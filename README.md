@@ -11,6 +11,8 @@ A zero-dependency PowerShell script for switching between multiple Claude Code a
 
 ## Installation
 
+> **Requires PowerShell 7.0+.** Stock Windows ships PowerShell 5.1, which is not supported. Install PS 7 via `winget install Microsoft.PowerShell`, then run from `pwsh`.
+
 ### Manual (run once)
 
 ```powershell
@@ -104,9 +106,15 @@ OAuth tokens expire after ~1 hour of inactivity. If a saved slot stops working:
 Close Claude Code / VS Code before running `sca save` or `sca switch` (see Workflow). PowerShell will show a clear error if you try to overwrite a locked file.
 
 ### Name sanitization
-Spaces and special characters are automatically replaced with `_`:
-- `my-work-account` → `my_work_account`
+Spaces and Windows-invalid filename characters (`\ / : * ? " < > |` and control chars) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected with an error.
+
 - `my personal` → `my_personal`
+- `foo/bar` → `foo_bar`
+- `foo.` → `foo`
+- `CON` → error (reserved device name)
+
+### Profile encoding
+`sca install` and `sca uninstall` preserve your PowerShell profile's existing encoding (UTF-8 with or without BOM, UTF-16 LE/BE). ANSI-encoded profiles are treated as UTF-8 no-BOM, which is indistinguishable without a BOM.
 
 ### Execution policy
 If you get a security warning on first run, press `Y` or run once as:

@@ -9,7 +9,7 @@ Single-file PowerShell tool — everything lives in `switch_claude_account.ps1`.
 - **Credential directory**: `%USERPROFILE%\.claude\`
 - **Active credentials**: `.credentials.json`
 - **Named slots**: `.credentials.<name>.json`
-- **PS version**: Requires PowerShell 5.0+ (`#Requires -Version 5.0`)
+- **PS version**: Requires PowerShell 7.0+ (`#Requires -Version 7.0`). Uses `$PROFILE.CurrentUserAllHosts` for the install target.
 - **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block
 
 ## Windows-specific gotchas
