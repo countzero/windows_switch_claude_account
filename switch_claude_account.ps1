@@ -114,6 +114,7 @@ function switch_claude_account_caller {
 # We are removing the switch_claude_account_caller block from the
 # user's PowerShell profile by detecting the marker comments.
 function Remove-From-Profile {
+    param([switch]$Quiet)
     if (-not (Test-Path -Path $ProfilePath)) { return }
 
     $MarkerStart = "# === Claude Account Switcher ==="
@@ -128,7 +129,9 @@ function Remove-From-Profile {
     }
 
     Set-Content $ProfilePath ($newLines -join "`r`n") -Force
-    Write-Host "[Uninstall] Uninstalled. Close and reopen PowerShell to remove the alias." -ForegroundColor "Red"
+    if (-not $Quiet) {
+        Write-Host "[Uninstall] Uninstalled. Close and reopen PowerShell to remove the alias." -ForegroundColor "Red"
+    }
 }
 
 # We are showing the built-in help documentation if requested.
