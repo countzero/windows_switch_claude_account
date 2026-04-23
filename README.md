@@ -6,9 +6,8 @@ A zero-dependency PowerShell script for switching between multiple Claude Code a
 
 - **Named slots** — Save unlimited accounts with custom names
 - **Name sanitization** — Automatically handles special characters for Windows
-- **Built-in alias installer** — One command to set up `sca` (short) and `switch-claude-account` (long)
+- **Persistent aliases** — `sca` (short) and `switch-claude-account` (long) installed into your PowerShell profile
 - **No dependencies** — Pure PowerShell, no external packages needed
-- **Profile management** — `install`/`uninstall` for persistent alias
 
 ## Installation
 
@@ -68,19 +67,41 @@ sca help         # Show usage info
 
 ## Workflow
 
+### Saving accounts
+
 1. Open Claude Code and log in with your first account
-2. Run `sca save work`
-3. Log out, log in with a different account
-4. Run `sca save personal`
-5. Switch back anytime with `sca switch work`
+2. **Close Claude Code** (Windows locks the credentials file while it runs)
+3. Run `sca save work`
+4. Open Claude Code, log out, log in with a different account
+5. **Close Claude Code**
+6. Run `sca save personal`
+
+### Switching between accounts
+
+1. **Close Claude Code**
+2. Run `sca switch work`
+3. Open Claude Code — it now uses the `work` credentials
+
+### Refreshing a stale slot
+
+OAuth tokens expire after ~1 hour of inactivity. If a saved slot stops working:
+
+1. Log into that account in Claude Code
+2. **Close Claude Code**
+3. Run `sca save work` again — this overwrites the old token with fresh credentials
+
+> `sca save <name>` silently overwrites any existing slot with the same name.
+
+### Renaming a slot
+
+1. `sca switch old-name`
+2. `sca save new-name`
+3. `sca remove old-name`
 
 ## Windows Notes
 
 ### File locks
-Close Claude Code / VS Code before running `sca switch` or `sca save`. Windows locks the credentials file while the app is running. PowerShell will show a clear error if you try to overwrite a locked file.
-
-### Token expiry
-OAuth tokens refresh/expire after ~1 hour of inactivity. If a saved slot stops working, log back into that account in Claude Code and run `sca save <name>` again. The script safely overwrites the old token.
+Close Claude Code / VS Code before running `sca save` or `sca switch` (see Workflow). PowerShell will show a clear error if you try to overwrite a locked file.
 
 ### Name sanitization
 Spaces and special characters are automatically replaced with `_`:
