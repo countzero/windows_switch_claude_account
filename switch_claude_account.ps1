@@ -32,9 +32,8 @@ actions. Special characters are automatically sanitized to underscores.
 
 Param (
     [Parameter(Mandatory = $false)]
-    [ValidateSet("save", "switch", "list", "remove", "install", "uninstall", "help")]
     [String]
-    $Action = "help",
+    $Action,
 
     [Parameter(Mandatory = $false)]
     [String]
@@ -44,7 +43,7 @@ Param (
     $help
 )
 
-if ($help) {
+if ($help -or -not $Action) {
     Get-Help -Detailed $PSCommandPath
     exit
 }
@@ -84,17 +83,7 @@ function Add-To-Profile {
     # wrapper function is always up to date.
     Remove-From-Profile -Quiet
 
-    $funcDef = @"
-function switch_claude_account_caller {
-    param([Parameter(Position=0)][string]`$a,
-          [Parameter(Position=1)][string]`$n,
-          [Parameter(ValueFromRemainingArguments)]`$rest)
-    `$params = @{}`
-    if (`$a) { `$params["Action"] = `$a }`
-    if (`$n) { `$params["Name"] = `$n }`
-    & '$ScriptPath' @`$params @`$rest
-}
-"@
+    $funcDef  = "function switch_claude_account_caller { param([Parameter(ValueFromRemainingArguments)]`$args) & '$ScriptPath' @`$args }"
 
     $aliasShort = "Set-Alias -Name sca -Value switch_claude_account_caller -Option AllScope"
     $aliasLong  = "Set-Alias -Name switch-claude-account -Value switch_claude_account_caller -Option AllScope"
@@ -107,7 +96,17 @@ function switch_claude_account_caller {
     Add-Content $ProfilePath $aliasShort
     Add-Content $ProfilePath $aliasLong
     Add-Content $ProfilePath "$MarkerEnd`r`n"
-    Write-Host "[Install] Installed! Close and reopen PowerShell, then use: sca save <name>" -ForegroundColor "Green"
+
+    # Also update the current session so the user doesn't
+    # need to close and reopen PowerShell.
+    Remove-Item Function:switch_claude_account_caller -ErrorAction SilentlyContinue
+    Remove-Item Alias:sca -ErrorAction SilentlyContinue
+    Remove-Item Alias:switch-claude-account -ErrorAction SilentlyContinue
+    Invoke-Expression $funcDef
+    Invoke-Expression $aliasShort
+    Invoke-Expression $aliasLong
+
+    Write-Host "[Install] Installed! Ready to use: sca save <name>" -ForegroundColor "Green"
     Write-Host "   Quick ref: sca | sca -h | sca list | sca save <name> | sca switch <name> | sca remove <name>"
 }
 
@@ -129,8 +128,15 @@ function Remove-From-Profile {
     }
 
     Set-Content $ProfilePath ($newLines -join "`r`n") -Force
+
+    # Also remove from the current session so the user doesn't
+    # need to close and reopen PowerShell.
+    Remove-Item Function:switch_claude_account_caller -ErrorAction SilentlyContinue
+    Remove-Item Alias:sca -ErrorAction SilentlyContinue
+    Remove-Item Alias:switch-claude-account -ErrorAction SilentlyContinue
+
     if (-not $Quiet) {
-        Write-Host "[Uninstall] Uninstalled. Close and reopen PowerShell to remove the alias." -ForegroundColor "Red"
+        Write-Host "[Uninstall] Uninstalled." -ForegroundColor "Red"
     }
 }
 
