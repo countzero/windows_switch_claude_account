@@ -53,7 +53,7 @@ if ($help -or -not $Action) {
 $ScriptPath  = (Resolve-Path $PSCommandPath).Path
 $CredDir     = Join-Path $env:USERPROFILE ".claude"
 $CredFile    = Join-Path $CredDir ".credentials.json"
-$ProfilePath = $PROFILE
+$ProfilePath = Join-Path $env:USERPROFILE "Documents\PowerShell\profile.ps1"
 
 # We are sanitizing names to ensure compatibility with the
 # Windows filesystem by replacing invalid characters with underscores.
