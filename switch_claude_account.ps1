@@ -31,15 +31,23 @@ actions. Special characters are automatically sanitized to underscores.
 #>
 
 Param (
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
     [ValidateSet("save", "switch", "list", "remove", "install", "uninstall", "help")]
     [String]
-    $Action,
+    $Action = "help",
 
     [Parameter(Mandatory = $false)]
     [String]
-    $Name = ""
+    $Name = "",
+
+    [switch]
+    $help
 )
+
+if ($help) {
+    Get-Help -Detailed $PSCommandPath
+    exit
+}
 
 # We are resolving the script path to reference this file when
 # installing the alias into the user's PowerShell profile.

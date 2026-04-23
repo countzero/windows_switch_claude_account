@@ -102,19 +102,3 @@ The script manages credentials stored at:
 
 Each `save` copies the credentials file to `.credentials.<name>.json` in the same directory. Each `switch` copies the named slot back to `.credentials.json`.
 
-## Alias details
-
-Two aliases are installed in your PowerShell profile (`$PROFILE`):
-
-- **`sca`** — Short form for quick use (e.g., `sca save work`)
-- **`switch-claude-account`** — Long form for readability (e.g., `switch-claude-account save work`)
-
-Both aliases point to the same wrapper function:
-
-```powershell
-function switch_claude_account_caller { param([string]$a, [string]$n) & 'C:\path\to\switch_claude_account.ps1' $a $n }
-Set-Alias -Name sca -Value switch_claude_account_caller -Option AllScope
-Set-Alias -Name switch-claude-account -Value switch_claude_account_caller -Option AllScope
-```
-
-The alias block is marked with `# === Claude Account Switcher ===` markers so it can be cleanly removed with `uninstall`.
