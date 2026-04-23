@@ -6,7 +6,7 @@ A zero-dependency PowerShell script for switching between multiple Claude Code a
 
 - **Named slots** — Save unlimited accounts with custom names
 - **Name sanitization** — Automatically handles special characters for Windows
-- **Built-in alias installer** — One command to set up `cs` shortcut
+- **Built-in alias installer** — One command to set up `sca` (short) and `switch-claude-account` (long)
 - **No dependencies** — Pure PowerShell, no external packages needed
 - **Profile management** — `install`/`uninstall` for persistent alias
 
@@ -18,7 +18,7 @@ A zero-dependency PowerShell script for switching between multiple Claude Code a
 .\switch_claude_account.ps1 install
 ```
 
-This adds a `cs` alias to your PowerShell profile. Close and reopen your terminal to activate it.
+This adds `sca` (short) and `switch-claude-account` (long) aliases to your PowerShell profile. Close and reopen your terminal to activate them.
 
 ### Without alias
 
@@ -35,52 +35,52 @@ Run the script directly:
 Log into an account in Claude Code, then save it:
 
 ```powershell
-cs save work
-cs save personal
-cs save test-project
+sca save work
+sca save personal
+sca save test-project
 ```
 
 ### List saved slots
 
 ```powershell
-cs list
+sca list
 ```
 
 ### Switch to a slot
 
 ```powershell
-cs switch work
+sca switch work
 ```
 
 ### Remove a slot
 
 ```powershell
-cs remove test-project
+sca remove test-project
 ```
 
 ### Install / uninstall alias
 
 ```powershell
-cs install      # Add cs alias to your PowerShell profile
-cs uninstall    # Remove cs alias from your PowerShell profile
-cs help         # Show usage info
+sca install      # Add aliases to your PowerShell profile
+sca uninstall    # Remove aliases from your PowerShell profile
+sca help         # Show usage info
 ```
 
 ## Workflow
 
 1. Open Claude Code and log in with your first account
-2. Run `cs save work`
+2. Run `sca save work`
 3. Log out, log in with a different account
-4. Run `cs save personal`
-5. Switch back anytime with `cs switch work`
+4. Run `sca save personal`
+5. Switch back anytime with `sca switch work`
 
 ## Windows Notes
 
 ### File locks
-Close Claude Code / VS Code before running `cs switch` or `cs save`. Windows locks the credentials file while the app is running. PowerShell will show a clear error if you try to overwrite a locked file.
+Close Claude Code / VS Code before running `sca switch` or `sca save`. Windows locks the credentials file while the app is running. PowerShell will show a clear error if you try to overwrite a locked file.
 
 ### Token expiry
-OAuth tokens refresh/expire after ~1 hour of inactivity. If a saved slot stops working, log back into that account in Claude Code and run `cs save <name>` again. The script safely overwrites the old token.
+OAuth tokens refresh/expire after ~1 hour of inactivity. If a saved slot stops working, log back into that account in Claude Code and run `sca save <name>` again. The script safely overwrites the old token.
 
 ### Name sanitization
 Spaces and special characters are automatically replaced with `_`:
@@ -98,17 +98,23 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 The script manages credentials stored at:
 - **Credentials file**: `%USERPROFILE%\.claude\.credentials.json`
-- **Backup directory**: `%USERPROFILE%\.claude-swap-backup\`
+- **Slot files**: `%USERPROFILE%\.claude\.credentials.<name>.json`
 
-Each `save` copies the credentials file to a named JSON file in the backup directory. Each `switch` copies the named file back to the credentials location.
+Each `save` copies the credentials file to `.credentials.<name>.json` in the same directory. Each `switch` copies the named slot back to `.credentials.json`.
 
 ## Alias details
 
-The `cs` alias is installed in your PowerShell profile (`$PROFILE`). It wraps the script with two parameters: action and optional name. The alias definition looks like:
+Two aliases are installed in your PowerShell profile (`$PROFILE`):
+
+- **`sca`** — Short form for quick use (e.g., `sca save work`)
+- **`switch-claude-account`** — Long form for readability (e.g., `switch-claude-account save work`)
+
+Both aliases point to the same wrapper function:
 
 ```powershell
-function claude-acct { param([string]$a, [string]$n) & 'C:\path\to\switch_claude_account.ps1' $a $n }
-Set-Alias -Name cs -Value claude-acct -Option AllScope
+function switch_claude_account_caller { param([string]$a, [string]$n) & 'C:\path\to\switch_claude_account.ps1' $a $n }
+Set-Alias -Name sca -Value switch_claude_account_caller -Option AllScope
+Set-Alias -Name switch-claude-account -Value switch_claude_account_caller -Option AllScope
 ```
 
-The alias is marked with `# === Claude Account Switcher ===` markers so it can be cleanly removed with `uninstall`.
+The alias block is marked with `# === Claude Account Switcher ===` markers so it can be cleanly removed with `uninstall`.
