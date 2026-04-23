@@ -83,7 +83,7 @@ function Add-To-Profile {
     # wrapper function is always up to date.
     Remove-From-Profile -Quiet
 
-    $funcDef  = "function switch_claude_account_caller { param([Parameter(ValueFromRemainingArguments)]`$args) & '$ScriptPath' @`$args }"
+    $funcDef  = "function switch_claude_account_caller { & '$ScriptPath' @args }"
 
     $aliasShort = "Set-Alias -Name sca -Value switch_claude_account_caller -Option AllScope"
     $aliasLong  = "Set-Alias -Name switch-claude-account -Value switch_claude_account_caller -Option AllScope"
