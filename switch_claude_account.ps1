@@ -368,106 +368,127 @@ function Remove-From-Profile {
     }
 }
 
-# We are showing the built-in help documentation if requested
-# (explicit -help/-h, 'help' action, or no action at all).
-if ($help -or $Action -eq "help" -or $Action -eq "") {
-    Show-Help
-    exit
+# We are extracting each action body into its own function so the logic
+# is directly invokable from tests without spawning a subprocess and
+# without re-parsing the $Action dispatcher. The dispatcher below becomes
+# a thin switch that forwards to these functions.
+
+function Invoke-SaveAction {
+    Param ([String] $Name)
+
+    $safeName = Get-SafeName $Name
+
+    if (-not (Test-Path -Path $CredFile)) {
+        throw "$CredFile not found. Log in via Claude Code first."
+    }
+
+    Copy-Item -Path $CredFile -Destination (Join-Path $CredDir ".credentials.$safeName.json") -Force
+    Write-Host "[Save] Saved as '$safeName'" -ForegroundColor "Green"
 }
 
-# We are ensuring the credentials directory exists before
-# attempting any file operations within it.
-if (-not (Test-Path -Path $CredDir)) {
-    New-Item -ItemType Directory -Path $CredDir -Force | Out-Null
-}
+function Invoke-SwitchAction {
+    Param ([String] $Name)
 
-switch ($Action) {
-    "install" {
-        Add-To-Profile
-        exit
-    }
+    # When invoked without a name, rotate to the next saved slot
+    # (alphabetical, wrap-around). Get-NextSlotName returns $null for
+    # the single-slot-already-active no-op and prints its own warning,
+    # so we simply return in that case rather than emit a duplicate msg.
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        $rotation = Get-NextSlotName
+        if (-not $rotation) { return }
 
-    "uninstall" {
-        Remove-From-Profile
-        exit
-    }
-
-    "save" {
-        $safeName = Get-SafeName $Name
-
-        if (-not (Test-Path -Path $CredFile)) {
-            throw "$CredFile not found. Log in via Claude Code first."
-        }
-
-        Copy-Item -Path $CredFile -Destination (Join-Path $CredDir ".credentials.$safeName.json") -Force
-        Write-Host "[Save] Saved as '$safeName'" -ForegroundColor "Green"
-    }
-
-    "switch" {
-        # When invoked without a name, rotate to the next saved slot
-        # (alphabetical, wrap-around). Get-NextSlotName returns $null for
-        # the single-slot-already-active no-op and prints its own warning,
-        # so we simply exit in that case rather than emit a duplicate msg.
-        if ([string]::IsNullOrWhiteSpace($Name)) {
-            $rotation = Get-NextSlotName
-            if (-not $rotation) { exit }
-
-            $safeName = $rotation.To
-            if ($rotation.From) {
-                Write-Host "[Switch] Rotating from '$($rotation.From)' to '$safeName'" -ForegroundColor "Cyan"
-            } elseif ($rotation.Locked) {
-                Write-Host "[Switch] Active credentials file is locked; cannot identify current slot. Rotating to '$safeName'." -ForegroundColor "Yellow"
-            } else {
-                Write-Host "[Switch] No currently active slot detected. Rotating to '$safeName'." -ForegroundColor "Yellow"
-            }
+        $safeName = $rotation.To
+        if ($rotation.From) {
+            Write-Host "[Switch] Rotating from '$($rotation.From)' to '$safeName'" -ForegroundColor "Cyan"
+        } elseif ($rotation.Locked) {
+            Write-Host "[Switch] Active credentials file is locked; cannot identify current slot. Rotating to '$safeName'." -ForegroundColor "Yellow"
         } else {
-            $safeName = Get-SafeName $Name
+            Write-Host "[Switch] No currently active slot detected. Rotating to '$safeName'." -ForegroundColor "Yellow"
         }
-
-        $target = Join-Path $CredDir ".credentials.$safeName.json"
-
-        if (-not (Test-Path -Path $target)) {
-            throw "Slot '$safeName' not found."
-        }
-
-        Copy-Item -Path $target -Destination $CredFile -Force
-        Write-Host "[Switch] Switched to '$safeName'. Close and restart Claude Code to apply." -ForegroundColor "Cyan"
-    }
-
-    "list" {
-        $info  = Get-Slots
-        $slots = @($info.Slots)
-
-        if ($slots.Count -eq 0) {
-            Write-Host "[List] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
-            break
-        }
-
-        # Get-Slots swallowed a hash failure on .credentials.json; surface
-        # it here so the user knows why no slot is marked active.
-        if ($info.ActiveLocked) {
-            Write-Host "[List] Could not read active credentials (file may be locked); active slot cannot be marked." -ForegroundColor "Yellow"
-        }
-
-        Write-Host "[List] Saved slots:" -ForegroundColor "Yellow"
-        foreach ($slot in $slots) {
-            if ($slot.IsActive) {
-                Write-Host " * $($slot.Name) (active)" -ForegroundColor "Green"
-            } else {
-                Write-Host "   $($slot.Name)"
-            }
-        }
-    }
-
-    "remove" {
+    } else {
         $safeName = Get-SafeName $Name
-        $target   = Join-Path $CredDir ".credentials.$safeName.json"
-
-        if (-not (Test-Path -Path $target)) {
-            throw "Slot '$safeName' not found."
-        }
-
-        Remove-Item -Path $target -Force
-        Write-Host "[Remove] Removed '$safeName'" -ForegroundColor "Red"
     }
+
+    $target = Join-Path $CredDir ".credentials.$safeName.json"
+
+    if (-not (Test-Path -Path $target)) {
+        throw "Slot '$safeName' not found."
+    }
+
+    Copy-Item -Path $target -Destination $CredFile -Force
+    Write-Host "[Switch] Switched to '$safeName'. Close and restart Claude Code to apply." -ForegroundColor "Cyan"
+}
+
+function Invoke-ListAction {
+    $info  = Get-Slots
+    $slots = @($info.Slots)
+
+    if ($slots.Count -eq 0) {
+        Write-Host "[List] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
+        return
+    }
+
+    # Get-Slots swallowed a hash failure on .credentials.json; surface
+    # it here so the user knows why no slot is marked active.
+    if ($info.ActiveLocked) {
+        Write-Host "[List] Could not read active credentials (file may be locked); active slot cannot be marked." -ForegroundColor "Yellow"
+    }
+
+    Write-Host "[List] Saved slots:" -ForegroundColor "Yellow"
+    foreach ($slot in $slots) {
+        if ($slot.IsActive) {
+            Write-Host " * $($slot.Name) (active)" -ForegroundColor "Green"
+        } else {
+            Write-Host "   $($slot.Name)"
+        }
+    }
+}
+
+function Invoke-RemoveAction {
+    Param ([String] $Name)
+
+    $safeName = Get-SafeName $Name
+    $target   = Join-Path $CredDir ".credentials.$safeName.json"
+
+    if (-not (Test-Path -Path $target)) {
+        throw "Slot '$safeName' not found."
+    }
+
+    Remove-Item -Path $target -Force
+    Write-Host "[Remove] Removed '$safeName'" -ForegroundColor "Red"
+}
+
+# We are wrapping the top-level dispatcher in Invoke-Main so the script
+# file is safe to dot-source from tests. Help uses `return` instead of
+# `exit` to avoid killing a host that dot-sourced us; the redundant
+# `exit` calls from install/uninstall branches are dropped because the
+# script naturally exits at the end of Invoke-Main with status 0.
+function Invoke-Main {
+    if ($help -or $Action -eq "help" -or $Action -eq "") {
+        Show-Help
+        return
+    }
+
+    # We are ensuring the credentials directory exists before
+    # attempting any file operations within it.
+    if (-not (Test-Path -Path $CredDir)) {
+        New-Item -ItemType Directory -Path $CredDir -Force | Out-Null
+    }
+
+    switch ($Action) {
+        "install"   { Add-To-Profile }
+        "uninstall" { Remove-From-Profile }
+        "save"      { Invoke-SaveAction   -Name $Name }
+        "switch"    { Invoke-SwitchAction -Name $Name }
+        "list"      { Invoke-ListAction }
+        "remove"    { Invoke-RemoveAction -Name $Name }
+    }
+}
+
+# We are detecting dot-sourcing by checking the invocation name; the
+# dispatcher only runs when the script is invoked normally, not when
+# tests dot-source the file to exercise individual functions in
+# isolation.
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-Main
 }

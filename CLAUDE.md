@@ -2,7 +2,7 @@
 
 ## Repo structure
 
-Single-file PowerShell tool — everything lives in `switch_claude_account.ps1`. No build, test, lint, or dependency system.
+Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`. Tests live in `tests/` and use Pester 5.
 
 ## Key facts
 
@@ -34,3 +34,17 @@ Single-file PowerShell tool — everything lives in `switch_claude_account.ps1`.
 ## Editing the script
 
 The profile install/uninstall uses marker comments (`# === Claude Account Switcher ===`) to isolate its block. When modifying `Add-To-Profile` or `Remove-From-Profile`, keep these markers intact.
+
+The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }` so tests can dot-source the script without triggering a live run. Each action body (`save`, `switch`, `list`, `remove`) is extracted into an `Invoke-*Action` function so tests can call it directly. Keep this shape when adding new actions — put the body in `Invoke-<Action>Action` and add a one-line dispatch to `Invoke-Main`.
+
+## Testing
+
+Run the suite:
+
+```powershell
+pwsh -NoProfile -File tests/Invoke-Tests.ps1
+```
+
+The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode — findings are printed but never fail the run.
+
+Tests sandbox `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`, so the real profile and real `.claude` directory are never touched.

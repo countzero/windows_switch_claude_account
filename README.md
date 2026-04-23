@@ -131,3 +131,38 @@ The script manages credentials stored at:
 
 Each `save` copies the credentials file to `.credentials.<name>.json` in the same directory. Each `switch` copies the named slot back to `.credentials.json`.
 
+## Testing
+
+The test suite uses [Pester 5](https://pester.dev) and lives in `tests/`.
+
+### Run all tests
+
+```powershell
+pwsh -NoProfile -File tests/Invoke-Tests.ps1
+```
+
+The runner will:
+1. **Auto-install Pester 5** to the CurrentUser scope on first use (no admin rights needed).
+2. Run **PSScriptAnalyzer** in advisory mode if it is installed — findings are printed but never fail the run. If not installed, the runner prints a one-line skip notice and proceeds.
+3. Invoke Pester against `tests/switch_claude_account.Tests.ps1` with `-Output Detailed`.
+
+Exit code follows Pester: `0` on pass, non-zero on any failure.
+
+### Optional: enable the lint pass
+
+```powershell
+Install-Module PSScriptAnalyzer -Scope CurrentUser
+```
+
+### Run Pester directly (skip the runner)
+
+If Pester 5 is already installed:
+
+```powershell
+Invoke-Pester -Path tests -Output Detailed
+```
+
+### Sandboxing
+
+Each test runs with `$env:USERPROFILE` pointed at Pester's `$TestDrive` and `$PROFILE.CurrentUserAllHosts` stubbed to a file inside `$TestDrive`. Your real `%USERPROFILE%\.claude\` directory and your real PowerShell profile are never touched.
+
