@@ -80,25 +80,35 @@ function Add-To-Profile {
         New-Item -ItemType File -Path $ProfilePath -Force | Out-Null
     }
 
-    $funcDef  = "function switch_claude_account_caller { param([string]`$a, [string]`$n) & '$ScriptPath' `$a `$n }"
+    # Remove any existing block before re-adding to ensure the
+    # wrapper function is always up to date.
+    Remove-From-Profile -Quiet
+
+    $funcDef = @"
+function switch_claude_account_caller {
+    param([Parameter(Position=0)][string]`$a,
+          [Parameter(Position=1)][string]`$n,
+          [Parameter(ValueFromRemainingArguments)]`$rest)
+    `$params = @{}`
+    if (`$a) { `$params["Action"] = `$a }`
+    if (`$n) { `$params["Name"] = `$n }`
+    & '$ScriptPath' @`$params @`$rest
+}
+"@
+
     $aliasShort = "Set-Alias -Name sca -Value switch_claude_account_caller -Option AllScope"
     $aliasLong  = "Set-Alias -Name switch-claude-account -Value switch_claude_account_caller -Option AllScope"
 
     $MarkerStart = "# === Claude Account Switcher ==="
     $MarkerEnd   = "# === End Claude Account Switcher ==="
 
-    if (-not ((Get-Content $ProfilePath -Raw) -match [regex]::Escape($MarkerStart))) {
-        Add-Content $ProfilePath "`r`n$MarkerStart"
-        Add-Content $ProfilePath $funcDef
-        Add-Content $ProfilePath $aliasShort
-        Add-Content $ProfilePath $aliasLong
-        Add-Content $ProfilePath "$MarkerEnd`r`n"
-        Write-Host "[Install] Installed! Close and reopen PowerShell, then use: sca save <name>" -ForegroundColor "Green"
-        Write-Host "   Quick ref: sca list | sca save <name> | sca switch <name> | sca remove <name>"
-    }
-    else {
-        Write-Host "[Install] Already installed in your profile." -ForegroundColor "Yellow"
-    }
+    Add-Content $ProfilePath "`r`n$MarkerStart"
+    Add-Content $ProfilePath $funcDef
+    Add-Content $ProfilePath $aliasShort
+    Add-Content $ProfilePath $aliasLong
+    Add-Content $ProfilePath "$MarkerEnd`r`n"
+    Write-Host "[Install] Installed! Close and reopen PowerShell, then use: sca save <name>" -ForegroundColor "Green"
+    Write-Host "   Quick ref: sca | sca -h | sca list | sca save <name> | sca switch <name> | sca remove <name>"
 }
 
 # We are removing the switch_claude_account_caller block from the

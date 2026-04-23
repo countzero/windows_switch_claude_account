@@ -50,24 +50,17 @@ overall design of the change:
 1. **Scope alignment:** Compare the diff against the commit messages and the
    PR description (when a PR exists). Flag if the change does more or less
    than those stated goals.
-2. **Placement:** Do the changes live in the correct module? This repo's
-   layout:
-   - `run.ts` — CLI entry and grid orchestration.
-   - `src/lib.ts` — constants (`MODEL_ID`, timeouts, `APPLICATION_SUBDIR`,
-     default paths, `DEFAULT_SAMPLES`) and shared utilities (`loadTasks`,
-     `runCommand`).
-   - `src/harnesses.ts` — harness spawning, invoker resolution, metrics
-     parsing. Treats each harness as a black box.
-   - `src/verify.ts` — `applyPrep`, `verifyFixture`.
-   - `src/preflight.ts` — the 12 gated preflight checks.
-   - `src/scorecard.ts` — aggregation and scorecard rendering.
-   - `tasks/tasks.md` — frozen prompts.
-   - `tasks/acceptance/task-NN.ts` — per-task acceptance checks.
-   - `tasks/prep/task-NN.ts` — optional per-task prep.
-   There is no harness test suite; correctness is validated through live
-   runs. Flag changes that land in the wrong layer (e.g., task-specific
-   logic inside `src/harnesses.ts`, or harness-generic logic inside a
-   task's acceptance script).
+2. **Placement:** Do the changes live in the correct place? This repo's
+    layout:
+    - `switch_claude_account.ps1` — the entire application: parameter
+      parsing, name sanitization (`Get-SafeName`), profile management
+      (`Add-To-Profile`/`Remove-From-Profile`), and credential slot actions
+      (save/switch/list/remove).
+    - `README.md` — usage documentation.
+    - `.gitignore` — excludes `.claude/` directory.
+    There is no test suite; correctness is validated through manual runs.
+    Flag changes that mix concerns inappropriately (e.g., credential logic
+    embedded in profile management, or profile logic in credential actions).
 3. **Complexity:** Is any part of the change more complex than necessary?
    Flag over-engineering, unnecessary abstractions, or functionality that
    is not required by the stated goal.
@@ -111,14 +104,11 @@ Skip any finding that:
 
 **Pass 1 — General scan:**
 Review the diff. Report all defects: bugs, logic errors, security issues, bad
-practices, missing validation, incorrect error handling. For new or
-significantly changed functions, check whether corresponding test files exist
-in the diff and cover the changed behavior — flag missing test coverage as a
-finding (this applies to application code under `fixtures/` and to
-`tasks/acceptance/`; the harness itself in `src/` has no test suite, so
-absent tests there are not defects). Also check the project-specific concerns
-listed in the Project-Specific Review Checklist section below. Only flag
-defects in lines that are added or modified in this PR.
+practices, missing validation, incorrect error handling. This project has no
+test suite — do not flag missing test coverage as a defect. Also check the
+project-specific concerns listed in the Project-Specific Review Checklist
+section below. Only flag defects in lines that are added or modified in this
+PR.
 
 **Pass 2 — What was missed:**
 Review the diff again, assuming defects were missed on the first pass. Focus
@@ -142,22 +132,30 @@ Do NOT flag any of the following:
 - Pre-existing issues not introduced in this PR's changes.
 - Code that appears to be a bug but is actually correct.
 - Pedantic nitpicks that a senior engineer would not flag.
-- Issues that ESLint or equivalent linters will catch.
-- General code quality concerns unless explicitly required in CLAUDE.md.
+- Issues that PSScriptAnalyzer or equivalent linters will catch.
+- General code quality concerns unless explicitly required in README.md.
 - Issues explicitly silenced in code (e.g., via a lint ignore comment).
 - Code style or formatting concerns.
 - Potential issues that depend on specific inputs or runtime state.
 
 ### Project-Specific Review Checklist
 
-Enforce the invariants listed in `CLAUDE.md` § Hard invariants — that section
-is the single source of truth for this repo's correctness rules. In addition,
-flag bare `as` type assertions on values from external sources (`JSON.parse`,
-`response.json()`, DOM queries, `event.target`, or any other external data)
-that are not preceded by a type guard, validation function, or explicit null
-check. `as` is only permitted to bridge TypeScript limitations after the
-type has been verified, or in contexts where the type is structurally
-guaranteed.
+This is a PowerShell utility that manages credential files. Check for:
+
+- **Name sanitization coverage:** Verify `Get-SafeName` is called on all code
+  paths that accept user-supplied names (`save`, `switch`, `remove`). Flag any
+  path where `$Name` is used directly without sanitization.
+- **File lock handling:** `Copy-Item` and `Remove-Item` will fail if Claude
+  Code holds the credentials file open on Windows. Flag if error messages are
+  unclear or if there's no guidance for the user.
+- **Credential leakage:** Flag any credential data logged, written to stdout,
+  or exposed in error messages.
+- **Consistent error handling:** `save`/`switch`/`remove` use `throw` for
+  errors, while `list` uses `Write-Host`. Flag if new actions introduce
+  inconsistent patterns.
+- **Profile manipulation safety:** Flag if `Add-To-Profile` or
+  `Remove-From-Profile` could corrupt the user's `$PROFILE` on unexpected
+  input or partial writes.
 
 ### Final Summary
 
@@ -195,7 +193,7 @@ rules exactly.
 **Columns:** File, Description. The File column contains a markdown link. The
 link label is the file path relative to the repository root with a leading
 `/`, plus the line range in `:{start}-{end}` format (e.g.,
-`/src/harnesses.ts:41-43`). The link URL is the full GitHub URL constructed
+`/switch_claude_account.ps1:41-43`). The link URL is the full GitHub URL constructed
 as described below.
 
 **Line range:** Include 1 line of context before and after the finding. A
@@ -204,7 +202,9 @@ links to lines 41-46. The label always uses `:{start}-{end}` regardless of
 whether the URL uses `L` or `R` anchors.
 
 **SHA-256 hash for PR links:** Compute the SHA-256 hex digest of each unique
-file path via Node.js (cross-platform):
+file path. Prefer PowerShell (this is a Windows project):
+`$hasher = [System.Security.Cryptography.SHA256]::Create(); $bytes = [System.Text.Encoding]::UTF8.GetBytes('{path}'); -join(($hasher.ComputeHash($bytes) | ForEach-Object ToString('x2')))`
+Fallback if Node.js is available:
 `node -e "process.stdout.write(require('crypto').createHash('sha256').update('{path}').digest('hex'))"`.
 
 **When a PR exists:** Use PR deep links. The URL format is
@@ -219,8 +219,8 @@ Note: blob links use `L` (not `R`) for line anchors.
 ```markdown
 | File                                                                                                                  | Description                    |
 | --------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| [/src/harnesses.ts:41-43](https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43)         | Tokens summed instead of maxed |
-| [/src/harnesses.ts:41-43](https://github.com/owner/repo/blob/4a7c9e1f/src/harnesses.ts#L41-L43)                       | Tokens summed instead of maxed |
+| [/switch_claude_account.ps1:41-43](https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43) | Name not sanitized before use  |
+| [/switch_claude_account.ps1:41-43](https://github.com/owner/repo/blob/4a7c9e1f/switch_claude_account.ps1#L41-L43)      | Name not sanitized before use  |
 ```
 
 **Wrong — do NOT use any of these formats:**
@@ -228,7 +228,7 @@ Note: blob links use `L` (not `R`) for line anchors.
 ```markdown
 | https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43 | ...  |
 | [https://github.com/...](https://github.com/...)                                   | ...  |
-| [harnesses.ts:41-43](https://github.com/...)                                       | ...  |
+| [switch_claude_account.ps1:41-43](https://github.com/...)                          | ...  |
 ```
 
 The first is wrong because it uses a raw URL instead of a markdown link. The
@@ -245,15 +245,15 @@ from the repository root with a leading `/`.
 
 ### Critical
 
-| File                                                                                                          | Description                |
-| ------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| [/src/harnesses.ts:41-43](https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43) | Tokens summed, not max-won |
+| File                                                                                                          | Description                       |
+| ------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| [/switch_claude_account.ps1:41-43](https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43) | Credentials leaked to stdout    |
 
 ### High
 
-| File                                                                                                          | Description               |
-| ------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| [/run.ts:14-19](https://github.com/owner/repo/pull/42/files#diff-f6a7b8c9d0a1b2c3d4e5f6a7b8R14-R19)           | Unhandled async rejection |
+| File                                                                                                          | Description                       |
+| ------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| [/switch_claude_account.ps1:14-19](https://github.com/owner/repo/pull/42/files#diff-f6a7b8c9d0a1b2c3d4e5f6a7b8R14-R19) | Name not sanitized before file op |
 ```
 
 ### Constraints
