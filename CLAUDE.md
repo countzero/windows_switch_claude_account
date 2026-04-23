@@ -24,7 +24,7 @@ Single-file PowerShell tool — everything lives in `switch_claude_account.ps1`.
 | Action     | Requires name | What it does |
 |------------|---------------|--------------|
 | `save`     | Yes           | Copies `.credentials.json` → `.credentials.<name>.json` |
-| `switch`   | Yes           | Copies `.credentials.<name>.json` → `.credentials.json` |
+| `switch`   | Optional      | Copies `.credentials.<name>.json` → `.credentials.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). |
 | `list`     | No            | Lists saved slot names |
 | `remove`   | Yes           | Deletes a named slot |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile |

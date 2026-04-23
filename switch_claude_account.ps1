@@ -14,8 +14,10 @@ Specifies the action to perform. Supported values are: save, switch, list, remov
 install, uninstall, help.
 
 .PARAMETER Name
-Specifies the name of the credential slot. Required for save, switch, and remove
-actions. Special characters are automatically sanitized to underscores.
+Specifies the name of the credential slot. Required for save and remove.
+Optional for switch: when omitted, switch rotates to the next saved slot in
+alphabetical order (wrapping from the last slot back to the first). Special
+characters are automatically sanitized to underscores.
 
 .EXAMPLE
 # Snapshot the currently logged-in account into a slot called "work".
@@ -24,6 +26,10 @@ actions. Special characters are automatically sanitized to underscores.
 .EXAMPLE
 # Restore the "personal" slot as the active Claude Code account.
 .\switch_claude_account.ps1 switch personal
+
+.EXAMPLE
+# Rotate to the next saved slot (alphabetical order, wraps).
+.\switch_claude_account.ps1 switch
 
 .EXAMPLE
 # Show all saved slots (the active one is marked with *).
@@ -114,7 +120,7 @@ function Show-Help {
         "",
         "ACTIONS",
         "  save <name>      Snapshot the active login into a named slot",
-        "  switch <name>    Restore a named slot as the active login",
+        "  switch [name]    Restore a named slot; without <name>, rotate to the next slot (alphabetical, wraps)",
         "  list             List saved slots (active slot marked with *)",
         "  remove <name>    Delete a named slot",
         "  install          Add 'sca' + 'switch-claude-account' aliases to your PS profile",
@@ -124,6 +130,7 @@ function Show-Help {
         "EXAMPLES",
         "  $cmd save work           # save current login as 'work'",
         "  $cmd switch personal     # activate the 'personal' slot",
+        "  $cmd switch              # rotate to the next saved slot",
         "  $cmd list                # show all slots",
         "  $cmd remove old-acct     # delete a slot",
         "",
@@ -176,6 +183,102 @@ function Get-SafeName {
     }
 
     return $clean
+}
+
+# We are enumerating saved credential slots and fingerprinting each one
+# against the active .credentials.json so callers (list, rotation) can
+# share a single source of truth. Slots are returned sorted alphabetically
+# by name for deterministic rotation order and consistent list output.
+# The active hash is computed once; file-hash calls are wrapped in
+# try/catch because Claude Code / VS Code may hold the file open with a
+# restrictive share mode, and we prefer degraded output over aborting.
+# Returns an object with:
+#   Slots        : array of { Name, Path, IsActive }
+#   ActiveLocked : $true if .credentials.json exists but could not be hashed
+function Get-Slots {
+    $files = @(
+        Get-ChildItem -LiteralPath $CredDir -Filter ".credentials.*.json" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '.credentials.json' } |
+            Sort-Object -Property Name
+    )
+
+    $activeHash   = $null
+    $activeLocked = $false
+    if (Test-Path -Path $CredFile) {
+        try {
+            $activeHash = (Get-FileHash -Path $CredFile -Algorithm SHA256).Hash
+        }
+        catch {
+            $activeLocked = $true
+        }
+    }
+
+    $slots = foreach ($file in $files) {
+        $slotName = $file.BaseName -replace '^\.credentials\.', ''
+        $isActive = $false
+        if ($activeHash) {
+            try {
+                $isActive = ((Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash -eq $activeHash)
+            }
+            catch {
+                $isActive = $false
+            }
+        }
+
+        [pscustomobject]@{
+            Name     = $slotName
+            Path     = $file.FullName
+            IsActive = $isActive
+        }
+    }
+
+    return [pscustomobject]@{
+        Slots        = @($slots)
+        ActiveLocked = $activeLocked
+    }
+}
+
+# We are determining which slot should become active when `switch` is
+# called without an explicit name. Behavior:
+#   * No slots saved       -> throw (nothing to rotate to).
+#   * One slot, active     -> print warning and return $null (caller exits).
+#   * Active slot found    -> return { From, To } for the next slot (wraps).
+#   * No active match      -> return { From=$null, To=first, Locked=? } so
+#                              the caller can emit a context-appropriate
+#                              warning (locked active file vs. missing /
+#                              unrecognized active file).
+function Get-NextSlotName {
+    $info  = Get-Slots
+    $slots = @($info.Slots)
+
+    if ($slots.Count -eq 0) {
+        throw "No slots saved. Use: sca save <name>"
+    }
+
+    $activeIdx = -1
+    for ($i = 0; $i -lt $slots.Count; $i++) {
+        if ($slots[$i].IsActive) { $activeIdx = $i; break }
+    }
+
+    if ($slots.Count -eq 1 -and $activeIdx -eq 0) {
+        Write-Host "[Switch] Only one slot ('$($slots[0].Name)') and it is already active. Nothing to do." -ForegroundColor "Yellow"
+        return $null
+    }
+
+    if ($activeIdx -lt 0) {
+        return [pscustomobject]@{
+            From   = $null
+            To     = $slots[0].Name
+            Locked = $info.ActiveLocked
+        }
+    }
+
+    $nextIdx = ($activeIdx + 1) % $slots.Count
+    return [pscustomobject]@{
+        From   = $slots[$activeIdx].Name
+        To     = $slots[$nextIdx].Name
+        Locked = $false
+    }
 }
 
 # We are adding the switch_claude_account_caller function and aliases
@@ -301,8 +404,27 @@ switch ($Action) {
     }
 
     "switch" {
-        $safeName = Get-SafeName $Name
-        $target   = Join-Path $CredDir ".credentials.$safeName.json"
+        # When invoked without a name, rotate to the next saved slot
+        # (alphabetical, wrap-around). Get-NextSlotName returns $null for
+        # the single-slot-already-active no-op and prints its own warning,
+        # so we simply exit in that case rather than emit a duplicate msg.
+        if ([string]::IsNullOrWhiteSpace($Name)) {
+            $rotation = Get-NextSlotName
+            if (-not $rotation) { exit }
+
+            $safeName = $rotation.To
+            if ($rotation.From) {
+                Write-Host "[Switch] Rotating from '$($rotation.From)' to '$safeName'" -ForegroundColor "Cyan"
+            } elseif ($rotation.Locked) {
+                Write-Host "[Switch] Active credentials file is locked; cannot identify current slot. Rotating to '$safeName'." -ForegroundColor "Yellow"
+            } else {
+                Write-Host "[Switch] No currently active slot detected. Rotating to '$safeName'." -ForegroundColor "Yellow"
+            }
+        } else {
+            $safeName = Get-SafeName $Name
+        }
+
+        $target = Join-Path $CredDir ".credentials.$safeName.json"
 
         if (-not (Test-Path -Path $target)) {
             throw "Slot '$safeName' not found."
@@ -313,46 +435,26 @@ switch ($Action) {
     }
 
     "list" {
-        # .credentials.json itself matches the filter, so exclude it explicitly.
-        $slots = Get-ChildItem -LiteralPath $CredDir -Filter ".credentials.*.json" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne '.credentials.json' }
+        $info  = Get-Slots
+        $slots = @($info.Slots)
 
-        if (-not $slots) {
+        if ($slots.Count -eq 0) {
             Write-Host "[List] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
             break
         }
 
-        # Fingerprint the active credentials file so we can mark the matching
-        # slot. Get-FileHash can throw if Claude Code holds the file with a
-        # restrictive share mode; degrade gracefully rather than aborting
-        # the whole list.
-        $activeHash = $null
-        if (Test-Path -Path $CredFile) {
-            try {
-                $activeHash = (Get-FileHash -Path $CredFile -Algorithm SHA256).Hash
-            }
-            catch {
-                Write-Host "[List] Could not read active credentials (file may be locked); active slot cannot be marked." -ForegroundColor "Yellow"
-            }
+        # Get-Slots swallowed a hash failure on .credentials.json; surface
+        # it here so the user knows why no slot is marked active.
+        if ($info.ActiveLocked) {
+            Write-Host "[List] Could not read active credentials (file may be locked); active slot cannot be marked." -ForegroundColor "Yellow"
         }
 
         Write-Host "[List] Saved slots:" -ForegroundColor "Yellow"
         foreach ($slot in $slots) {
-            $slotName = $slot.BaseName -replace '^\.credentials\.', ''
-            $isActive = $false
-            if ($activeHash) {
-                try {
-                    $isActive = ((Get-FileHash -Path $slot.FullName -Algorithm SHA256).Hash -eq $activeHash)
-                }
-                catch {
-                    $isActive = $false
-                }
-            }
-
-            if ($isActive) {
-                Write-Host " * $slotName (active)" -ForegroundColor "Green"
+            if ($slot.IsActive) {
+                Write-Host " * $($slot.Name) (active)" -ForegroundColor "Green"
             } else {
-                Write-Host "   $slotName"
+                Write-Host "   $($slot.Name)"
             }
         }
     }
