@@ -146,7 +146,11 @@ function Get-SafeName {
     if ([string]::IsNullOrWhiteSpace($inputName)) { throw "Name required." }
 
     # Replace Windows-invalid filename characters (including space) with _.
-    $clean = $inputName -replace '[\\/:*?"<>|\x00-\x1F ]', '_'
+    # [ and ] are valid on the Windows filesystem but PowerShell's -Path
+    # parameter treats them as character-class wildcards, so we sanitize
+    # them to keep every Test-Path / Copy-Item / Remove-Item call below
+    # unambiguous (defense-in-depth alongside -LiteralPath on those calls).
+    $clean = $inputName -replace '[\\/:*?"<>|\[\]\x00-\x1F ]', '_'
 
     # Strip trailing dots (Windows silently drops them, which would
     # collapse e.g. 'foo.' and 'foo' into the same slot file).
@@ -191,9 +195,9 @@ function Get-Slots {
 
     $activeHash   = $null
     $activeLocked = $false
-    if (Test-Path -Path $CredFile) {
+    if (Test-Path -LiteralPath $CredFile) {
         try {
-            $activeHash = (Get-FileHash -Path $CredFile -Algorithm SHA256).Hash
+            $activeHash = (Get-FileHash -LiteralPath $CredFile -Algorithm SHA256).Hash
         }
         catch {
             $activeLocked = $true
@@ -205,7 +209,7 @@ function Get-Slots {
         $isActive = $false
         if ($activeHash) {
             try {
-                $isActive = ((Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash -eq $activeHash)
+                $isActive = ((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -eq $activeHash)
             }
             catch {
                 $isActive = $false
@@ -384,11 +388,11 @@ function Invoke-SaveAction {
 
     $safeName = Get-SafeName $Name
 
-    if (-not (Test-Path -Path $CredFile)) {
+    if (-not (Test-Path -LiteralPath $CredFile)) {
         throw "$CredFile not found. Log in via Claude Code first."
     }
 
-    Copy-Item -Path $CredFile -Destination (Join-Path $CredDir ".credentials.$safeName.json") -Force
+    Copy-Item -LiteralPath $CredFile -Destination (Join-Path $CredDir ".credentials.$safeName.json") -Force
     Write-Host "[Save] Saved as '$safeName'" -ForegroundColor "Green"
 }
 
@@ -417,11 +421,11 @@ function Invoke-SwitchAction {
 
     $target = Join-Path $CredDir ".credentials.$safeName.json"
 
-    if (-not (Test-Path -Path $target)) {
+    if (-not (Test-Path -LiteralPath $target)) {
         throw "Slot '$safeName' not found."
     }
 
-    Copy-Item -Path $target -Destination $CredFile -Force
+    Copy-Item -LiteralPath $target -Destination $CredFile -Force
     Write-Host "[Switch] Switched to '$safeName'. Close and restart Claude Code to apply." -ForegroundColor "Cyan"
 }
 
@@ -456,11 +460,11 @@ function Invoke-RemoveAction {
     $safeName = Get-SafeName $Name
     $target   = Join-Path $CredDir ".credentials.$safeName.json"
 
-    if (-not (Test-Path -Path $target)) {
+    if (-not (Test-Path -LiteralPath $target)) {
         throw "Slot '$safeName' not found."
     }
 
-    Remove-Item -Path $target -Force
+    Remove-Item -LiteralPath $target -Force
     Write-Host "[Remove] Removed '$safeName'" -ForegroundColor "Red"
 }
 
@@ -477,7 +481,7 @@ function Invoke-Main {
 
     # We are ensuring the credentials directory exists before
     # attempting any file operations within it.
-    if (-not (Test-Path -Path $CredDir)) {
+    if (-not (Test-Path -LiteralPath $CredDir)) {
         New-Item -ItemType Directory -Path $CredDir -Force | Out-Null
     }
 

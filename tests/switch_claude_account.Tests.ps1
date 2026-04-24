@@ -84,6 +84,13 @@ Describe 'switch_claude_account' {
             @{ Case = 'pipe';           Raw = 'a|b';         Expected = 'a_b' }
             @{ Case = 'trailing dot';   Raw = 'foo.';        Expected = 'foo' }
             @{ Case = 'many dots';      Raw = 'foo...';      Expected = 'foo' }
+            # Brackets are valid on the Windows filesystem but are PowerShell
+            # wildcard chars; leaving them in slot names would cause -Path
+            # operations to match unintended files (silent wrong-slot or
+            # data-loss bug).
+            @{ Case = 'open bracket';   Raw = 'foo[bar';     Expected = 'foo_bar' }
+            @{ Case = 'close bracket';  Raw = 'foo]bar';     Expected = 'foo_bar' }
+            @{ Case = 'both brackets';  Raw = 'foo[bar]';    Expected = 'foo_bar_' }
         ) {
             # Information stream 6 carries the "Sanitized to:" Write-Host notice;
             # redirect it to $null so it does not bleed into the return value.
@@ -239,6 +246,21 @@ Describe 'switch_claude_account' {
 
             Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'A'
         }
+
+        # Regression: if a literal bracket-containing slot file exists on disk
+        # (e.g., from a pre-sanitization version or manual placement), rotation
+        # must land on it without PowerShell's -Path wildcard expansion
+        # matching unrelated slots. Proves Test-Path and Copy-Item use
+        # -LiteralPath on the target slot.
+        It 'rotation onto a literal bracket slot copies the correct bytes' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.a.json')      -Value 'A'  -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.b[c].json')   -Value 'BC' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                       -Value 'A'  -NoNewline
+
+            Invoke-SwitchAction -Name '' 6>$null
+
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'BC'
+        }
     }
 
     Context 'Invoke-ListAction' {
@@ -289,6 +311,28 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Get-Slots' {
+        # Regression: a slot file whose literal name contains [ or ] must be
+        # hashed correctly so IsActive is true when that slot's content
+        # matches the active credentials. Before the -LiteralPath fix,
+        # Get-FileHash -Path wildcard-expanded the path and silently
+        # mis-identified which slot was active (or threw).
+        It 'marks a literal bracket slot as active when its hash matches .credentials.json' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.fooa.json')    -Value 'A'  -NoNewline
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.foo[bar].json') -Value 'BR' -NoNewline
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.json')         -Value 'BR' -NoNewline
+
+            $info   = Get-Slots
+            $active = @($info.Slots | Where-Object { $_.IsActive })
+
+            $active.Count    | Should -Be 1
+            $active[0].Name  | Should -Be 'foo[bar]'
+            $info.ActiveLocked | Should -BeFalse
+        }
+    }
+
     Context 'Invoke-RemoveAction' {
         It 'deletes the slot file' {
             $credDir = Join-Path $script:SandboxHome '.claude'
@@ -317,6 +361,26 @@ Describe 'switch_claude_account' {
             Invoke-RemoveAction -Name 'my work' 6>$null
 
             Test-Path -LiteralPath $slot | Should -BeFalse
+        }
+
+        # Regression: a user typing `sca remove foo[bar]` must NOT cause
+        # wildcard expansion of `foo[bar]` into a character class that
+        # matches unrelated slot files (fooa, foob, foor). Get-SafeName
+        # sanitizes brackets to _ so the user-facing name becomes
+        # foo_bar_; the lookup then misses and throws. The key assertions
+        # are that the unrelated slots survive and the throw message
+        # references the sanitized name.
+        It 'user-supplied bracket name is sanitized and does not wildcard-delete sibling slots' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.fooa.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.foob.json') -Value 'B' -NoNewline
+
+            { Invoke-RemoveAction -Name 'foo[bar]' 6>$null } |
+                Should -Throw -ExpectedMessage "*Slot 'foo_bar_' not found*"
+
+            Test-Path -LiteralPath (Join-Path $credDir '.credentials.fooa.json') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $credDir '.credentials.foob.json') | Should -BeTrue
         }
     }
 

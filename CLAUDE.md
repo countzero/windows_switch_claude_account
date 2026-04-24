@@ -17,7 +17,7 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 - **File locks**: `Copy-Item -Force` fails if Claude Code or VS Code has `.credentials.json` open. Always close the app before `save` or `switch`.
 - **Execution policy**: May need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
 - **Token expiry**: OAuth tokens refresh/expire after ~1 hour of inactivity. Stale slots need re-saving.
-- **Name sanitization**: Invalid Windows filename characters (including `\ / : * ? " < > |` and control chars) are replaced with `_`.
+- **Name sanitization**: Invalid Windows filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and spaces are replaced with `_`. Brackets are sanitized because PowerShell's `-Path` parameter treats them as character-class wildcards; without sanitization, `sca remove foo[bar]` would silently wildcard-match unrelated slot files. Paired with `-LiteralPath` on every credential-file op as defense-in-depth.
 
 ## Script actions
 

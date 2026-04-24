@@ -114,10 +114,11 @@ OAuth tokens expire after ~1 hour of inactivity. If a saved slot stops working:
 Close Claude Code / VS Code before running `sca save` or `sca switch` (see Workflow). PowerShell will show a clear error if you try to overwrite a locked file.
 
 ### Name sanitization
-Spaces and Windows-invalid filename characters (`\ / : * ? " < > |` and control chars) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected with an error.
+Spaces, Windows-invalid filename characters (`\ / : * ? " < > |` and control chars), and PowerShell wildcard brackets (`[` `]`) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected with an error.
 
 - `my personal` → `my_personal`
 - `foo/bar` → `foo_bar`
+- `foo[bar]` → `foo_bar_`
 - `foo.` → `foo`
 - `CON` → error (reserved device name)
 
