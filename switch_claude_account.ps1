@@ -1660,7 +1660,7 @@ function Format-UsageFrame {
         }
     }
 
-    if ($Footer) { Format-UsageFooter $Footer }
+    if ($Footer) { Format-UsageFooter $Footer } else { Write-Host '' }
 }
 
 # Render the multi-line footer block under a usage frame. Internal helper
