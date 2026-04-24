@@ -120,6 +120,13 @@ $Script:UsageUserAgent    = "claude-code/2.1.119"
 $Script:UsageTimeoutSec   = 5
 $Script:ProfileTimeoutSec = 10
 
+# Cache of the last successful /api/oauth/usage response per slot path.
+# Used as a fallback when the endpoint returns 429 (rate limited) so the
+# watch display stays functional during rate-limited periods. Entries
+# expire after $Script:UsageCacheTTL minutes.
+$Script:SlotUsageCache = @{}
+$Script:UsageCacheTTL  = 10
+
 # Plan-usability thresholds used by Get-PlanStatus / Format-UsageTable /
 # Format-UsageVerbose. The Status column on the usage table mixes HTTP
 # health (expired / unauthorized / error / no-oauth) with plan-state
@@ -913,6 +920,11 @@ function Get-SlotUsage {
                                   -Headers $headers `
                                   -TimeoutSec $Script:UsageTimeoutSec `
                                   -ErrorAction Stop
+        # Cache the successful response so we can fall back on 429.
+        $Script:SlotUsageCache[$SlotPath] = @{
+            Data      = $resp
+            Timestamp = [DateTime]::UtcNow
+        }
         return [pscustomobject]@{ Status = 'ok'; Data = $resp }
     }
     catch {
@@ -923,6 +935,38 @@ function Get-SlotUsage {
         }
         if ($status -eq 401 -or $status -eq 403) {
             return [pscustomobject]@{ Status = 'unauthorized' }
+        }
+        # On 429 (rate limited), fall back to cached data if available and
+        # still fresh. This keeps the watch display functional during rate-
+        # limited periods — usage data only changes every few hours at most.
+        if ($status -eq 429) {
+            if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
+                $entry = $Script:SlotUsageCache[$SlotPath]
+                if (([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -lt $Script:UsageCacheTTL) {
+                    return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
+                }
+            } else {
+                # No cached data — retry once after a short delay so back-to-back
+                # slot polls don't all hit the rate limit simultaneously.
+                Start-Sleep -Seconds 5
+                try {
+                    $resp2 = Invoke-RestMethod -Method Get `
+                                              -Uri $Script:UsageEndpoint `
+                                              -Headers $headers `
+                                              -TimeoutSec $Script:UsageTimeoutSec `
+                                              -ErrorAction Stop
+                    # Cache the successful retry.
+                    $Script:SlotUsageCache[$SlotPath] = @{
+                        Data      = $resp2
+                        Timestamp = [DateTime]::UtcNow
+                    }
+                    return [pscustomobject]@{ Status = 'ok'; Data = $resp2 }
+                }
+                catch {
+                    # Second attempt also failed — return clean rate-limited status.
+                    return [pscustomobject]@{ Status = 'rate-limited' }
+                }
+            }
         }
         return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
     }
@@ -1230,7 +1274,8 @@ function Get-StatusColor {
         '^expired'      { return 'Yellow' }
         '^unauthorized' { return 'Red' }
         '^error'        { return 'Red' }
-        default         { return 'Gray' }
+         '^rate-limited' { return 'Yellow' }
+         default         { return 'Gray' }
     }
 }
 
@@ -1301,6 +1346,7 @@ function Format-UsageTable {
                 if ($msg.Length -gt 60) { $msg = $msg.Substring(0, 60) + '...' }
                 "error: $msg"
             }
+            'rate-limited' { 'rate-limited' }
             default        { [string]$r.Status }
         }
 
@@ -1328,6 +1374,7 @@ function Format-UsageTable {
     $fmt = "  {0} {1,-$nameW}  {2,-$acctW}  {3,-$fiveW}  {4,-$sevenW}  {5}"
 
     Write-Host "[Usage] Plan usage per slot (live from /api/oauth/usage):" -ForegroundColor "Yellow"
+    Write-Host ''
     Write-Host ($fmt -f ' ',  'Slot',         'Account',       '5h',           '7d',            'Status')
     Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW),  ('-' * $fiveW), ('-' * $sevenW), '------')
 
@@ -1521,7 +1568,8 @@ function Get-UsageSnapshot {
             # Get-SlotFileInfo). No HTTP call here — the only source of
             # truth for a slot's email is its filename, which was written
             # by `sca save` from a fresh profile fetch at that moment.
-            Email    = $slot.Email
+            Email            = $slot.Email
+            IsCachedFallback = $usage.IsCachedFallback
         }
     }
 
@@ -1538,8 +1586,9 @@ function Get-UsageSnapshot {
             IsActive = $true
             Status   = $activeUsage.Status
             Data     = $activeUsage.Data
-            Error    = $activeUsage.Error
-            Email    = if ($activeProfile.Status -eq 'ok') { $activeProfile.Email } else { $null }
+            Error            = $activeUsage.Error
+            Email            = if ($activeProfile.Status -eq 'ok') { $activeProfile.Email } else { $null }
+            IsCachedFallback = $activeUsage.IsCachedFallback
         }
         # Append so the synth row appears after the saved slots, matching
         # the `sca list` ordering convention.
@@ -1550,8 +1599,9 @@ function Get-UsageSnapshot {
         Results         = @($results)
         HardlinkBroken  = $needSynthActive
         MatchedSlotName = $matchedSlotName
-        NoSlots         = $false
-        HasSynthRow     = $includeSynthetic
+        NoSlots          = $false
+        HasSynthRow      = $includeSynthetic
+        HasCacheFallback = ($results | Where-Object { $_.IsCachedFallback }).Count -gt 0
     }
 }
 
@@ -1592,6 +1642,12 @@ function Format-UsageFrame {
         Format-UsageVerbose -Result $results[0]
     } else {
         Format-UsageTable -Results @($results)
+    }
+
+    # Cache-fallback advisory: inform the user that data is stale because
+    # /api/oauth/usage returned 429 and we fell back to cached responses.
+    if ($Snapshot.HasCacheFallback) {
+        Write-Host "  [Usage] Warning: /api/oauth/usage rate limited — displaying cached data." -ForegroundColor "Yellow"
     }
 
     # Hardlink-broken advisory: only on the summary table; the verbose
@@ -1675,7 +1731,7 @@ function Invoke-UsageAction {
 # unofficial endpoint and we refuse to go faster. Clamping up (rather
 # than throwing) keeps the call ergonomic for users who just typed a
 # round number.
-$Script:UsageWatchMinInterval = 30
+$Script:UsageWatchMinInterval = 60
 
 # Live `sca usage -watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. Interactive only — throws when output
@@ -1733,7 +1789,7 @@ function Invoke-UsageWatch {
 
             $secsToNext = [math]::Max(0, [int][math]::Ceiling($Interval - ($now - $lastPoll).TotalSeconds))
             $footerLines = @(
-                "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))  |  next in ${secsToNext}s  |  q / Esc / Ctrl-C: quit  |  r / Space: refresh now"
+                "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))  |  next in ${secsToNext}s  |  Space: refresh"
             )
             if ($lastPollError) {
                 $footerLines += "[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next tick)"
