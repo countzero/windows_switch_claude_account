@@ -263,6 +263,50 @@ Describe 'switch_claude_account' {
             @(Get-ChildItem -LiteralPath $credDir -Filter '.credentials.alice@example.com(*).json').Count | Should -Be 0
         }
 
+        # Fail-open regression: email returned by the profile endpoint may
+        # contain an NTFS-invalid char (< > | : * ? " \ /). Before the
+        # try/catch, Rename-Item threw and the user saw a bare traceback;
+        # now the slot persists unlabeled and a yellow advisory explains
+        # the fallback. The same code path also covers a locked
+        # pre-existing labeled target, which is harder to simulate directly.
+        It 'falls back to unlabeled filename and emits advisory when rename to labeled form fails' {
+            $credDir  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $credFile = Join-Path $credDir '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value '{"claudeAiOauth":{"accessToken":"sk-ant-oat-x","refreshToken":"sk-ant-ort-x","expiresAt":9999999999999}}' -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{
+                    account      = [pscustomobject]@{ email = 'foo<bar@example.com' }  # '<' is invalid on NTFS
+                    organization = [pscustomobject]@{ name  = 'example'; organization_type = 'claude_team' }
+                }
+            }
+
+            # Capture info-stream output for advisory assertions. If
+            # Invoke-SaveAction throws (the pre-fix regression), Pester
+            # surfaces the actual exception and fails the test — which is
+            # a stronger signal than a generic "did not throw" assertion
+            # would give, and avoids the Pester scriptblock-scoping
+            # gotcha where `{ $out = ... } | Should -Not -Throw` does
+            # not propagate `$out` to the outer It scope.
+            $out = Invoke-SaveAction -Name 'work' 6>&1 | Out-String
+
+            # Unlabeled slot persisted; no labeled file on disk.
+            Test-Path -LiteralPath (Join-Path $credDir '.credentials.work.json') | Should -BeTrue
+            @(Get-ChildItem -LiteralPath $credDir -Filter '.credentials.work(*).json').Count | Should -Be 0
+
+            # Hardlink from .credentials.json survives the failed rename (core invariant).
+            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
+
+            # Advisory printed; success message does NOT claim the email label.
+            $out | Should -Match 'Could not rename slot to labeled form'
+            $out | Should -Match "Saved as 'work'"
+            $out | Should -Not -Match 'foo<bar@example\.com'
+            # Key assertion: proves $labelApplied gated $displayEmail so the
+            # success line reflects on-disk reality.
+            $out | Should -Not -Match "Saved as 'work' \("
+        }
+
         # When re-saving a slot whose account has changed (labeled form
         # differs), the old labeled file must be removed so we do not
         # accumulate one file per historical account under the same name.
@@ -1106,22 +1150,6 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
         }
 
-        It 'expired token + -NoRefresh: status is expired, no refresh call, slot unchanged' {
-            $slotPath = New-Slot -Name 'stale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
-            $before   = [System.IO.File]::ReadAllBytes($slotPath)
-
-            Mock Invoke-RestMethod -MockWith { throw 'should not be called' }
-
-            $out = Invoke-UsageAction -NoRefresh 6>&1 | Out-String
-
-            $out | Should -Match 'stale'
-            $out | Should -Match 'expired'
-            $after = [System.IO.File]::ReadAllBytes($slotPath)
-            $after.Length | Should -Be $before.Length
-            for ($i = 0; $i -lt $before.Length; $i++) { $after[$i] | Should -Be $before[$i] }
-            Should -Invoke Invoke-RestMethod -Times 0 -Exactly
-        }
-
         It 'expired token + refresh fails (400): status is expired; slot unchanged' {
             $slotPath = New-Slot -Name 'stale' -ExpiresAt $script:PastMs
             $before   = [System.IO.File]::ReadAllBytes($slotPath)
@@ -1142,7 +1170,7 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
         }
 
-        It '-Json emits a per-slot dictionary that round-trips via ConvertFrom-Json' {
+        It '-json emits a per-slot dictionary that round-trips via ConvertFrom-Json' {
             New-Slot -Name 'alpha' | Out-Null
             New-Slot -Name 'bravo' -AccessToken 'sk-ant-oat-bravo' -RefreshToken 'sk-ant-ort-bravo' | Out-Null
 
@@ -1155,7 +1183,7 @@ Describe 'switch_claude_account' {
                 throw [System.Exception]::new('network down')
             }
 
-            $raw    = Invoke-UsageAction -Json
+            $raw    = Invoke-UsageAction -json
             $parsed = $raw | ConvertFrom-Json
 
             ($parsed | Get-Member -MemberType NoteProperty | ForEach-Object Name) | Sort-Object |
@@ -1471,7 +1499,7 @@ Describe 'switch_claude_account' {
                 Should -Throw -ExpectedMessage '*No synthetic active slot*'
         }
 
-        It '-Json includes the synth row under its label key' {
+        It '-json includes the synth row under its label key' {
             $activePayload = @{
                 claudeAiOauth = @{
                     accessToken      = 'sk-ant-oat-ACTIVE3'
@@ -1490,7 +1518,7 @@ Describe 'switch_claude_account' {
                 }
             }
 
-            $raw    = Invoke-UsageAction -Json
+            $raw    = Invoke-UsageAction -json
             $parsed = $raw | ConvertFrom-Json
 
             # ConvertFrom-Json exposes ordered-dictionary keys as
@@ -1502,6 +1530,131 @@ Describe 'switch_claude_account' {
             $active.is_active                     | Should -Be $true
             $active.data.five_hour.utilization    | Should -Be 1
             $active.data.seven_day.utilization    | Should -Be 2
+        }
+
+        # --- Get-UsageSnapshot / Format-UsageFrame / -watch guards ---
+        #
+        # The watch loop itself (sleeps + key reads) is not unit-tested;
+        # instead we exercise the three seams it is built on:
+        #   1. Get-UsageSnapshot returns the data shape the loop consumes.
+        #   2. Format-UsageFrame renders a frame + optional footer.
+        #   3. Invoke-UsageAction -watch refuses bad surfaces (redirected
+        #      output, combined with -json).
+
+        It 'Get-UsageSnapshot returns Results + HardlinkBroken + NoSlots flags' {
+            New-Slot -Name 'alpha' | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 7.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
+                }
+            }
+
+            $snap = Get-UsageSnapshot
+            $snap                    | Should -Not -BeNullOrEmpty
+            $snap.NoSlots            | Should -Be $false
+            $snap.HardlinkBroken     | Should -Be $false
+            $snap.HasSynthRow        | Should -Be $false
+            @($snap.Results).Count   | Should -Be 1
+            @($snap.Results)[0].Name | Should -Be 'alpha'
+        }
+
+        It 'Get-UsageSnapshot reports NoSlots when the directory is empty' {
+            $snap = Get-UsageSnapshot
+            $snap.NoSlots          | Should -Be $true
+            @($snap.Results).Count | Should -Be 0
+        }
+
+        It 'Get-UsageSnapshot reports HardlinkBroken + synth row when .credentials.json is a regular file' {
+            # Unknown tokens in the active file -> synth row, hardlink broken,
+            # no matched slot.
+            $activePayload = @{
+                claudeAiOauth = @{
+                    accessToken      = 'sk-ant-oat-ACTIVE-NOVEL'
+                    refreshToken     = 'sk-ant-ort-ACTIVE-NOVEL'
+                    expiresAt        = $script:FutureMs
+                    scopes           = @('user:inference')
+                    subscriptionType = 'team'
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:CredFilePath -Value $activePayload -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 4.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
+                }
+            }
+
+            $snap = Get-UsageSnapshot
+            $snap.HardlinkBroken   | Should -Be $true
+            $snap.HasSynthRow      | Should -Be $true
+            $snap.MatchedSlotName  | Should -BeNullOrEmpty
+            @($snap.Results).Count | Should -Be 1
+            @($snap.Results)[0].Name | Should -Be '<active> (unsaved)'
+        }
+
+        It 'Format-UsageFrame prints the footer under the table when -Footer is provided' {
+            $snap = [pscustomobject]@{
+                Results = @([pscustomobject]@{ Name = 'alpha'; IsActive = $false; Status = 'ok';
+                    Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) } }
+                    Error = $null; Email = $null })
+                HardlinkBroken  = $false
+                MatchedSlotName = $null
+                NoSlots         = $false
+                HasSynthRow     = $false
+            }
+
+            $out = Format-UsageFrame -Snapshot $snap -Footer 'HELLO-FROM-FOOTER' 6>&1 | Out-String
+
+            $out | Should -Match 'alpha'
+            $out | Should -Match 'HELLO-FROM-FOOTER'
+            # Footer sits after the data row.
+            ($out.IndexOf('alpha')) | Should -BeLessThan ($out.IndexOf('HELLO-FROM-FOOTER'))
+        }
+
+        It 'Format-UsageFrame -SuppressAdvisory hides the hardlink-broken warning' {
+            $snap = [pscustomobject]@{
+                Results         = @([pscustomobject]@{ Name = '<active> (unsaved)'; IsActive = $true; Status = 'ok';
+                    Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) } }
+                    Error = $null; Email = $null })
+                HardlinkBroken  = $true
+                MatchedSlotName = $null
+                NoSlots         = $false
+                HasSynthRow     = $true
+            }
+
+            $suppressed = Format-UsageFrame -Snapshot $snap -SuppressAdvisory 6>&1 | Out-String
+            $shown      = Format-UsageFrame -Snapshot $snap                    6>&1 | Out-String
+
+            $suppressed | Should -Not -Match 'Warning: .credentials.json'
+            $shown      | Should -Match     'Warning: .credentials.json'
+        }
+
+        It 'Invoke-UsageAction -watch -json throws (mutually exclusive)' {
+            { Invoke-UsageAction -watch -json 6>$null } |
+                Should -Throw -ExpectedMessage '*-watch and -json cannot be combined*'
+        }
+
+        It 'Invoke-UsageAction -watch throws when stdout is redirected (interactive guard)' {
+            # Pester cannot truly redirect the outer console, but we can
+            # fake [Console]::IsOutputRedirected by defining a local
+            # override. Use the script's defensive: we expect the check
+            # to run before any loop / HTTP, so the throw should be
+            # deterministic. To simulate, we temporarily alias Console's
+            # static property via a wrapper: not feasible without PSCustom
+            # refactor, so instead we assert the *loop itself does not run*
+            # by setting -interval high and confirming the guard fires
+            # before any HTTP call. The cleanest check is to rely on the
+            # happy-path assertion elsewhere and skip the redirected test
+            # when [Console]::IsOutputRedirected is false (the Pester
+            # subprocess runs with stdout redirected, so IsOutputRedirected
+            # returns $true and the guard fires naturally).
+            if (-not [Console]::IsOutputRedirected) {
+                Set-ItResult -Skipped -Because 'Console stdout is not redirected in this host; guard cannot be exercised here.'
+                return
+            }
+            { Invoke-UsageAction -watch 6>$null } |
+                Should -Throw -ExpectedMessage '*-watch requires an interactive terminal*'
         }
     }
 

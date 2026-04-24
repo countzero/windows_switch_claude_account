@@ -53,16 +53,24 @@ Param (
     [switch]
     $help,
 
-    # -Json: emit the `usage` action's output as a machine-parseable JSON
+    # -json: emit the `usage` action's output as a machine-parseable JSON
     # object keyed by slot name. Ignored by other actions.
     [switch]
-    $Json,
+    $json,
 
-    # -NoRefresh: skip the OAuth refresh that `usage` normally performs on
-    # expired tokens. Marks those slots as 'expired' instead of hitting the
-    # token endpoint. Ignored by other actions.
+    # -watch: render a live, self-refreshing `usage` view that polls
+    # /api/oauth/usage every -interval seconds and redraws every second
+    # (so reset deltas and the countdown footer tick visibly). Interactive
+    # only — exits cleanly on q / Esc / Ctrl-C. Mutually exclusive with
+    # -json. Ignored by other actions.
     [switch]
-    $NoRefresh
+    $watch,
+
+    # -interval: seconds between HTTP polls when -watch is set. Floor is
+    # 30 to keep the unofficial endpoint politely polled; values below 30
+    # get clamped up with a one-line notice. Defaults to 30.
+    [int]
+    $interval = 30
 )
 
 # We are resolving the script path to reference this file when
@@ -174,9 +182,10 @@ function Show-Help {
         "  $cmd switch              # rotate to the next saved slot",
         "  $cmd list                # show all slots",
         "  $cmd remove old-acct     # delete a slot",
-        "  $cmd usage               # show 5h + weekly usage for every slot",
-        "  $cmd usage -NoRefresh    # do not auto-refresh expired OAuth tokens",
-        "  $cmd usage -Json         # emit usage as JSON for scripting",
+        "  $cmd usage                      # show 5h + weekly usage for every slot",
+        "  $cmd usage -watch               # live refresh; 30s polls; q or Ctrl-C to quit",
+        "  $cmd usage -watch -interval 60  # slower refresh (floor is 30s)",
+        "  $cmd usage -json                # emit usage as JSON for scripting",
         "",
         "FILES",
         "  Active login : $CredFile",
@@ -582,8 +591,9 @@ function Invoke-SaveAction {
     # (offline, 401, timeout, profile missing email) -> leave as
     # unlabeled and emit a non-fatal yellow notice; the user can re-run
     # `sca save <name>` when online to upgrade.
-    $finalPath = $unlabeledPath
-    $profile   = Get-SlotProfile -SlotPath $unlabeledPath
+    $finalPath  = $unlabeledPath
+    $finalEmail = $null
+    $profile    = Get-SlotProfile -SlotPath $unlabeledPath
     if ($profile.Status -eq 'ok' -and $profile.Email) {
         $labeledName = Get-SlotFileName -Name $safeName -Email $profile.Email
         $labeledPath = Join-Path $CredDir $labeledName
@@ -592,16 +602,30 @@ function Invoke-SaveAction {
                 Remove-Item -LiteralPath $labeledPath -Force
             }
             # Rename preserves the inode on NTFS, so the hardlink from
-            # .credentials.json follows the file automatically.
-            Rename-Item -LiteralPath $unlabeledPath -NewName $labeledName
-            $finalPath = $labeledPath
+            # .credentials.json follows the file automatically. If the
+            # rename fails (e.g. email contains an NTFS-invalid character
+            # like '<' or ':'), fall back to the unlabeled form and emit
+            # an advisory so the save still succeeds — user can re-run
+            # later if Anthropic ever returns a sanitizable email.
+            try {
+                Rename-Item -LiteralPath $unlabeledPath -NewName $labeledName -ErrorAction Stop
+                $finalPath  = $labeledPath
+                $finalEmail = $profile.Email
+            }
+            catch {
+                Write-Host "[Save] Could not rename slot to labeled form (keeping unlabeled): $($_.Exception.Message)" -ForegroundColor "Yellow"
+            }
+        } else {
+            # Labeled == unlabeled (slot name equals email, dedup form):
+            # no rename needed, but the email is still known.
+            $finalEmail = $profile.Email
         }
     } else {
         $reason = if ($profile.Error) { $profile.Error } else { $profile.Status }
         Write-Host "[Save] Could not resolve account email (slot saved unlabeled): $reason" -ForegroundColor "Yellow"
     }
 
-    $displayEmail = if ($profile.Status -eq 'ok' -and $profile.Email) { " ($($profile.Email))" } else { '' }
+    $displayEmail = if ($finalEmail) { " ($finalEmail)" } else { '' }
     Write-Host "[Save] Saved as '$safeName'$displayEmail" -ForegroundColor "Green"
 }
 
@@ -815,18 +839,17 @@ function Update-SlotTokens {
 }
 
 # Call /api/oauth/usage for one slot. Auto-refreshes a token that is
-# expired or within 60s of expiry, unless -NoRefresh is passed. Returns:
+# expired or within 60s of expiry. Returns:
 #   @{ Status = 'ok';           Data = <parsed response> }
 #   @{ Status = 'no-oauth' }                                # slot has no claudeAiOauth
-#   @{ Status = 'expired'; Error? = <msg> }                 # token expired + refresh skipped/failed
+#   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed
 #   @{ Status = 'unauthorized' }                            # 401/403 from usage endpoint
 #   @{ Status = 'error';   Error = <msg> }                  # network / shape / other
 # Never throws to callers; surfaces every failure mode as a Status value
 # so Invoke-UsageAction can render mixed-health tables without aborting.
 function Get-SlotUsage {
     Param (
-        [String] $SlotPath,
-        [switch] $NoRefresh
+        [String] $SlotPath
     )
 
     try {
@@ -847,9 +870,6 @@ function Get-SlotUsage {
     # expire mid-call.
     $threshold = [DateTime]::UtcNow.AddSeconds(60)
     if ($info.ExpiresAt -and $info.ExpiresAt -lt $threshold) {
-        if ($NoRefresh) {
-            return [pscustomobject]@{ Status = 'expired' }
-        }
         try {
             $accessToken = Update-SlotTokens -SlotPath $SlotPath
         }
@@ -906,8 +926,7 @@ function Get-SlotUsage {
 # known-good call shape.
 function Get-SlotProfile {
     Param (
-        [String] $SlotPath,
-        [switch] $NoRefresh
+        [String] $SlotPath
     )
 
     try {
@@ -927,9 +946,6 @@ function Get-SlotProfile {
     # both endpoints behave identically under token rotation.
     $threshold = [DateTime]::UtcNow.AddSeconds(60)
     if ($info.ExpiresAt -and $info.ExpiresAt -lt $threshold) {
-        if ($NoRefresh) {
-            return [pscustomobject]@{ Status = 'expired' }
-        }
         try {
             $accessToken = Update-SlotTokens -SlotPath $SlotPath
         }
@@ -1164,7 +1180,7 @@ function Format-UsageTable {
 # ("Current session") and seven_day ("Current week (all models)"). Other
 # buckets returned by the endpoint are intentionally not rendered here
 # because they are not the limits the user is tracking; they remain
-# accessible via `sca usage <name> -Json`.
+# accessible via `sca usage <name> -json`.
 function Format-UsageVerbose {
     Param ([object] $Result)
 
@@ -1215,12 +1231,37 @@ function Format-UsageVerbose {
     & $renderOne 'Weekly (all models)' $seven
 }
 
-function Invoke-UsageAction {
-    Param (
-        [String] $Name,
-        [switch] $Json,
-        [switch] $NoRefresh
-    )
+# --- usage action: data + rendering split ---------------------------------
+#
+# Invoke-UsageAction was originally a single function that both gathered
+# per-slot usage data and wrote the output. Splitting the two makes
+# `sca usage -watch` possible: the watch loop re-gathers a fresh snapshot
+# each poll, keeps the previous snapshot visible during HTTP failures,
+# and calls the same frame renderer that the one-shot path uses. The
+# split also keeps the test matrix clean — unit tests mock the data
+# layer and assert on the rendered frame.
+#
+# Snapshot shape (Get-UsageSnapshot):
+#   Results          : array of per-slot result rows
+#                      { Name, IsActive, Status, Data, Error, Email }
+#   HardlinkBroken   : $true when .credentials.json is a regular file
+#                      (not a hardlink) — drives the synth <active> row
+#                      and the post-table advisory.
+#   MatchedSlotName  : saved-slot whose content matches .credentials.json,
+#                      or $null. Used only to steer the advisory wording.
+#   NoSlots          : $true when there are zero saved slots AND no synth
+#                      row to render. Caller prints the "no slots" hint.
+#   HasSynthRow      : $true when a synth <active> row was appended to
+#                      Results. Convenience flag so the renderer does
+#                      not re-derive it.
+
+# Gather the per-slot usage snapshot used by both the one-shot action and
+# the live watch loop. Performs all network IO (Get-SlotUsage per slot,
+# plus one extra Get-SlotProfile for the synth <active> row when the
+# hardlink is broken). Never renders; callers decide between table,
+# verbose, JSON, and watch-frame presentations.
+function Get-UsageSnapshot {
+    Param ([String] $Name)
 
     $info  = Get-Slots
     $slots = @($info.Slots)
@@ -1233,9 +1274,8 @@ function Invoke-UsageAction {
     # won't flow into the saved slots, and our content-hash match may
     # coincide with a saved slot only because of a prior identical snapshot.
     # In that case we add a synthetic <active> row so the user sees the
-    # usage that Claude Code itself would see, and emit the same warning
-    # `sca list` produces.
-    $credExists    = Test-Path -LiteralPath $CredFile
+    # usage that Claude Code itself would see.
+    $credExists     = Test-Path -LiteralPath $CredFile
     $credIsHardlink = $false
     if ($credExists) {
         try {
@@ -1253,22 +1293,22 @@ function Invoke-UsageAction {
     $synthName       = $null
     $matchedSlotName = $null
     if ($needSynthActive) {
-        # Find a saved slot whose content matches .credentials.json so we
-        # can steer the warning message and choose between the <active>
-        # vs. <active> (unsaved) labels.
         $matchedSlotName = ($slots | Where-Object { $_.IsActive } | Select-Object -First 1 -ExpandProperty Name)
-        $synthName = if ($matchedSlotName) { $Script:ActiveSlotNameMatched } else { $Script:ActiveSlotNameUnsaved }
-
+        $synthName       = if ($matchedSlotName) { $Script:ActiveSlotNameMatched } else { $Script:ActiveSlotNameUnsaved }
         # A synthetic <active> row carries the `*` marker; suppress the
         # content-hash match on saved slots so the `*` appears exactly
-        # once. The saved slot's row still lists in the table; just without
-        # the active marker.
+        # once. The saved slot's row still lists; just without the marker.
         foreach ($s in $slots) { $s.IsActive = $false }
     }
 
     if ($slots.Count -eq 0 -and -not $needSynthActive) {
-        Write-Host "[Usage] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
-        return
+        return [pscustomobject]@{
+            Results         = @()
+            HardlinkBroken  = $false
+            MatchedSlotName = $null
+            NoSlots         = $true
+            HasSynthRow     = $false
+        }
     }
 
     # -Name filter: accept saved-slot names AND the two synth labels (they
@@ -1276,8 +1316,8 @@ function Invoke-UsageAction {
     # them before sanitizing). When a synth label is requested but
     # .credentials.json is absent or normally-linked, fall through to the
     # saved-slot match path which will throw 'not found' as usual.
-    $selectedSlots     = $slots
-    $includeSynthetic  = $needSynthActive
+    $selectedSlots    = $slots
+    $includeSynthetic = $needSynthActive
     if ($Name) {
         if ($Name -eq $Script:ActiveSlotNameUnsaved -or $Name -eq $Script:ActiveSlotNameMatched -or $Name -eq '<active>') {
             if (-not $needSynthActive) {
@@ -1296,7 +1336,7 @@ function Invoke-UsageAction {
     }
 
     $results = foreach ($slot in $selectedSlots) {
-        $usage = Get-SlotUsage -SlotPath $slot.Path -NoRefresh:$NoRefresh
+        $usage = Get-SlotUsage -SlotPath $slot.Path
         [pscustomobject]@{
             Name     = $slot.Name
             IsActive = $slot.IsActive
@@ -1312,13 +1352,13 @@ function Invoke-UsageAction {
     }
 
     if ($includeSynthetic) {
-        $activeUsage = Get-SlotUsage -SlotPath $CredFile -NoRefresh:$NoRefresh
+        $activeUsage = Get-SlotUsage -SlotPath $CredFile
         # For the synth <active> row we do not have a filename-encoded
         # email (the active file is always `.credentials.json`), so we
         # keep the live profile call only for this row. At most one
-        # extra HTTP call per `sca usage` invocation, and only when a
-        # synth row is rendered (hardlink broken / fresh login state).
-        $activeProfile = Get-SlotProfile -SlotPath $CredFile -NoRefresh:$NoRefresh
+        # extra HTTP call per snapshot, and only when a synth row is
+        # rendered (hardlink broken / fresh login state).
+        $activeProfile = Get-SlotProfile -SlotPath $CredFile
         $synthRow = [pscustomobject]@{
             Name     = $synthName
             IsActive = $true
@@ -1327,19 +1367,111 @@ function Invoke-UsageAction {
             Error    = $activeUsage.Error
             Email    = if ($activeProfile.Status -eq 'ok') { $activeProfile.Email } else { $null }
         }
-        # Append so the synth row appears after the saved slots in the
-        # summary table, matching the `sca list` ordering convention.
+        # Append so the synth row appears after the saved slots, matching
+        # the `sca list` ordering convention.
         $results = @($results) + $synthRow
     }
 
-    if ($Json) {
+    return [pscustomobject]@{
+        Results         = @($results)
+        HardlinkBroken  = $needSynthActive
+        MatchedSlotName = $matchedSlotName
+        NoSlots         = $false
+        HasSynthRow     = $includeSynthetic
+    }
+}
+
+# Render one usage frame (table OR verbose view, plus optional advisory
+# and optional footer). Pure presentation — does not call the network.
+# Used by both the one-shot action and the live watch loop; the same
+# frame renders identically in either context so tests assert on the
+# frame shape without running the loop.
+#
+# -Name        : when set, selects the single-slot verbose view. Empty
+#                -> summary table.
+# -Snapshot    : output of Get-UsageSnapshot for this frame.
+# -Footer      : optional string printed below the table / verbose view
+#                and below the hardlink advisory, for the watch-mode
+#                "Last updated / next poll / keybindings" line. Multi-
+#                line strings are split and each line rendered in the
+#                DarkGray information color.
+# -SuppressAdvisory : when true, skip the hardlink-broken advisory (the
+#                verbose single-slot drill-down already-targeted; the
+#                warning is noise there).
+function Format-UsageFrame {
+    Param (
+        [String]                $Name,
+        [pscustomobject]        $Snapshot,
+        [AllowEmptyString()]
+        [AllowNull()] [String]  $Footer,
+        [switch]                $SuppressAdvisory
+    )
+
+    if (-not $Snapshot -or $Snapshot.NoSlots) {
+        Write-Host "[Usage] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
+        if ($Footer) { Format-UsageFooter $Footer }
+        return
+    }
+
+    $results = @($Snapshot.Results)
+    if ($Name -and $results.Count -eq 1) {
+        Format-UsageVerbose -Result $results[0]
+    } else {
+        Format-UsageTable -Results @($results)
+    }
+
+    # Hardlink-broken advisory: only on the summary table; the verbose
+    # drill-down is already a targeted view and does not need it.
+    if ($Snapshot.HardlinkBroken -and -not $Name -and -not $SuppressAdvisory) {
+        if ($Snapshot.MatchedSlotName) {
+            Write-Host "[Usage] Warning: .credentials.json is not hardlinked to '$($Snapshot.MatchedSlotName)' (auto-sync broken). Run 'sca switch $($Snapshot.MatchedSlotName)' to repair." -ForegroundColor "Yellow"
+        } else {
+            Write-Host "[Usage] Warning: .credentials.json is not hardlinked to any saved slot. Run 'sca save <name>' to capture the active session, or 'sca switch <name>' to overwrite it with a saved slot." -ForegroundColor "Yellow"
+        }
+    }
+
+    if ($Footer) { Format-UsageFooter $Footer }
+}
+
+# Render the multi-line footer block under a usage frame. Internal helper
+# for Format-UsageFrame; extracted so the watch loop and any future
+# footer-consumers share one wrapping policy.
+function Format-UsageFooter {
+    Param ([String] $Footer)
+
+    Write-Host ""
+    foreach ($line in ($Footer -split "`r?`n")) {
+        Write-Host $line -ForegroundColor "DarkGray"
+    }
+}
+
+function Invoke-UsageAction {
+    Param (
+        [String] $Name,
+        [switch] $json,
+        [switch] $watch,
+        [int]    $interval = 30
+    )
+
+    if ($json -and $watch) {
+        throw "-watch and -json cannot be combined; -watch is interactive, -json is for scripting."
+    }
+
+    if ($watch) {
+        Invoke-UsageWatch -Name $Name -Interval $interval
+        return
+    }
+
+    $snapshot = Get-UsageSnapshot -Name $Name
+
+    if ($json) {
         # Per-slot dictionary. Each entry carries the raw response under
         # .data so scripts can pull any field Anthropic returns, including
         # buckets this script does not render in the table or verbose view.
         # The `account` block is included whenever the email was resolved;
         # currently only .email is surfaced (scope decision).
         $out = [ordered]@{}
-        foreach ($r in $results) {
+        foreach ($r in $snapshot.Results) {
             $entry = [ordered]@{
                 status    = $r.Status
                 is_active = [bool]$r.IsActive
@@ -1353,21 +1485,116 @@ function Invoke-UsageAction {
         return
     }
 
-    if ($Name -and $results.Count -eq 1) {
-        Format-UsageVerbose -Result $results[0]
-    } else {
-        Format-UsageTable -Results @($results)
+    Format-UsageFrame -Name $Name -Snapshot $snapshot
+}
+
+# Minimum poll interval for -watch. Matches the default so users can only
+# adjust the interval upward; the floor is the "polite" setting for the
+# unofficial endpoint and we refuse to go faster. Clamping up (rather
+# than throwing) keeps the call ergonomic for users who just typed a
+# round number.
+$Script:UsageWatchMinInterval = 30
+
+# Live `sca usage -watch` loop: redraws once per second and re-polls the
+# endpoint every -Interval seconds. Interactive only — throws when output
+# is redirected because Clear-Host would poison a captured log. Exits
+# cleanly on q / Esc / Ctrl-C; r / Space forces an immediate re-poll on
+# the next tick. On HTTP failure the previous snapshot stays visible and
+# an advisory is appended to the footer so the display never blanks.
+#
+# The loop is deliberately simple: blocking Invoke-RestMethod (via
+# Get-UsageSnapshot) inside the poll step, 50 ms key-poll granularity
+# during the 1 s inter-frame sleep. A runspace-based async poll would
+# feel snappier during the HTTP call but adds substantial complexity
+# that is not worth v1's budget.
+function Invoke-UsageWatch {
+    Param (
+        [String] $Name,
+        [int]    $Interval = $Script:UsageWatchMinInterval
+    )
+
+    if ([Console]::IsOutputRedirected) {
+        throw "-watch requires an interactive terminal; for scripted output use 'sca usage -json'."
     }
 
-    # Emit the same "hardlink broken" advisory `sca list` does, but only
-    # for the no-name (summary) table. The verbose single-slot view is
-    # already a targeted drill-down and does not need the warning.
-    if ($needSynthActive -and -not $Name) {
-        if ($matchedSlotName) {
-            Write-Host "[Usage] Warning: .credentials.json is not hardlinked to '$matchedSlotName' (auto-sync broken). Run 'sca switch $matchedSlotName' to repair." -ForegroundColor "Yellow"
-        } else {
-            Write-Host "[Usage] Warning: .credentials.json is not hardlinked to any saved slot. Run 'sca save <name>' to capture the active session, or 'sca switch <name>' to overwrite it with a saved slot." -ForegroundColor "Yellow"
+    if ($Interval -lt $Script:UsageWatchMinInterval) {
+        Write-Host "[Usage] -interval below minimum; clamping to $($Script:UsageWatchMinInterval)s (polite to the unofficial endpoint)." -ForegroundColor "Yellow"
+        $Interval = $Script:UsageWatchMinInterval
+    }
+
+    $origCursor = [Console]::CursorVisible
+    try {
+        [Console]::CursorVisible = $false
+
+        $snapshot      = $null
+        $lastPoll      = [DateTime]::MinValue
+        $lastPollError = $null
+
+        while ($true) {
+            $now = [DateTime]::Now
+            $dueForPoll = ($null -eq $snapshot) -or (($now - $lastPoll).TotalSeconds -ge $Interval)
+
+            if ($dueForPoll) {
+                try {
+                    $snapshot      = Get-UsageSnapshot -Name $Name
+                    $lastPollError = $null
+                }
+                catch {
+                    # Keep the previous snapshot visible. If the very first
+                    # poll failed we still need to show SOMETHING below the
+                    # header, so render an empty frame and surface the
+                    # error in the footer — the user can still quit cleanly.
+                    $lastPollError = $_.Exception.Message
+                }
+                $lastPoll = $now
+            }
+
+            $secsToNext = [math]::Max(0, [int][math]::Ceiling($Interval - ($now - $lastPoll).TotalSeconds))
+            $footerLines = @(
+                "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))  |  next in ${secsToNext}s  |  q / Esc / Ctrl-C: quit  |  r / Space: refresh now"
+            )
+            if ($lastPollError) {
+                $footerLines += "[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next tick)"
+            }
+            $footer = $footerLines -join "`n"
+
+            Clear-Host
+            if ($null -ne $snapshot) {
+                # -SuppressAdvisory: during watch mode the hardlink warning
+                # is still useful but fires once per second of redraw; that
+                # is loud. Show it only on every poll boundary (when we
+                # just refreshed) so the user gets the message without
+                # the header flashing it constantly.
+                $suppress = -not $dueForPoll
+                Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer -SuppressAdvisory:$suppress
+            } else {
+                # First poll failed and we have nothing to render yet.
+                Write-Host "[Watch] Waiting for first successful /api/oauth/usage response..." -ForegroundColor "Yellow"
+                Format-UsageFooter $footer
+            }
+
+            # 1-second inter-frame wait, but wake every 50 ms to check for
+            # key input. 50 ms is the compromise between key-responsiveness
+            # (<100 ms feels instant) and wasted wakeups.
+            $tickEnd = [DateTime]::Now.AddSeconds(1)
+            while ([DateTime]::Now -lt $tickEnd) {
+                if ([Console]::KeyAvailable) {
+                    $k = [Console]::ReadKey($true)
+                    switch ($k.Key) {
+                        'Q'        { return }
+                        'Escape'   { return }
+                        # Force-refresh: backdate the poll timestamp so
+                        # the next iteration's `$dueForPoll` test fires.
+                        'R'        { $lastPoll = [DateTime]::MinValue }
+                        'Spacebar' { $lastPoll = [DateTime]::MinValue }
+                    }
+                }
+                Start-Sleep -Milliseconds 50
+            }
         }
+    }
+    finally {
+        [Console]::CursorVisible = $origCursor
     }
 }
 
@@ -1395,7 +1622,7 @@ function Invoke-Main {
         "switch"    { Invoke-SwitchAction -Name $Name }
         "list"      { Invoke-ListAction }
         "remove"    { Invoke-RemoveAction -Name $Name }
-        "usage"     { Invoke-UsageAction  -Name $Name -Json:$Json -NoRefresh:$NoRefresh }
+        "usage"     { Invoke-UsageAction  -Name $Name -json:$json -watch:$watch -interval $interval }
     }
 }
 

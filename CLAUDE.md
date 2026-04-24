@@ -28,7 +28,7 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 | `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). |
 | `list`     | No            | Lists saved slot names |
 | `remove`   | Yes           | Deletes a named slot |
-| `usage`    | Optional      | Calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens in place (hardlink-preserving). Accepts `-Json` and `-NoRefresh` switches. With `<name>`, renders a verbose single-slot block including opus / sonnet / overage buckets. |
+| `usage`    | Optional      | Calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens in place (hardlink-preserving). Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 30) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block including opus / sonnet / overage buckets. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile |
 | `uninstall`| No            | Removes wrapper function + aliases from profile |
 | `help`     | No            | Shows detailed help |
@@ -76,19 +76,97 @@ Response schema (verified against a live Team-plan call on 2026-04-24):
 }
 ```
 
-All branches are optional; free-tier / API-key accounts receive `{}`. The `-Json` switch emits the raw response under `data` per slot so scripts can pull any field the script itself does not format.
+All branches are optional; free-tier / API-key accounts receive `{}`. The `-json` switch emits the raw response under `data` per slot so scripts can pull any field the script itself does not format.
 
-By design the script only **renders** two buckets in both the summary table and the verbose view: `five_hour` (labelled *Session (5h)*) and `seven_day` (labelled *Weekly (all models)*) — matching Claude Code's own `/usage` screen's first two bars. Every other bucket the endpoint returns (`seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal codenames) still round-trips through `-Json`; it just does not have a human-readable row in the normal view.
+By design the script only **renders** two buckets in both the summary table and the verbose view: `five_hour` (labelled *Session (5h)*) and `seven_day` (labelled *Weekly (all models)*) — matching Claude Code's own `/usage` screen's first two bars. Every other bucket the endpoint returns (`seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal codenames) still round-trips through `-json`; it just does not have a human-readable row in the normal view.
 
 Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { used_percentage, resets_at } } }` before handing it to its status-line hook — that is the schema you will find by grepping `used_percentage` in `claude.exe`. **Do not** trust the hook-input schema for parsing the raw endpoint response; use the shape above.
 
 `Format-ResetDelta` renders the ISO string as a relative delta in the summary table (variant C: hours+minutes under 24h, integer total hours at/above 24h — e.g. `in 2h 14m`, `in 103h`). `Format-ResetAbsolute` renders it as local-tz wall-clock in the `sca usage <name>` verbose view (`Resets 7:50pm Europe/Berlin`, `Resets Apr 26, 9am Europe/Berlin`), matching Claude Code's own `/usage` display.
 
+### Summary-table layout + Status column semantics
+
+`Format-UsageTable` renders 5 data columns (plus the leading `*` active marker): `Slot | Account | 5h | 7d | Status`.
+
+- **Merged bucket cells**. `5h` and `7d` each combine utilization and reset delta in a single cell: `100% in 2h 37m`. A cold bucket (`utilization = 0`, `resets_at = null`) renders as just ` 0%` — the em-dash reset sentinel is only emitted when the bucket itself has no data at all. Column widths auto-fit to the widest cell in the batch.
+- **Account column**. Pulls the email parsed from the slot filename by `Get-SlotFileInfo`. Renders `—` for unlabeled slots and for slots whose name equals the labeled email (dedup form). Long emails are middle-truncated with `…` at `$Script:AccountColumnMaxWidth = 32` characters; the full string is always retained in `sca usage <name>` verbose view and in `-Json`. Replaces the previous `└─ email` continuation line — rows are now single-line.
+- **Status column** mixes HTTP health with plan usability. When the `/api/oauth/usage` call succeeded, `Get-PlanStatus` derives the label from the utilization values:
+
+  | State                                       | Label               | Color |
+  |---------------------------------------------|---------------------|-------|
+  | Both buckets below `$Script:UtilWarnPct`    | `ok`                | Green if active, Gray otherwise |
+  | HTTP ok but response carried no buckets     | `ok (no plan data)` | same as `ok` |
+  | Any bucket ≥ `UtilWarnPct` and all < `UtilLimitPct` | `near limit` | Yellow |
+  | 5h bucket ≥ `UtilLimitPct`                  | `limited 5h`        | Red |
+  | 7d bucket ≥ `UtilLimitPct`                  | `limited 7d`        | Red |
+  | Both buckets ≥ `UtilLimitPct`               | `limited`           | Red |
+  | HTTP failure states                         | `expired` / `unauthorized` / `error: …` / `no-oauth (api key or non-claude.ai slot)` | Yellow / Red / Red / DarkGray |
+
+  The thresholds are script-scope constants (`$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`) next to the usage endpoint constants. `100%` is the hard cap Anthropic enforces; `90%` is the heads-up tier. `Get-StatusColor` is the single source of truth for the color mapping so the summary table and verbose view stay in lockstep.
+
+A row flagged `limited 5h` / `limited 7d` / `limited` cannot serve new prompts until the named window resets. This was previously rendered as `ok` in the old HTTP-only Status column, which was misleading — the rewrite is the reason this section exists.
+
+### Verbose view (`sca usage <slot>`)
+
+`Format-UsageVerbose` renders a single slot as a 4-line block:
+
+```
+[Usage] Slot 'slot-1'
+  Account: kumkar@stadtwerk.org
+  Status:  limited 5h - no prompts until 5h window resets
+  Session (5h)         100%  Resets 7:50pm Europe/Berlin
+  Weekly (all models)   28%  Resets Apr 26, 9am Europe/Berlin
+```
+
+The `Status:` line sits between `Account:` and the bucket rows so the usability verdict is the first thing read. `Get-StatusRationale` supplies a short English tail for the non-obvious labels (`limited 5h`, `limited 7d`, `limited`, `near limit`, `ok (no plan data)`); plain `ok` renders without a tail.
+
+### `-Json` output
+
+Each per-slot entry carries the same fields as before plus a `plan_status` string when the HTTP call succeeded:
+
+```jsonc
+{
+  "slot-1": {
+    "status":      "ok",
+    "is_active":   false,
+    "plan_status": "limited 5h",          // absent for HTTP-failure rows
+    "account":     { "email": "kumkar@stadtwerk.org" },
+    "data":        { /* raw /api/oauth/usage body */ }
+  }
+}
+```
+
+`plan_status` values match the Status column labels verbatim so scripts can branch on usability without re-deriving the thresholds. The full untruncated email always lives in `account.email`, regardless of the summary table's truncation width.
+
+### Watch mode (`sca usage -watch`)
+
+`Invoke-UsageWatch` provides a self-refreshing live view of the usage table or verbose view. It re-polls the endpoint every `-interval` seconds (default **30 s**, floor **30 s**) and redraws the frame once per second so reset deltas (`in 2h 37m`) and the countdown footer tick visibly between polls.
+
+Design split driven by the watch loop:
+
+- **`Get-UsageSnapshot`** is the pure data-gathering function: enumerates slots, calls `Get-SlotUsage` (and `Get-SlotProfile` for the synth row), and returns `{ Results, HardlinkBroken, MatchedSlotName, NoSlots, HasSynthRow }`. Never renders. The one-shot path and the watch loop both call it.
+- **`Format-UsageFrame`** is the pure renderer: takes a snapshot plus an optional footer string and prints table-or-verbose + optional hardlink advisory + footer. Used identically from both entry points, so the frame shape is asserted by the suite and the watch loop automatically inherits every rendering guarantee.
+- **`Invoke-UsageWatch`** is the loop itself. Untested — its behavior is `Clear-Host` + `Format-UsageFrame` on a 1-second tick with 50 ms inner-loop key polling.
+
+Runtime guards (both throw, neither runs the loop):
+
+- `-watch -json` — mutually exclusive; `-watch` is interactive, `-json` is for scripting.
+- `[Console]::IsOutputRedirected` — `sca usage -watch > file.txt` is refused rather than silently filling the file with `Clear-Host`-shredded frames; the error message points at `-json`.
+
+Interval clamping: values below `$Script:UsageWatchMinInterval = 30` get clamped up to 30 with a one-line yellow advisory. The floor matches the default so `-interval` can only *slow* the poll — this is deliberate, the unofficial endpoint has no published rate limit and we prefer conservative cadence.
+
+Key bindings inside the loop:
+
+- `q`, `Esc`, or Ctrl-C → exit cleanly; the `finally` block restores `[Console]::CursorVisible` to its pre-loop value.
+- `r`, `Space` → force an immediate re-poll on the next tick (backdates the poll timestamp so the next iteration's `dueForPoll` check fires).
+
+Error handling: if an HTTP call fails mid-loop, the previous snapshot stays on screen and a second line appears under the footer reading `[Watch] Last poll failed: <msg> (keeping previous data; will retry on next tick)`. The hardlink-broken advisory is suppressed on redraws between polls (only shown on freshly-polled frames) so the warning does not flash every second.
+
 ### Profile endpoint + filename-encoded email
 
 `Invoke-SaveAction` resolves the OAuth account email at save time via `GET https://api.anthropic.com/api/oauth/profile` (Claude Code's `Ql()` function, same auth token as the usage endpoint). Claude Code's exact header shape is used: `Authorization: Bearer <token>` + `Content-Type: application/json`, 10 s timeout, **no** `anthropic-beta` or `User-Agent`. Matches Ql() verbatim so a future Anthropic header-validation change breaks us no sooner than it breaks Claude Code itself.
 
-Response consumption is minimal — only `account.email` is rendered. The full response carries `account.uuid`, `account.display_name`, `organization.name`, `organization.organization_type`, `organization.rate_limit_tier`, `organization.has_extra_usage_enabled`, `organization.billing_type`, `organization.subscription_created_at`, `organization.cc_onboarding_flags`, `organization.claude_code_trial_ends_at`, and `organization.claude_code_trial_duration_days`; all still round-trip through `sca usage -Json` under the per-slot `.data` key if callers need them.
+Response consumption is minimal — only `account.email` is rendered. The full response carries `account.uuid`, `account.display_name`, `organization.name`, `organization.organization_type`, `organization.rate_limit_tier`, `organization.has_extra_usage_enabled`, `organization.billing_type`, `organization.subscription_created_at`, `organization.cc_onboarding_flags`, `organization.claude_code_trial_ends_at`, and `organization.claude_code_trial_duration_days`; all still round-trip through `sca usage -json` under the per-slot `.data` key if callers need them.
 
 The resolved email is embedded directly in the slot filename using the RFC 5322 parenthesized-comment form:
 
@@ -116,7 +194,7 @@ Synth `<active>` row: `.credentials.json` has no filename-encoded email, so when
 
 On-disk migration from the previous cache-based implementation: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` sidecars and the `.credentials.profile.json` file on each enumeration (the cleanup is cheap and idempotent once complete).
 
-Display contract: the `  └─ <email>` second line under a slot row in `sca list` / `sca usage` only appears when the slot's labeled email (case-insensitive) differs from the slot name. Slots saved with the deduplicated form, and unlabeled slots (offline save), render as a single line.
+Display contract: the `  └─ <email>` second line under a slot row in `sca list` only appears when the slot's labeled email (case-insensitive) differs from the slot name. Slots saved with the deduplicated form, and unlabeled slots (offline save), render as a single line. `sca usage` no longer uses the continuation line at all — emails live in the `Account` column on the same row (see the Summary-table layout section above).
 
 ### Synthetic `<active>` row + hardlink warning
 
