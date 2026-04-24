@@ -1680,7 +1680,7 @@ function Invoke-UsageAction {
         [String] $Name,
         [switch] $json,
         [switch] $watch,
-        [int]    $interval = 30
+        [int]    $interval = $Script:UsageWatchMinInterval
     )
 
     if ($json -and $watch) {
