@@ -53,6 +53,14 @@ sca list
 sca switch work
 ```
 
+### Rotate to the next slot
+
+```powershell
+sca switch
+```
+
+Without a name, `switch` activates the next slot in alphabetical order and wraps from the last slot back to the first. Useful for cycling through accounts without typing names. If the active credentials file is locked or does not match any saved slot, rotation falls back to the first slot and tells you so.
+
 ### Remove a slot
 
 ```powershell

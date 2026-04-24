@@ -16,6 +16,18 @@
 
 BeforeAll {
     $script:ScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..\switch_claude_account.ps1')).Path
+
+    # Shared helper for install/uninstall round-trip tests. Throws with a
+    # precise offset on first mismatch so Pester shows exactly where the
+    # byte sequences diverge instead of a generic "not equal" failure.
+    function Assert-BytesEqual ([byte[]] $Expected, [byte[]] $Actual) {
+        $Actual.Length | Should -Be $Expected.Length
+        for ($i = 0; $i -lt $Expected.Length; $i++) {
+            if ($Expected[$i] -ne $Actual[$i]) {
+                throw "Byte mismatch at offset $i"
+            }
+        }
+    }
 }
 
 Describe 'switch_claude_account' {
@@ -105,25 +117,6 @@ Describe 'switch_claude_account' {
         It 'returns utf8NoBOM when file does not exist' {
             $missing = Join-Path $TestDrive 'does-not-exist.ps1'
             Get-ProfileEncoding $missing | Should -Be 'utf8NoBOM'
-        }
-    }
-
-    Context 'Test-IsMarkerLine' {
-        It '<Case>' -ForEach @(
-            @{ Case = 'exact match';         Line = '# === X ===';        Expected = $true  }
-            @{ Case = 'leading whitespace';  Line = '   # === X ===';     Expected = $true  }
-            @{ Case = 'trailing whitespace'; Line = '# === X ===   ';     Expected = $true  }
-            @{ Case = 'tabs around';         Line = "`t# === X ===`t";    Expected = $true  }
-            @{ Case = 'different case';      Line = '# === x ===';        Expected = $false }
-            @{ Case = 'empty';               Line = '';                   Expected = $false }
-            @{ Case = 'substring only';      Line = 'echo "# === X ==="'; Expected = $false }
-            @{ Case = 'marker with suffix';  Line = '# === X === extra';  Expected = $false }
-        ) {
-            Test-IsMarkerLine -Line $Line -Marker '# === X ===' | Should -Be $Expected
-        }
-
-        It 'returns false for $null' {
-            Test-IsMarkerLine -Line $null -Marker '# === X ===' | Should -BeFalse
         }
     }
 
@@ -287,9 +280,12 @@ Describe 'switch_claude_account' {
             $out = Invoke-ListAction 6>&1 | Out-String
 
             $out | Should -Match 'work'
-            # A raw ".credentials" entry would show as an empty slot name;
-            # make sure none of that leaks through.
-            $out | Should -Not -Match '(?m)^\s*\*?\s{3}\s*\(active\)'
+            # If the Where-Object filter in Get-Slots ever regresses,
+            # .credentials.json itself leaks as a slot whose rendered name is
+            # the literal '.credentials'. Anchor to the list-row shape
+            # (leading ' * ' or '   ' indent) so this assertion catches the
+            # leak without false-positiving on legitimate slot names.
+            $out | Should -Not -Match '(?m)^\s*\*?\s+\.credentials(\s|$)'
         }
     }
 
@@ -355,12 +351,7 @@ Describe 'switch_claude_account' {
             Add-To-Profile 6>$null
             $bytes2 = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
 
-            $bytes1.Length | Should -Be $bytes2.Length
-            for ($i = 0; $i -lt $bytes1.Length; $i++) {
-                if ($bytes1[$i] -ne $bytes2[$i]) {
-                    throw "Byte mismatch at offset $i"
-                }
-            }
+            Assert-BytesEqual $bytes1 $bytes2
         }
 
         It 'install + uninstall round-trip preserves pre-existing UTF-8 content byte-for-byte' {
@@ -372,12 +363,36 @@ Describe 'switch_claude_account' {
             Remove-From-Profile 6>$null
 
             $postBytes = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
-            $postBytes.Length | Should -Be $preBytes.Length
-            for ($i = 0; $i -lt $preBytes.Length; $i++) {
-                if ($preBytes[$i] -ne $postBytes[$i]) {
-                    throw "Byte mismatch at offset $i"
-                }
-            }
+            Assert-BytesEqual $preBytes $postBytes
+        }
+
+        It 'install + uninstall round-trip preserves LF-only line endings byte-for-byte' {
+            # Write raw bytes so PowerShell does not normalize LF to CRLF.
+            $pre = "line1`nline2`n"
+            [System.IO.File]::WriteAllBytes(
+                $script:FakeProfilePath,
+                [System.Text.Encoding]::UTF8.GetBytes($pre))
+            $preBytes = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
+
+            Add-To-Profile 6>$null
+            Remove-From-Profile 6>$null
+
+            $postBytes = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
+            Assert-BytesEqual $preBytes $postBytes
+        }
+
+        It 'install + uninstall round-trip preserves mixed LF/CRLF line endings byte-for-byte' {
+            $pre = "line1`r`nline2`nline3`r`n"
+            [System.IO.File]::WriteAllBytes(
+                $script:FakeProfilePath,
+                [System.Text.Encoding]::UTF8.GetBytes($pre))
+            $preBytes = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
+
+            Add-To-Profile 6>$null
+            Remove-From-Profile 6>$null
+
+            $postBytes = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
+            Assert-BytesEqual $preBytes $postBytes
         }
 
         It 'install + uninstall round-trip preserves UTF-16 LE BOM and content' {
@@ -422,12 +437,7 @@ Describe 'switch_claude_account' {
             { Remove-From-Profile 6>$null } | Should -Throw -ExpectedMessage '*orphan*'
 
             $after = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
-            $after.Length | Should -Be $before.Length
-            for ($i = 0; $i -lt $before.Length; $i++) {
-                if ($before[$i] -ne $after[$i]) {
-                    throw "Byte mismatch at offset $i"
-                }
-            }
+            Assert-BytesEqual $before $after
         }
 
         It 'uninstall throws when only end marker is present' {
@@ -445,12 +455,7 @@ Describe 'switch_claude_account' {
             { Remove-From-Profile 6>$null } | Should -Not -Throw
 
             $after = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
-            $after.Length | Should -Be $before.Length
-            for ($i = 0; $i -lt $before.Length; $i++) {
-                if ($before[$i] -ne $after[$i]) {
-                    throw "Byte mismatch at offset $i"
-                }
-            }
+            Assert-BytesEqual $before $after
         }
     }
 

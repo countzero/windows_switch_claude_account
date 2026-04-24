@@ -93,19 +93,6 @@ function Get-ProfileEncoding {
     return 'utf8NoBOM'
 }
 
-# We are checking whether a profile line is one of our markers using
-# trimmed, case-sensitive equality. Substring -match would misclassify a
-# user comment that happens to contain the marker text.
-function Test-IsMarkerLine {
-    Param (
-        [String] $Line,
-        [String] $Marker
-    )
-
-    if ($null -eq $Line) { return $false }
-    return ($Line.Trim() -ceq $Marker)
-}
-
 # We are rendering a compact, locale-independent help screen so the
 # user always sees the same layout regardless of Windows UI language.
 function Show-Help {
@@ -320,24 +307,34 @@ function Add-To-Profile {
 }
 
 # We are removing the switch_claude_account_caller block from the
-# user's PowerShell profile by detecting the marker comments. When only
-# one of the two markers is present, we refuse to mutate the profile and
-# throw so the user can inspect the damage manually. -Quiet suppresses
-# only the benign "no block found" message; the orphan-marker throw is
-# never silenced.
+# user's PowerShell profile by splicing the marker-delimited region out
+# of the raw file content. Reading with -Raw and writing -NoNewline
+# preserves the user's existing line endings (LF, CRLF, or mixed), BOM,
+# and trailing-newline convention byte-for-byte; the previous line-based
+# implementation silently rewrote everything to CRLF. When only one of
+# the two markers is present, we refuse to mutate the profile and throw
+# so the user can inspect the damage manually. -Quiet suppresses only
+# the benign "no block found" message; the orphan-marker throw is never
+# silenced.
 function Remove-From-Profile {
     param([switch]$Quiet)
     if (-not (Test-Path -LiteralPath $ProfilePath)) { return }
 
     $encoding = Get-ProfileEncoding $ProfilePath
-    $lines    = @(Get-Content -LiteralPath $ProfilePath -Encoding $encoding)
+    $raw      = Get-Content -LiteralPath $ProfilePath -Raw -Encoding $encoding
+    if ($null -eq $raw) { $raw = '' }
 
-    $hasStart = $false
-    $hasEnd   = $false
-    foreach ($line in $lines) {
-        if (Test-IsMarkerLine $line $MarkerStart) { $hasStart = $true }
-        if (Test-IsMarkerLine $line $MarkerEnd)   { $hasEnd   = $true }
-    }
+    # Line-anchored, case-sensitive marker detection. [ \t]* allows trimmed
+    # horizontal whitespace around the marker text on its line but nothing
+    # else, so a user comment that merely contains the marker substring will
+    # not be misclassified. The (?=\r?\n|\z) lookahead matches end-of-line
+    # for both LF and CRLF as well as end-of-input; the simpler $ anchor
+    # would fail on CRLF lines because .NET treats $ as "before \n" only.
+    $startLine = '(?m)^[ \t]*' + [regex]::Escape($MarkerStart) + '[ \t]*(?=\r?\n|\z)'
+    $endLine   = '(?m)^[ \t]*' + [regex]::Escape($MarkerEnd)   + '[ \t]*(?=\r?\n|\z)'
+
+    $hasStart = [regex]::IsMatch($raw, $startLine)
+    $hasEnd   = [regex]::IsMatch($raw, $endLine)
 
     if (-not $hasStart -and -not $hasEnd) {
         if (-not $Quiet) {
@@ -351,17 +348,26 @@ function Remove-From-Profile {
         throw "Profile '$ProfilePath' has an orphan '$orphan' marker without its counterpart. Remove it manually and re-run. Profile left unchanged."
     }
 
-    $inBlock  = $false
-    $newLines = foreach ($line in $lines) {
-        if (Test-IsMarkerLine $line $MarkerStart) { $inBlock = $true;  continue }
-        if (Test-IsMarkerLine $line $MarkerEnd)   { $inBlock = $false; continue }
-        if (-not $inBlock) { $line }
-    }
+    # Splice the block out of the raw content. The leading (?:\r?\n)? absorbs
+    # the blank-line separator Add-To-Profile prepends when the profile was
+    # non-empty; the trailing (?:\r?\n)? absorbs the line terminator Add-Content
+    # appends after the block. Together they keep install -> uninstall
+    # byte-identical to the pre-install state. (?s) so . matches newlines;
+    # (?m) so ^ matches line starts; .*? is non-greedy so the earliest
+    # MarkerEnd closes the match.
+    $blockPattern =
+        '(?sm)(?:\r?\n)?' +
+        '^[ \t]*' + [regex]::Escape($MarkerStart) + '[ \t]*\r?\n' +
+        '.*?' +
+        '^[ \t]*' + [regex]::Escape($MarkerEnd)   + '[ \t]*' +
+        '(?:\r?\n)?'
+
+    $new = [regex]::Replace($raw, $blockPattern, '')
 
     # -NoNewline so Remove leaves no trailing newline of its own. Add-To-Profile
     # prepends a separator when the file is non-empty and Add-Content adds one
     # trailing newline, which keeps install -> install byte-idempotent.
-    Set-Content -LiteralPath $ProfilePath -Value ($newLines -join "`r`n") -Encoding $encoding -Force -NoNewline
+    Set-Content -LiteralPath $ProfilePath -Value $new -Encoding $encoding -Force -NoNewline
 
     if (-not $Quiet) {
         Write-Host "[Uninstall] Uninstalled. Close and reopen PowerShell to remove the alias." -ForegroundColor "Red"
