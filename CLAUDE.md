@@ -89,7 +89,7 @@ Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { u
 `Format-UsageTable` renders 5 data columns (plus the leading `*` active marker): `Slot | Account | 5h | 7d | Status`.
 
 - **Merged bucket cells**. `5h` and `7d` each combine utilization and reset delta in a single cell: `100% in 2h 37m`. A cold bucket (`utilization = 0`, `resets_at = null`) renders as just ` 0%` — the em-dash reset sentinel is only emitted when the bucket itself has no data at all. Column widths auto-fit to the widest cell in the batch.
-- **Account column**. Pulls the email parsed from the slot filename by `Get-SlotFileInfo`. Renders `—` for unlabeled slots and for slots whose name equals the labeled email (dedup form). Long emails are middle-truncated with `…` at `$Script:AccountColumnMaxWidth = 32` characters; the full string is always retained in `sca usage <name>` verbose view and in `-Json`. Replaces the previous `└─ email` continuation line — rows are now single-line.
+- **Account column**. Pulls the email parsed from the slot filename by `Get-SlotFileInfo`. Renders `—` for unlabeled slots and for slots whose name equals the labeled email (dedup form). Long emails are middle-truncated with `…` at `$Script:AccountColumnMaxWidth = 32` characters; the full string is always retained in `sca usage <name>` verbose view and in `-json`. Replaces the previous `└─ email` continuation line — rows are now single-line.
 - **Status column** mixes HTTP health with plan usability. When the `/api/oauth/usage` call succeeded, `Get-PlanStatus` derives the label from the utilization values:
 
   | State                                       | Label               | Color |
@@ -120,7 +120,7 @@ A row flagged `limited 5h` / `limited 7d` / `limited` cannot serve new prompts u
 
 The `Status:` line sits between `Account:` and the bucket rows so the usability verdict is the first thing read. `Get-StatusRationale` supplies a short English tail for the non-obvious labels (`limited 5h`, `limited 7d`, `limited`, `near limit`, `ok (no plan data)`); plain `ok` renders without a tail.
 
-### `-Json` output
+### `-json` output
 
 Each per-slot entry carries the same fields as before plus a `plan_status` string when the HTTP call succeeded:
 

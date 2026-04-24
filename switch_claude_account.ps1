@@ -120,6 +120,30 @@ $Script:UsageUserAgent    = "claude-code/2.1.119"
 $Script:UsageTimeoutSec   = 5
 $Script:ProfileTimeoutSec = 10
 
+# Plan-usability thresholds used by Get-PlanStatus / Format-UsageTable /
+# Format-UsageVerbose. The Status column on the usage table mixes HTTP
+# health (expired / unauthorized / error / no-oauth) with plan-state
+# derived from these two thresholds:
+#
+#   util < UtilWarnPct                   -> 'ok'         (green if active, gray otherwise)
+#   UtilWarnPct  <= util < UtilLimitPct  -> 'near limit' (yellow)
+#   UtilLimitPct <= util (5h only)       -> 'limited 5h' (red; slot cannot serve prompts until 5h reset)
+#   UtilLimitPct <= util (7d only)       -> 'limited 7d' (red)
+#   UtilLimitPct <= util (both)          -> 'limited'    (red)
+#
+# 100% is the hard cap enforced by Anthropic; 90% is the heads-up tier.
+# Keep these as script-scope constants so tests can reason about the
+# thresholds without duplicating magic numbers.
+$Script:UtilWarnPct            = 90
+$Script:UtilLimitPct           = 100
+
+# Middle-truncation target for the Account column in the usage table.
+# Emails longer than this get rendered as `aaa…zzz` with an ellipsis in
+# the middle so the domain (which disambiguates accounts under the same
+# local-part) stays visible. The verbose `sca usage <name>` view and
+# `-json` output always carry the full email.
+$Script:AccountColumnMaxWidth  = 32
+
 # Synthetic slot names used when .credentials.json content matches none
 # of the saved slot files. These are user-visible; the verbose drill-down
 # (`sca usage <name>`) accepts them as-is. Kept as script-scope constants
@@ -591,7 +615,6 @@ function Invoke-SaveAction {
     # (offline, 401, timeout, profile missing email) -> leave as
     # unlabeled and emit a non-fatal yellow notice; the user can re-run
     # `sca save <name>` when online to upgrade.
-    $finalPath  = $unlabeledPath
     $finalEmail = $null
     $profile    = Get-SlotProfile -SlotPath $unlabeledPath
     if ($profile.Status -eq 'ok' -and $profile.Email) {
@@ -609,7 +632,6 @@ function Invoke-SaveAction {
             # later if Anthropic ever returns a sanitizable email.
             try {
                 Rename-Item -LiteralPath $unlabeledPath -NewName $labeledName -ErrorAction Stop
-                $finalPath  = $labeledPath
                 $finalEmail = $profile.Email
             }
             catch {
@@ -1089,55 +1111,188 @@ function Format-UtilCell {
     return '{0,3}%' -f [int][math]::Round([double]$Utilization)
 }
 
+# Middle-truncate a string to at most $Max characters using '…' (U+2026)
+# in the middle. A single ellipsis is one visible cell in monospace, so
+# the truncated form is exactly $Max cells wide. Returns the input
+# unchanged when it already fits, or '—' for null/empty (the caller
+# decides whether that means "no email" or "truncate").
+function Format-Truncate {
+    Param (
+        [AllowNull()] [String] $Text,
+        [int] $Max
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return '—' }
+    if ($Text.Length -le $Max) { return $Text }
+    if ($Max -le 1) { return '…' }
+
+    # Keep more of the tail than the head so the domain (after the '@')
+    # stays visible for emails — the domain is the disambiguating part
+    # when multiple slots share a local-part. For $Max = 32 this gives
+    # 15 leading + '…' + 16 trailing = 32 cells.
+    $headLen = [math]::Max(1, [int][math]::Floor(($Max - 1) / 2))
+    $tailLen = $Max - 1 - $headLen
+    return $Text.Substring(0, $headLen) + '…' + $Text.Substring($Text.Length - $tailLen, $tailLen)
+}
+
+# Render the Account column cell for a single row. '—' when the slot has
+# no labeled email or when the email is a redundant duplicate of the
+# slot name (case-insensitive); otherwise the middle-truncated email.
+function Format-AccountCell {
+    Param (
+        [AllowNull()] [String] $SlotName,
+        [AllowNull()] [String] $Email
+    )
+
+    if ([string]::IsNullOrEmpty($Email)) { return '—' }
+    if ($SlotName -and $SlotName.ToLowerInvariant() -eq $Email.ToLowerInvariant()) { return '—' }
+    return Format-Truncate -Text $Email -Max $Script:AccountColumnMaxWidth
+}
+
+# Merge a utilization value and its reset timestamp into a single cell
+# for the summary table. Layout rules:
+#   null utilization, any reset     -> '   —'                (no data at all)
+#   numeric utilization, null reset -> ' 34%'                (cold bucket, no active window)
+#   numeric utilization, reset      -> ' 34% in 2h 14m'      (normal row)
+# Width is variable because reset deltas range from 'now' (3 chars) to
+# 'in 103h' (7 chars) to 'in 2h 14m' (9 chars); the table's column
+# width is computed from the widest cell per invocation.
+function Format-BucketCell {
+    Param (
+        $Utilization,
+        $ResetsAt
+    )
+
+    if ($null -eq $Utilization) { return '   —' }
+    $pct = Format-UtilCell $Utilization
+    if ($null -eq $ResetsAt -or $ResetsAt -eq '') { return $pct }
+    return "$pct $(Format-ResetDelta $ResetsAt)"
+}
+
+# Classify a slot's usage response into a plan-usability status. Returns
+# one of:
+#   ok                 - both buckets below the warn threshold
+#   near limit         - any bucket at or above UtilWarnPct but all below UtilLimitPct
+#   limited 5h         - 5h bucket at or above UtilLimitPct (prompts refused until 5h reset)
+#   limited 7d         - 7d bucket at or above UtilLimitPct
+#   limited            - both buckets at or above UtilLimitPct
+#   ok (no plan data)  - HTTP ok but response had neither bucket
+# HTTP-failure states (expired / unauthorized / error / no-oauth) are
+# surfaced via the caller's own mapping; this helper only runs when the
+# caller has already determined HTTP was 'ok'.
+function Get-PlanStatus {
+    Param ($Data)
+
+    $fiveUtil  = $null
+    $sevenUtil = $null
+    if ($Data) {
+        if ($Data.five_hour -and $null -ne $Data.five_hour.utilization) {
+            $fiveUtil = [double]$Data.five_hour.utilization
+        }
+        if ($Data.seven_day -and $null -ne $Data.seven_day.utilization) {
+            $sevenUtil = [double]$Data.seven_day.utilization
+        }
+    }
+
+    if ($null -eq $fiveUtil -and $null -eq $sevenUtil) {
+        return 'ok (no plan data)'
+    }
+
+    $fiveLimit  = ($null -ne $fiveUtil  -and $fiveUtil  -ge $Script:UtilLimitPct)
+    $sevenLimit = ($null -ne $sevenUtil -and $sevenUtil -ge $Script:UtilLimitPct)
+    if ($fiveLimit -and $sevenLimit) { return 'limited' }
+    if ($fiveLimit)                  { return 'limited 5h' }
+    if ($sevenLimit)                 { return 'limited 7d' }
+
+    $fiveNear  = ($null -ne $fiveUtil  -and $fiveUtil  -ge $Script:UtilWarnPct)
+    $sevenNear = ($null -ne $sevenUtil -and $sevenUtil -ge $Script:UtilWarnPct)
+    if ($fiveNear -or $sevenNear) { return 'near limit' }
+
+    return 'ok'
+}
+
+# Return the Write-Host color for a given rendered status label, mixing
+# HTTP-health and plan-usability outcomes. Centralized so the summary
+# table and the verbose view stay in lockstep.
+function Get-StatusColor {
+    Param (
+        [String] $Label,
+        [bool]   $IsActive
+    )
+
+    $okColor = if ($IsActive) { 'Green' } else { 'Gray' }
+    switch -Regex ($Label) {
+        '^limited'      { return 'Red' }
+        '^near limit'   { return 'Yellow' }
+        '^ok \(no plan' { return $okColor }
+        '^ok$'          { return $okColor }
+        '^no-oauth'     { return 'DarkGray' }
+        '^expired'      { return 'Yellow' }
+        '^unauthorized' { return 'Red' }
+        '^error'        { return 'Red' }
+        default         { return 'Gray' }
+    }
+}
+
+# One-sentence English rationale for a plan-usability status, used in
+# the verbose `sca usage <slot>` view. Returns $null when no rationale
+# applies (the status label is self-explanatory, e.g. 'ok').
+function Get-StatusRationale {
+    Param ([String] $Label)
+
+    switch ($Label) {
+        'limited 5h'        { return 'no prompts until 5h window resets' }
+        'limited 7d'        { return 'no prompts until 7d window resets' }
+        'limited'           { return 'no prompts until both 5h and 7d windows reset' }
+        'near limit'        { return "at or above $($Script:UtilWarnPct)% on at least one bucket" }
+        'ok (no plan data)' { return 'HTTP ok but response carried no bucket data' }
+        default             { return $null }
+    }
+}
+
 # Render per-slot usage rows as a fixed-width table. Uses Write-Host (the
 # information stream) to match the other Invoke-*Action functions so the
 # existing `$out = Invoke-*Action 6>&1 | Out-String` test pattern keeps
 # working. Fixed-width + manually padded columns (rather than Format-Table)
 # so tests can assert on stable column headers without fighting PowerShell's
-# responsive-width formatter. Parses the real /api/oauth/usage response
-# shape: buckets at the root of data (no rate_limits wrapper), `utilization`
-# field (already 0..100), `resets_at` as ISO-8601 string or null.
+# responsive-width formatter.
+#
+# Column shape (5 data columns + leading active-marker):
+#   *  Slot    Account                      5h              7d            Status
+#
+# - `5h` / `7d` cells merge utilization and reset delta into one string
+#   ('100% in 2h 37m'); width auto-fits to the widest cell in the batch.
+# - `Account` renders the slot's filename-encoded email, middle-truncated
+#   at $Script:AccountColumnMaxWidth. Slots with no email (offline save)
+#   or whose email equals the slot name (dedup form) render as '—'.
+# - `Status` mixes HTTP health (expired / unauthorized / error / no-oauth)
+#   with plan-usability derived via Get-PlanStatus; see that helper for
+#   the threshold semantics.
 function Format-UsageTable {
     Param ([object[]] $Results)
 
     if (-not $Results) { return }
 
-    $nameW = 4
-    foreach ($r in $Results) {
-        if ($r.Name.Length -gt $nameW) { $nameW = $r.Name.Length }
-    }
-    # Placeholders {2} and {4} receive precomputed 4-char cells from
-    # Format-UtilCell so ' 34%' and '   —' align in the column.
-    $fmt = "  {0} {1,-$nameW}  {2}  {3,-11}  {4}  {5,-11}  {6}"
-
-    Write-Host "[Usage] Plan usage per slot (live from /api/oauth/usage):" -ForegroundColor "Yellow"
-    Write-Host ($fmt -f ' ',  'Slot',           ' 5h ',  '5h reset',    ' 7d ',  '7d reset',    'Status')
-    Write-Host ($fmt -f ' ', ('-' * $nameW),    '----',  '-----------', '----',  '-----------', '------')
-
-    foreach ($r in $Results) {
-        $marker = if ($r.IsActive) { '*' } else { ' ' }
-
-        $fiveUsed  = '   —'; $fiveReset  = '—'
-        $sevenUsed = '   —'; $sevenReset = '—'
-        $hasBuckets = $false
+    # Precompute per-row cell content so column widths can auto-fit.
+    $rows = foreach ($r in $Results) {
+        $fiveCell  = '   —'
+        $sevenCell = '   —'
 
         if ($r.Status -eq 'ok' -and $r.Data) {
-            # Real schema: data.five_hour / data.seven_day at the root. Field
-            # name is 'utilization', not 'used_percentage'.
             if ($r.Data.five_hour -and $null -ne $r.Data.five_hour.utilization) {
-                $fiveUsed   = Format-UtilCell $r.Data.five_hour.utilization
-                $fiveReset  = Format-ResetDelta $r.Data.five_hour.resets_at
-                $hasBuckets = $true
+                $fiveCell = Format-BucketCell $r.Data.five_hour.utilization $r.Data.five_hour.resets_at
             }
             if ($r.Data.seven_day -and $null -ne $r.Data.seven_day.utilization) {
-                $sevenUsed  = Format-UtilCell $r.Data.seven_day.utilization
-                $sevenReset = Format-ResetDelta $r.Data.seven_day.resets_at
-                $hasBuckets = $true
+                $sevenCell = Format-BucketCell $r.Data.seven_day.utilization $r.Data.seven_day.resets_at
             }
         }
 
+        $email = if ($r.PSObject.Properties['Email']) { $r.Email } else { $null }
+        $accountCell = Format-AccountCell -SlotName $r.Name -Email $email
+
+        # Status: plan-usability when HTTP was ok, HTTP-state otherwise.
         $statusText = switch ($r.Status) {
-            'ok'           { if ($hasBuckets) { 'ok' } else { 'ok (no plan data)' } }
+            'ok'           { Get-PlanStatus $r.Data }
             'no-oauth'     { 'no-oauth (api key or non-claude.ai slot)' }
             'expired'      { if ($r.Error) { "expired: $($r.Error)" } else { 'expired (run sca switch to refresh)' } }
             'unauthorized' { 'unauthorized (token revoked; run sca switch then /login)' }
@@ -1149,28 +1304,36 @@ function Format-UsageTable {
             default        { [string]$r.Status }
         }
 
-        $color = switch ($r.Status) {
-            'ok'           { if ($r.IsActive) { 'Green' } else { 'Gray' } }
-            'no-oauth'     { 'DarkGray' }
-            'expired'      { 'Yellow' }
-            'unauthorized' { 'Red' }
-            'error'        { 'Red' }
-            default        { 'Gray' }
+        [pscustomobject]@{
+            Row     = $r
+            Marker  = if ($r.IsActive) { '*' } else { ' ' }
+            Name    = $r.Name
+            Account = $accountCell
+            Five    = $fiveCell
+            Seven   = $sevenCell
+            Status  = $statusText
         }
+    }
 
-        Write-Host ($fmt -f $marker, $r.Name, $fiveUsed, $fiveReset, $sevenUsed, $sevenReset, $statusText) -ForegroundColor $color
+    # Minimum widths are the header label lengths so headers never get
+    # clipped. Data-driven max keeps narrow tables narrow for 1-2 slots.
+    $nameW = 4; $acctW = 7; $fiveW = 2; $sevenW = 2
+    foreach ($e in $rows) {
+        if ($e.Name.Length    -gt $nameW)  { $nameW  = $e.Name.Length }
+        if ($e.Account.Length -gt $acctW)  { $acctW  = $e.Account.Length }
+        if ($e.Five.Length    -gt $fiveW)  { $fiveW  = $e.Five.Length }
+        if ($e.Seven.Length   -gt $sevenW) { $sevenW = $e.Seven.Length }
+    }
 
-        # Second-line email annotation: only when an email was resolved
-        # AND it adds information (differs from the slot name, case-
-        # insensitive). Synth rows almost always get the line because
-        # their Name is the literal '<active>' / '<active> (unsaved)'.
-        if ($r.PSObject.Properties['Email'] -and $r.Email) {
-            $slotLc  = $r.Name.ToLowerInvariant()
-            $emailLc = $r.Email.ToLowerInvariant()
-            if ($slotLc -ne $emailLc) {
-                Write-Host ("      └─ $($r.Email)") -ForegroundColor "DarkGray"
-            }
-        }
+    $fmt = "  {0} {1,-$nameW}  {2,-$acctW}  {3,-$fiveW}  {4,-$sevenW}  {5}"
+
+    Write-Host "[Usage] Plan usage per slot (live from /api/oauth/usage):" -ForegroundColor "Yellow"
+    Write-Host ($fmt -f ' ',  'Slot',         'Account',       '5h',           '7d',            'Status')
+    Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW),  ('-' * $fiveW), ('-' * $sevenW), '------')
+
+    foreach ($entry in $rows) {
+        $color = Get-StatusColor -Label $entry.Status -IsActive ([bool]$entry.Row.IsActive)
+        Write-Host ($fmt -f $entry.Marker, $entry.Name, $entry.Account, $entry.Five, $entry.Seven, $entry.Status) -ForegroundColor $color
     }
 }
 
@@ -1202,6 +1365,17 @@ function Format-UsageVerbose {
         Write-Host "  (empty response)" -ForegroundColor "DarkGray"
         return
     }
+
+    # Status line between Account and the bucket rows, so the first thing
+    # the user reads is "can I use this slot right now?". Same label set
+    # as the summary table, plus a short English rationale when the
+    # label alone is not self-explanatory (near limit, limited, no plan
+    # data).
+    $planStatus  = Get-PlanStatus $Result.Data
+    $rationale   = Get-StatusRationale $planStatus
+    $statusLine  = if ($rationale) { "$planStatus - $rationale" } else { $planStatus }
+    $statusColor = Get-StatusColor -Label $planStatus -IsActive ([bool]$Result.IsActive)
+    Write-Host ("  Status:  $statusLine") -ForegroundColor $statusColor
 
     # Two-bucket render. Each Render-Bucket closure inlines the label so
     # this function does not depend on a lookup table; when buckets change
@@ -1470,11 +1644,19 @@ function Invoke-UsageAction {
         # buckets this script does not render in the table or verbose view.
         # The `account` block is included whenever the email was resolved;
         # currently only .email is surfaced (scope decision).
+        #
+        # plan_status mirrors the summary-table Status column for HTTP-ok
+        # rows so scripts can branch on usability without re-deriving the
+        # thresholds. Absent for HTTP-failure rows; callers already have
+        # `status` (expired / unauthorized / error / no-oauth) there.
         $out = [ordered]@{}
         foreach ($r in $snapshot.Results) {
             $entry = [ordered]@{
                 status    = $r.Status
                 is_active = [bool]$r.IsActive
+            }
+            if ($r.Status -eq 'ok') {
+                $entry.plan_status = Get-PlanStatus $r.Data
             }
             if ($r.Email) { $entry.account = [ordered]@{ email = $r.Email } }
             if ($r.Data)  { $entry.data    = $r.Data }

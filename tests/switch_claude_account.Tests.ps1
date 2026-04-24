@@ -1061,7 +1061,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'ok \(no plan data\)'
         }
 
-        It 'null resets_at paired with 0% renders the em-dash in the reset column' {
+        It 'null resets_at paired with 0% renders just the percent (merged cell)' {
             New-Slot -Name 'cold' | Out-Null
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 return [pscustomobject]@{
@@ -1072,12 +1072,14 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            # 0% five_hour with null reset: percentage renders as ' 0%',
-            # reset cell as '—' (em-dash). Column alignment is preserved.
+            # 0% five_hour with null reset: cell is just ' 0%' (no 'in ...'
+            # suffix). With columns merged, the em-dash reset sentinel is
+            # no longer emitted when utilization is known; a cold bucket
+            # is naturally represented by its raw percent without a tail.
             $out | Should -Match '\b0%'
-            # The 5h reset cell is em-dash. It sits right after the 0% cell
-            # within the row, so we assert on that sequence.
-            $out | Should -Match '0%\s+—'
+            # The 5h cell has no 'in ' tail; the 7d cell does (103h).
+            $out | Should -Not -Match '0%\s+in\s'
+            $out | Should -Match '9%\s+in 10[23]h'
         }
 
         It '401 response: status is unauthorized' {
@@ -1193,6 +1195,147 @@ Describe 'switch_claude_account' {
             $parsed.alpha.data.five_hour.utilization | Should -Be 10
             $parsed.bravo.status | Should -Be 'error'
             $parsed.bravo.error  | Should -Match 'network down'
+        }
+
+        # --- plan-usability status (100% = limited, >=90% = near limit) ---
+
+        # The Status column mixes HTTP-health (expired / unauthorized /
+        # error / no-oauth) with plan-usability derived from the
+        # utilization fields. A slot at 100% of its 5h window is rate-
+        # limited and cannot serve prompts until the window resets;
+        # rendering that as 'ok' would mislead the user (the bug these
+        # tests guard against).
+        It 'plan status is "limited 5h" when five_hour utilization is at 100%' {
+            New-Slot -Name 'capped' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
+                    seven_day = [pscustomobject]@{ utilization = 28.0;  resets_at = (Format-IsoReset ([TimeSpan]::FromHours(34))) }
+                }
+            }
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+
+            $out | Should -Match 'capped'
+            $out | Should -Match '100%'
+            # Status column reflects plan state, not HTTP state.
+            $out | Should -Match '(?m)\blimited 5h\s*$'
+            # And should NOT read as 'ok' anywhere on the data row.
+            $out | Should -Not -Match '(?m)^\s+capped\b.*\bok\s*$'
+        }
+
+        It 'plan status is "limited 7d" when seven_day utilization is at 100%' {
+            New-Slot -Name 'weeklycap' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 12.0;  resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
+                    seven_day = [pscustomobject]@{ utilization = 101.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(12))) }
+                }
+            }
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+            $out | Should -Match '(?m)\blimited 7d\s*$'
+        }
+
+        It 'plan status is "limited" when both buckets are at or above 100%' {
+            New-Slot -Name 'double' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
+                    seven_day = [pscustomobject]@{ utilization = 100.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(10))) }
+                }
+            }
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+            # Exact word boundary so 'limited' does not also match 'limited 5h'.
+            $out | Should -Match '(?m)\blimited\s*$'
+            $out | Should -Not -Match 'limited 5h'
+            $out | Should -Not -Match 'limited 7d'
+        }
+
+        It 'plan status is "near limit" when any bucket is at or above the warn threshold but under 100%' {
+            New-Slot -Name 'warnrow' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 92.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
+                    seven_day = [pscustomobject]@{ utilization = 11.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(50))) }
+                }
+            }
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+            $out | Should -Match 'near limit'
+            $out | Should -Not -Match 'limited'
+        }
+
+        It 'plan status is plain "ok" when both buckets are below the warn threshold' {
+            New-Slot -Name 'healthy' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 89.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
+                    seven_day = [pscustomobject]@{ utilization =  3.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(70))) }
+                }
+            }
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+            # 89 < 90 warn threshold -> still 'ok'. Word-anchored so 'ok'
+            # is not confused with 'ok (no plan data)'.
+            $out | Should -Match '(?m)\bok\s*$'
+            $out | Should -Not -Match 'near limit'
+            $out | Should -Not -Match 'limited'
+        }
+
+        It '-json emits plan_status alongside status for HTTP-ok rows' {
+            New-Slot -Name 'capped' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
+                    seven_day = [pscustomobject]@{ utilization = 28.0;  resets_at = (Format-IsoReset ([TimeSpan]::FromHours(34))) }
+                }
+            }
+
+            $raw    = Invoke-UsageAction -json
+            $parsed = $raw | ConvertFrom-Json
+
+            $parsed.capped.status      | Should -Be 'ok'
+            $parsed.capped.plan_status | Should -Be 'limited 5h'
+        }
+
+        It '-json omits plan_status for HTTP-failure rows' {
+            New-Slot -Name 'dead' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Exception]::new('network down')
+            }
+
+            $raw    = Invoke-UsageAction -json
+            $parsed = $raw | ConvertFrom-Json
+
+            $parsed.dead.status      | Should -Be 'error'
+            # plan_status is only attached for status='ok' rows so scripts
+            # don't have to disambiguate between "HTTP ok + near limit"
+            # and "HTTP failed". When absent, the NoteProperty is missing.
+            $parsed.dead.PSObject.Properties.Name | Should -Not -Contain 'plan_status'
+        }
+
+        It 'verbose view inserts a Status line between Account and the bucket rows for a limited slot' {
+            New-Slot -Name 'alpha' | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
+                    seven_day = [pscustomobject]@{ utilization = 28.0;  resets_at = (Format-IsoReset ([TimeSpan]::FromHours(34))) }
+                }
+            }
+
+            $out = Invoke-UsageAction -Name 'alpha' 6>&1 | Out-String
+
+            # Status line uses the same label as the summary table plus a
+            # short English rationale so the verbose screen can stand
+            # alone.
+            $out | Should -Match '(?m)^\s+Status:\s+limited 5h - no prompts until 5h window resets'
+
+            # Bucket rows still render below the Status line.
+            $out | Should -Match 'Session \(5h\)\s+100%\s+Resets '
+            $out | Should -Match 'Weekly \(all models\)\s+28%\s+Resets '
         }
 
         It 'refresh preserves any hardlink to .credentials.json (active-slot refresh)' {
@@ -1929,7 +2072,7 @@ Describe 'switch_claude_account' {
         # Get-SlotFileInfo and propagates .Email into the row objects.
         # These tests stage the filenames directly rather than running
         # Invoke-SaveAction, so they isolate the display path.
-        It 'renders a second-line email when the slot name differs from the labeled email' {
+        It 'renders the email in the Account column when the slot name differs from the labeled email' {
             $payload = @{
                 claudeAiOauth = @{
                     accessToken      = 'sk-ant-oat-alias'
@@ -1946,14 +2089,17 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            $out | Should -Match '(?m)^\s+work\s'
-            $out | Should -Match '(?m)^\s+└─ finn\.kumkar@stadtwerk\.org\s*$'
+            # Single-line row: slot name + email on the same line (the
+            # Account column is the second column now). No more '└─'
+            # continuation line anywhere.
+            $out | Should -Match '(?m)^\s+work\s+finn\.kumkar@stadtwerk\.org\b'
+            $out | Should -Not -Match '└─'
             # Zero profile HTTP calls on the display path — email is from
             # the filename, not the endpoint.
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' }
         }
 
-        It 'suppresses the second line when the slot name equals the embedded email' {
+        It 'renders "-" in the Account column when the slot name equals the embedded email' {
             # Slot name equals email -> save would have chosen the
             # unlabeled form. Stage that directly.
             $email = 'alice@example.com'
@@ -1970,11 +2116,13 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            $out | Should -Match "(?m)^\s+$([regex]::Escape($email))\s"
+            # Slot name present, email NOT repeated in the Account cell
+            # (dedup form). Account cell renders as the em-dash sentinel.
+            $out | Should -Match "(?m)^\s+$([regex]::Escape($email))\s+—\s"
             $out | Should -Not -Match '└─'
         }
 
-        It 'unlabeled slot (save-time profile fetch failed) renders without second line' {
+        It 'unlabeled slot (save-time profile fetch failed) renders "-" in the Account column' {
             # .credentials.pending.json (no parens suffix) -> email unknown.
             $payload = @{
                 claudeAiOauth = @{
@@ -1989,8 +2137,41 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            $out | Should -Match '(?m)^\s+pending\s'
+            $out | Should -Match '(?m)^\s+pending\s+—\s'
             $out | Should -Not -Match '└─'
+        }
+
+        It 'middle-truncates long emails in the Account column (full email kept in -json)' {
+            # Craft an email longer than $Script:AccountColumnMaxWidth (32)
+            # so the truncation path fires.
+            $longEmail = 'extremely.long.local.part@extraordinarily-long-domain.example.com'
+            $longEmail.Length | Should -BeGreaterThan $Script:AccountColumnMaxWidth
+
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken      = 'sk-ant-oat-long'
+                    refreshToken     = 'sk-ant-ort-long'
+                    expiresAt        = $script:FutureMs
+                    scopes           = @('user:inference')
+                    subscriptionType = 'team'
+                }
+            } | ConvertTo-Json -Compress
+            $labeled = ".credentials.longslot($longEmail).json"
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+
+            # The rendered Account cell carries the ellipsis (U+2026) and
+            # is no wider than AccountColumnMaxWidth. The untruncated
+            # string is too long to appear verbatim.
+            $out | Should -Match '…'
+            $out | Should -Not -Match ([regex]::Escape($longEmail))
+
+            # -json must still carry the full untruncated email under
+            # account.email for scripting consumers.
+            $raw    = Invoke-UsageAction -json
+            $parsed = $raw | ConvertFrom-Json
+            $parsed.longslot.account.email | Should -Be $longEmail
         }
     }
 
