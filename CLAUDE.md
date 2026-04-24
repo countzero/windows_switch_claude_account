@@ -7,24 +7,25 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 ## Key facts
 
 - **Credential directory**: `%USERPROFILE%\.claude\`
-- **Active credentials**: `.credentials.json`
+- **Active credentials**: `.credentials.json` — after the first `switch` or `save`, this is a hardlink to the active slot file. OAuth token refreshes in both paths simultaneously.
 - **Named slots**: `.credentials.<name>.json`
 - **PS version**: Requires PowerShell 7.0+ (`#Requires -Version 7.0`). Uses `$PROFILE.CurrentUserAllHosts` for the install target.
 - **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block
 
 ## Windows-specific gotchas
 
-- **File locks**: `Copy-Item -Force` fails if Claude Code or VS Code has `.credentials.json` open. Always close the app before `save` or `switch`.
+- **File locks**: `Remove-Item` / `New-Item -HardLink` fail if Claude Code or VS Code has `.credentials.json` open. Always close the app before `save` or `switch`.
 - **Execution policy**: May need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
-- **Token expiry**: OAuth tokens refresh/expire after ~1 hour of inactivity. Stale slots need re-saving.
+- **Token expiry**: OAuth tokens refresh/expire after ~1 hour of inactivity. Hardlinked slots auto-sync, so stale slots are self-healing — Claude Code will refresh on the next call.
+- **Hardlink detection**: `list` warns if `.credentials.json` is no longer hardlinked (likely from a Claude Code write that broke the link). Run `sca switch <name>` to repair.
 - **Name sanitization**: Invalid Windows filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and spaces are replaced with `_`. Brackets are sanitized because PowerShell's `-Path` parameter treats them as character-class wildcards; without sanitization, `sca remove foo[bar]` would silently wildcard-match unrelated slot files. Paired with `-LiteralPath` on every credential-file op as defense-in-depth.
 
 ## Script actions
 
 | Action     | Requires name | What it does |
 |------------|---------------|--------------|
-| `save`     | Yes           | Copies `.credentials.json` → `.credentials.<name>.json` |
-| `switch`   | Optional      | Copies `.credentials.<name>.json` → `.credentials.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). |
+| `save`     | Yes           | Copies `.credentials.json` → `.credentials.<name>.json`, then re-links `.credentials.json` as a hardlink to the new slot. Subsequent token refreshes flow into the saved slot. |
+| `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). |
 | `list`     | No            | Lists saved slot names |
 | `remove`   | Yes           | Deletes a named slot |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile |

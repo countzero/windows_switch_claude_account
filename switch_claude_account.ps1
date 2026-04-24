@@ -378,6 +378,26 @@ function Remove-From-Profile {
     }
 }
 
+# We verify that hardlinks can be created inside the credentials directory
+# before attempting any operation that depends on them.  This catches common
+# blockers (FAT32, network share, non-NTFS volume) with a clear error so the
+# user knows the environment does not support this feature.
+function Test-HardlinkSupport {
+    $sourceFile = Join-Path $CredDir '.scahardlink.source'
+    $linkFile   = Join-Path $CredDir '.scahardlink.target'
+
+    try {
+        # Clean up from a previous failed run.
+        Remove-Item -LiteralPath $sourceFile, $linkFile -Force -ErrorAction SilentlyContinue
+
+        [System.IO.File]::WriteAllBytes($sourceFile, @())
+        New-Item -ItemType HardLink -Path $linkFile -Target $sourceFile | Out-Null
+    }
+    finally {
+        Remove-Item -LiteralPath $sourceFile, $linkFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # We are extracting each action body into its own function so the logic
 # is directly invokable from tests without spawning a subprocess and
 # without re-parsing the $Action dispatcher. The dispatcher below becomes
@@ -392,7 +412,20 @@ function Invoke-SaveAction {
         throw "$CredFile not found. Log in via Claude Code first."
     }
 
-    Copy-Item -LiteralPath $CredFile -Destination (Join-Path $CredDir ".credentials.$safeName.json") -Force
+    Test-HardlinkSupport
+
+    $slotPath = Join-Path $CredDir ".credentials.$safeName.json"
+
+    # Always rebuild (idempotent; avoids fragile same-inode detection).
+    # If slotPath is currently the active hardlink target, removing it
+    # drops the link count to 1 — .credentials.json retains the content.
+    if (Test-Path -LiteralPath $slotPath) {
+        Remove-Item -LiteralPath $slotPath -Force
+    }
+
+    Copy-Item -LiteralPath $CredFile -Destination $slotPath
+    Remove-Item -LiteralPath $CredFile -Force
+    New-Item -ItemType HardLink -Path $CredFile -Target $slotPath | Out-Null
     Write-Host "[Save] Saved as '$safeName'" -ForegroundColor "Green"
 }
 
@@ -425,7 +458,11 @@ function Invoke-SwitchAction {
         throw "Slot '$safeName' not found."
     }
 
-    Copy-Item -LiteralPath $target -Destination $CredFile -Force
+    Test-HardlinkSupport
+    if (Test-Path -LiteralPath $CredFile) {
+        Remove-Item -LiteralPath $CredFile -Force
+    }
+    New-Item -ItemType HardLink -Path $CredFile -Target $target | Out-Null
     Write-Host "[Switch] Switched to '$safeName'. Close and restart Claude Code to apply." -ForegroundColor "Cyan"
 }
 
@@ -442,6 +479,22 @@ function Invoke-ListAction {
     # it here so the user knows why no slot is marked active.
     if ($info.ActiveLocked) {
         Write-Host "[List] Could not read active credentials (file may be locked); active slot cannot be marked." -ForegroundColor "Yellow"
+    }
+
+    # Self-check: .credentials.json should be a hardlink to the active slot
+    # after the first switch/save.  If it is not, auto-sync is broken —
+    # likely because Claude Code replaced the file via atomic rename during a
+    # token refresh.  Surface this so the user can repair with `sca switch`.
+    if (Test-Path -LiteralPath $CredFile) {
+        $isHardlinked = (Get-Item -LiteralPath $CredFile).LinkType -eq 'HardLink'
+        if (-not $isHardlinked) {
+            $matchingSlot = $slots | Where-Object { $_.IsActive } | Select-Object -First 1
+            if ($matchingSlot) {
+                Write-Host "[List] Warning: .credentials.json is not hardlinked to '$($matchingSlot.Name)'. Auto-sync is broken. Run 'sca switch $($matchingSlot.Name)' to repair." -ForegroundColor "Yellow"
+            } else {
+                Write-Host "[List] Warning: .credentials.json is not hardlinked to any slot. Run 'sca save <name>' or 'sca switch <name>' to establish tracking." -ForegroundColor "Yellow"
+            }
+        }
     }
 
     Write-Host "[List] Saved slots:" -ForegroundColor "Yellow"

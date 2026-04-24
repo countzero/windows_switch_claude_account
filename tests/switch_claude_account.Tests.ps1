@@ -533,6 +533,181 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Test-HardlinkSupport' {
+        It 'does not throw and cleans up sentinel files on success' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+
+            { Test-HardlinkSupport 6>$null } | Should -Not -Throw
+
+            Join-Path $credDir '.scahardlink.source'  | Test-Path | Should -BeFalse
+            Join-Path $credDir '.scahardlink.target'  | Test-Path | Should -BeFalse
+        }
+    }
+
+    Context 'Invoke-SaveAction (hardlink)' {
+        It 'creates a slot AND re-links .credentials.json as hardlink' {
+            $credDir  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $credFile = Join-Path $credDir '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value 'SAL' -NoNewline
+
+            Invoke-SaveAction -Name 'work' 6>$null
+
+            $slot  = Join-Path $credDir '.credentials.work.json'
+            Test-Path $slot | Should -BeTrue
+            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
+            (Get-Item -LiteralPath $slot).LinkType       | Should -Be 'HardLink'
+            Get-Content -LiteralPath $credFile -Raw | Should -Be 'SAL'
+            Get-Content -LiteralPath $slot     -Raw | Should -Be 'SAL'
+        }
+
+        It 'overwrites an existing slot AND re-links .credentials.json' {
+            $credDir  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $credFile = Join-Path $credDir '.credentials.json'
+            $slot     = Join-Path $credDir '.credentials.work.json'
+            Set-Content -LiteralPath $credFile -Value 'NEW' -NoNewline
+            Set-Content -LiteralPath $slot     -Value 'OLD' -NoNewline
+
+            Invoke-SaveAction -Name 'work' 6>$null
+
+            Get-Content -LiteralPath $credFile -Raw | Should -Be 'NEW'
+            Get-Content -LiteralPath $slot     -Raw | Should -Be 'NEW'
+            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
+        }
+
+        It 'migration: save when .credentials.json is a regular file produces hardlink' {
+            $credDir  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $credFile = Join-Path $credDir '.credentials.json'
+            [System.IO.File]::WriteAllBytes($credFile, [byte[]](0x41,0x42))
+
+            { Get-Item -LiteralPath $credFile }.LinkType | Should -Not -Be 'HardLink'
+
+            Invoke-SaveAction -Name 'work' 6>$null
+
+            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
+        }
+    }
+
+    Context 'Invoke-SwitchAction (hardlink)' {
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:CredFilePath = Join-Path $script:CredDirPath '.credentials.json'
+        }
+
+        It 'creates hardlink on both endpoints' {
+            $slot = Join-Path $script:CredDirPath '.credentials.work.json'
+            [System.IO.File]::WriteAllBytes($slot, [byte[]](0xDE,0xAD,0xBE,0xEF))
+
+            Invoke-SwitchAction -Name 'work' 6>$null
+
+            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
+            (Get-Item -LiteralPath $slot).LinkType                | Should -Be 'HardLink'
+            [System.IO.File]::ReadAllBytes($script:CredFilePath)  | Should -Be ([byte[]](0xDE,0xAD,0xBE,0xEF))
+        }
+
+        It 'migration: switch when .credentials.json is a regular file produces hardlink' {
+            $slot = Join-Path $script:CredDirPath '.credentials.work.json'
+            [System.IO.File]::WriteAllBytes($slot, [byte[]](0x41))
+
+            { Get-Item -LiteralPath $script:CredFilePath }.LinkType | Should -Not -Be 'HardLink'
+
+            Invoke-SwitchAction -Name 'work' 6>$null
+
+            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
+        }
+
+        It 'rotation creates hardlinks on both endpoints' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.a.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.b.json') -Value 'B' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                  -Value 'A' -NoNewline
+
+            Invoke-SwitchAction -Name '' 6>$null
+
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'B'
+            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
+        }
+    }
+
+    Context 'Invoke-RemoveAction (hardlink)' {
+        It 'removing the active slot leaves .credentials.json intact as a regular file' {
+            $credDir  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $credFile = Join-Path $credDir '.credentials.json'
+            $slot     = Join-Path $credDir '.credentials.work.json'
+            Set-Content -LiteralPath $credFile -Value 'DATA' -NoNewline
+            Set-Content -LiteralPath $slot     -Value 'DATA' -NoNewline
+
+            # Establish the hardlink (simulate a prior switch)
+            Remove-Item -LiteralPath $credFile -Force
+            New-Item -ItemType HardLink -Path $credFile -Target $slot | Out-Null
+            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
+
+            Invoke-RemoveAction -Name 'work' 6>$null
+
+            Test-Path -LiteralPath $slot | Should -BeFalse
+            Test-Path -LiteralPath $credFile | Should -BeTrue
+            Get-Content -LiteralPath $credFile -Raw | Should -Be 'DATA'
+            (Get-Item -LiteralPath $credFile).LinkType | Should -Not -Be 'HardLink'
+        }
+    }
+
+    Context 'Invoke-ListAction (hardlink self-check)' {
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:CredFilePath = Join-Path $script:CredDirPath '.credentials.json'
+        }
+
+        It 'no warning when .credentials.json is a hardlink to the active slot' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'B' -NoNewline
+
+            # Establish hardlink
+            Remove-Item -LiteralPath $script:CredFilePath -Force
+            New-Item -ItemType HardLink -Path $script:CredFilePath -Target (Join-Path $script:CredDirPath '.credentials.bravo.json') | Out-Null
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+            $out | Should -Not -Match 'Warning'
+        }
+
+        It 'warns when .credentials.json is a regular file that matches a slot' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'B' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+            $out | Should -Match 'Warning'
+            $out | Should -Match 'bravo'
+        }
+
+        It 'warns when .credentials.json is a regular file that matches no slot' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'UNKNOWN' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+            $out | Should -Match 'Warning'
+            # The "no slot" warning says "not hardlinked to any slot" — no specific name.
+            $out | Should -Match 'not hardlinked to any slot'
+        }
+
+        It 'no warning when no .credentials.json exists' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+            $out | Should -Not -Match 'Warning'
+        }
+
+        It 'no warning when no slots saved (early return)' {
+            $out = Invoke-ListAction 6>&1 | Out-String
+            $out | Should -Not -Match 'Warning'
+        }
+    }
+
     Context 'Show-Help' {
         It 'prints the ACTIONS header and lists all 7 actions' {
             $out = Show-Help 6>&1 | Out-String
