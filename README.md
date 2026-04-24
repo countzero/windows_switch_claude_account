@@ -67,6 +67,100 @@ Without a name, `switch` activates the next slot in alphabetical order and wraps
 sca remove test-project
 ```
 
+### Check plan usage
+
+```powershell
+sca usage
+```
+
+Shows the 5-hour session limit ("Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit ("Current week (all models)") for every saved slot, as live percentages against each account's Claude.ai subscription:
+
+```
+[Usage] Plan usage per slot (live from /api/oauth/usage):
+    Slot         5h   5h reset      7d   7d reset     Status
+    --------   ----  -----------  ----  -----------  ------
+    work        18%  in 2h 11m     42%  in 103h      ok
+  * personal     3%  in 4h 02m      7%  in 146h      ok
+    api-key      —   —              —   —            no-oauth (api key or non-claude.ai slot)
+```
+
+Deltas under 24h keep minute precision (`in 2h 11m`); at 24h and above the column switches to an integer total-hours view (`in 103h`) to stay narrow. Drill into a single slot for absolute reset times in your local timezone:
+
+```
+sca usage work
+```
+
+```
+[Usage] Slot 'work' (active)
+  Session (5h)           18%  Resets 7:50pm Europe/Berlin
+  Weekly (all models)    42%  Resets Apr 28, 9am Europe/Berlin
+```
+
+### Who is each slot actually logged in as?
+
+Slot names are user-assigned labels; nothing stops you from naming a slot `work` and then later overwriting it with credentials for a completely different account. At `sca save` time the tool fetches the OAuth account email and embeds it in the slot filename itself, using the RFC 5322 parenthesized-comment form:
+
+```
+%USERPROFILE%\.claude\.credentials.work(finn.kumkar@stadtwerk.org).json
+```
+
+`sca usage` and `sca list` then surface the email on an indented second line whenever it adds information:
+
+```
+[Usage] Plan usage per slot (live from /api/oauth/usage):
+    Slot                        5h   5h reset      7d   7d reset     Status
+    -------------------------  ----  -----------  ----  -----------  ------
+    kumkar@stadtwerk.org        31%  in 2h 14m    17%  in 42h        ok
+      └─ finn.kumkar@stadtwerk.org
+    alice@example.com            5%  in 3h 00m     2%  in 120h       ok
+```
+
+Reading it:
+- `kumkar@stadtwerk.org` is the slot name you picked, but the tokens inside actually belong to `finn.kumkar@stadtwerk.org`. The `└─` second line surfaces the mismatch so you can repair it (`sca save finn.kumkar@stadtwerk.org` then `sca remove kumkar@stadtwerk.org`).
+- `alice@example.com` has no second line because the slot name already equals the email — no new information to display. The filename is also deduplicated: `.credentials.alice@example.com.json` rather than `.credentials.alice@example.com(alice@example.com).json`.
+
+Because the email lives in the filename, it cannot drift from the OAuth tokens stored in the same file. The only way to update a slot's email label is to re-run `sca save`, which re-fetches the profile and renames the file. Subsequent `sca usage` / `sca list` calls are zero-network for labels — the email is parsed straight out of the filename.
+
+If `sca save` cannot reach the profile endpoint (offline, 401, timeout), the slot is saved with the old unlabeled name `.credentials.<slot>.json`. It still works; `sca usage` just omits the second line until you re-save while online.
+
+`sca switch <name>` and `sca remove <name>` continue to take just the slot name — the tool finds the matching file regardless of whether it carries the `(email)` suffix.
+
+### Hardlink-broken state (synthetic `<active>` row)
+
+When Claude Code rewrites `.credentials.json` via atomic rename during a token refresh, the hardlink that `sca save` / `sca switch` sets up is broken. `sca usage` detects this and adds a synthetic row so you still see the usage Claude Code is actually reporting:
+
+```
+[Usage] Plan usage per slot (live from /api/oauth/usage):
+    Slot                        5h   5h reset      7d   7d reset     Status
+    -------------------------  ----  -----------  ----  -----------  ------
+    work                         5%  in 3h 00m     7%  in 120h      ok
+  * <active> (unsaved)          53%  in 2h 00m    19%  in 40h       ok
+[Usage] Warning: .credentials.json is not hardlinked to any saved slot. Run 'sca save <name>' to capture the active session, or 'sca switch <name>' to overwrite it with a saved slot.
+```
+
+Label conventions:
+- `<active>` — the active-file content matches a saved slot (tokens are equivalent, only the hardlink was lost); the warning points at `sca switch <matched-slot>` to repair auto-sync.
+- `<active> (unsaved)` — content matches no saved slot; `sca save <name>` to capture it or `sca switch <name>` to discard.
+
+You can drill into the synthetic row directly (quote the name so the shell does not interpret `<` / `>` as redirection):
+
+```powershell
+sca usage '<active>'              # either label works
+sca usage '<active> (unsaved)'    # exact label also accepted
+```
+
+Other forms:
+
+```powershell
+sca usage work          # verbose single-slot report (shows opus / sonnet / overage buckets)
+sca usage -NoRefresh    # do not auto-refresh expired OAuth tokens
+sca usage -Json         # emit per-slot JSON for scripting
+```
+
+> **Unofficial API.** The `usage` action calls `api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` command uses internally. The endpoint is undocumented by Anthropic and the action may break on Claude Code upgrades; when that happens, see the extraction recipe at the top of `switch_claude_account.ps1` to re-pin the constants.
+
+If a slot's access token has expired (default TTL ~1h), `sca usage` transparently refreshes it against `platform.claude.com/v1/oauth/token` using the slot's refresh token, rewriting the slot file in place so any hardlink to `.credentials.json` survives. Pass `-NoRefresh` to disable this and only report stale slots.
+
 ### Install / uninstall alias
 
 ```powershell
