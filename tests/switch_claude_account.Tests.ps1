@@ -17,6 +17,16 @@
 BeforeAll {
     $script:ScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..\switch_claude_account.ps1')).Path
 
+    # Capture the pre-suite values of the two globals BeforeEach mutates so
+    # we can restore them in AfterAll. Without this, running Invoke-Pester
+    # directly in an interactive shell (as the README suggests) would leave
+    # the session's $env:USERPROFILE pointing at a deleted $TestDrive path
+    # and $PROFILE as a PSCustomObject stub, which breaks later commands.
+    # Running via the subprocess `pwsh -NoProfile -File tests/Invoke-Tests.ps1`
+    # was already safe because the mutations died with the subprocess.
+    $script:OriginalUserProfile = $env:USERPROFILE
+    $script:OriginalProfile     = $global:PROFILE
+
     # Shared helper for install/uninstall round-trip tests. Throws with a
     # precise offset on first mismatch so Pester shows exactly where the
     # byte sequences diverge instead of a generic "not equal" failure.
@@ -536,5 +546,13 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'uninstall'
             $out | Should -Match 'help, -h'
         }
+    }
+
+    AfterAll {
+        # Restore the two globals BeforeEach mutated so this suite leaves
+        # the caller's session clean. Pester runs AfterAll even if tests
+        # throw, so this covers the mid-suite-failure case too.
+        $env:USERPROFILE = $script:OriginalUserProfile
+        $global:PROFILE  = $script:OriginalProfile
     }
 }
