@@ -1,8 +1,11 @@
 #Requires -Version 7.0
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
-# Pester 5 tests for Invoke-SaveAction in switch_claude_account.ps1, including
-# its hardlink behavior. Per-test sandbox setup lives in tests/Common.ps1.
+# Pester 5 tests for Invoke-SaveAction in switch_claude_account.ps1.
+# After the state-file redesign Invoke-SaveAction no longer creates
+# hardlinks; its post-conditions are that the slot file matches
+# .credentials.json byte-for-byte and that .sca-state.json points at
+# the just-saved slot. Per-test sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
@@ -63,8 +66,8 @@ Describe 'switch_claude_account' {
         # Filename-encoded-email feature: on successful profile fetch
         # Invoke-SaveAction renames the slot file from
         #   .credentials.<slot>.json -> .credentials.<slot>(<email>).json
-        # The hardlink from .credentials.json follows the inode through
-        # the rename, so active-slot semantics are preserved.
+        # No hardlink involvement after the state-file redesign — the
+        # slot file is a plain copy and .sca-state.json tracks active.
         It 'writes the labeled filename when the profile fetch succeeds' {
             $credDir  = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $credDir -Force | Out-Null
@@ -82,8 +85,6 @@ Describe 'switch_claude_account' {
 
             Test-Path -LiteralPath (Join-Path $credDir '.credentials.work(alice@example.com).json') | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $credDir '.credentials.work.json')                    | Should -BeFalse
-            # Hardlink from .credentials.json survives the rename.
-            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
         }
 
         It 'keeps the unlabeled filename when profile fetch fails (fail-open)' {
@@ -154,9 +155,6 @@ Describe 'switch_claude_account' {
             Test-Path -LiteralPath (Join-Path $credDir '.credentials.work.json') | Should -BeTrue
             @(Get-ChildItem -LiteralPath $credDir -Filter '.credentials.work(*).json').Count | Should -Be 0
 
-            # Hardlink from .credentials.json survives the failed rename (core invariant).
-            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
-
             # Advisory printed; success message does NOT claim the email label.
             $out | Should -Match 'Could not rename slot to labeled form'
             $out | Should -Match "Saved as 'work'"
@@ -191,8 +189,8 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'Invoke-SaveAction (hardlink)' {
-        It 'creates a slot AND re-links .credentials.json as hardlink' {
+    Context 'Invoke-SaveAction (state file)' {
+        It 'updates state.active_slot to the saved slot' {
             $credDir  = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $credDir -Force | Out-Null
             $credFile = Join-Path $credDir '.credentials.json'
@@ -200,40 +198,44 @@ Describe 'switch_claude_account' {
 
             Invoke-SaveAction -Name 'work' 6>$null
 
-            $slot  = Join-Path $credDir '.credentials.work.json'
-            Test-Path $slot | Should -BeTrue
-            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
-            (Get-Item -LiteralPath $slot).LinkType       | Should -Be 'HardLink'
-            Get-Content -LiteralPath $credFile -Raw | Should -Be 'SAL'
-            Get-Content -LiteralPath $slot     -Raw | Should -Be 'SAL'
+            $state = Read-ScaState
+            $state.active_slot | Should -Be 'work'
+            # last_sync_hash matches a fresh hash of .credentials.json so
+            # Invoke-Reconcile no-ops on the next invocation.
+            $state.last_sync_hash | Should -Be (Get-FileHash -LiteralPath $credFile -Algorithm SHA256).Hash
         }
 
-        It 'overwrites an existing slot AND re-links .credentials.json' {
+        It 'leaves .credentials.json byte-equal to the new slot' {
             $credDir  = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $credDir -Force | Out-Null
             $credFile = Join-Path $credDir '.credentials.json'
-            $slot     = Join-Path $credDir '.credentials.work.json'
-            Set-Content -LiteralPath $credFile -Value 'NEW' -NoNewline
-            Set-Content -LiteralPath $slot     -Value 'OLD' -NoNewline
+            Set-Content -LiteralPath $credFile -Value 'NEWBYTES' -NoNewline
 
             Invoke-SaveAction -Name 'work' 6>$null
 
-            Get-Content -LiteralPath $credFile -Raw | Should -Be 'NEW'
-            Get-Content -LiteralPath $slot     -Raw | Should -Be 'NEW'
-            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
+            $slot = Join-Path $credDir '.credentials.work.json'
+            Get-Content -LiteralPath $slot     -Raw | Should -Be 'NEWBYTES'
+            Get-Content -LiteralPath $credFile -Raw | Should -Be 'NEWBYTES'
         }
 
-        It 'migration: save when .credentials.json is a regular file produces hardlink' {
+        # Save while Claude Code holds .credentials.json open (with
+        # FILE_SHARE_DELETE) must succeed — this is the whole reason the
+        # script switched to atomic-rename writes. Regression guard.
+        It 'succeeds when .credentials.json is open with FileShare::ReadWrite|Delete' {
             $credDir  = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $credDir -Force | Out-Null
             $credFile = Join-Path $credDir '.credentials.json'
-            [System.IO.File]::WriteAllBytes($credFile, [byte[]](0x41,0x42))
+            Set-Content -LiteralPath $credFile -Value 'OPEN' -NoNewline
 
-            { Get-Item -LiteralPath $credFile }.LinkType | Should -Not -Be 'HardLink'
+            $stream = [System.IO.File]::Open($credFile, 'Open', 'Read', 'ReadWrite, Delete')
+            try {
+                { Invoke-SaveAction -Name 'work' 6>$null } | Should -Not -Throw
+            }
+            finally {
+                $stream.Dispose()
+            }
 
-            Invoke-SaveAction -Name 'work' 6>$null
-
-            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
+            (Read-ScaState).active_slot | Should -Be 'work'
         }
     }
 

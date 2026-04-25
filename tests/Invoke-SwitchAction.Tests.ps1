@@ -1,9 +1,12 @@
 #Requires -Version 7.0
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
-# Pester 5 tests for Invoke-SwitchAction in switch_claude_account.ps1,
-# including its hardlink behavior. Per-test sandbox setup lives in
-# tests/Common.ps1.
+# Pester 5 tests for Invoke-SwitchAction in switch_claude_account.ps1.
+# After the state-file redesign Invoke-SwitchAction no longer creates
+# hardlinks; its post-conditions are that .credentials.json contains
+# the target slot's bytes (atomic-rename copy) and that
+# .sca-state.json points at the just-switched slot. Per-test sandbox
+# setup lives in tests/Common.ps1.
 
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
@@ -43,7 +46,6 @@ Describe 'switch_claude_account' {
             Invoke-SwitchAction -Name 'work' 6>$null
 
             [System.IO.File]::ReadAllBytes($script:CredFilePath) | Should -Be ([byte[]](0xBE,0xEF))
-            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
         }
 
         It 'throws when the named slot does not exist' {
@@ -94,14 +96,30 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'X'
         }
 
-        It 'rotation falls back to first slot when active file does not match any slot' {
+        # Active credentials don't match any saved slot: reconcile auto-saves
+        # them under a fresh `auto-<ts>` name (preserving the unknown
+        # tokens) and then rotation moves to the next alphabetical slot
+        # AFTER the auto-name. With slots [a, auto-<ts>, b] and active
+        # = auto-<ts>, the next alphabetical slot is 'b'. Replaces the
+        # old "fall back to first slot" behavior, which silently
+        # discarded the unknown active credentials.
+        It 'rotation auto-saves unknown active credentials and rotates from there' {
             Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.a.json') -Value 'A' -NoNewline
             Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.b.json') -Value 'B' -NoNewline
             Set-Content -LiteralPath $script:CredFilePath                                  -Value 'UNKNOWN' -NoNewline
 
-            Invoke-SwitchAction -Name '' 6>$null
+            $out = Invoke-SwitchAction -Name '' 6>&1 | Out-String
 
-            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'A'
+            # Reconcile auto-save advisory.
+            $out | Should -Match '\[Sync\] Auto-saved unknown active credentials'
+
+            # Auto slot exists with the unknown bytes preserved.
+            $autoFiles = @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.auto-*.json')
+            $autoFiles.Count | Should -Be 1
+            Get-Content -LiteralPath $autoFiles[0].FullName -Raw | Should -Be 'UNKNOWN'
+
+            # Rotation lands on 'b' (next alphabetical after 'auto-<ts>').
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'B'
         }
 
         # Regression: if a literal bracket-containing slot file exists on disk
@@ -241,12 +259,16 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
 
-            $out | Should -Match '\[Info\] Close and restart Claude Code to apply\.'
+            # Soft advisory: atomic-rename writes work even while Claude
+            # Code holds .credentials.json open, so we no longer demand
+            # closure — we just remind the user that running sessions
+            # need to restart to pick up the new tokens.
+            $out | Should -Match '\[Info\] Restart Claude Code to fully apply'
 
             # Ordering check: [Switch] header < table row < [Info] hint.
             $switchIdx = $out.IndexOf('[Switch] Switched')
             $rowIdx    = ($out | Select-String -Pattern '(?m)^\s+\*\s+alpha\s').Matches[0].Index
-            $infoIdx   = $out.IndexOf('[Info] Close')
+            $infoIdx   = $out.IndexOf('[Info] Restart')
             $switchIdx | Should -BeLessThan $rowIdx
             $rowIdx    | Should -BeLessThan $infoIdx
         }
@@ -263,50 +285,73 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'Only one slot'
             $out | Should -Match 'already active'
             # No apply hint: nothing changed, nothing to apply.
-            $out | Should -Not -Match '\[Info\] Close and restart'
+            $out | Should -Not -Match '\[Info\] Restart'
             # No success line either.
             $out | Should -Not -Match 'Switched to'
         }
     }
 
-    Context 'Invoke-SwitchAction (hardlink)' {
+    Context 'Invoke-SwitchAction (state file)' {
         BeforeEach {
             $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
             $script:CredFilePath = Join-Path $script:CredDirPath '.credentials.json'
         }
 
-        It 'creates hardlink on both endpoints' {
+        It 'updates state.active_slot to the switched slot' {
             $slot = Join-Path $script:CredDirPath '.credentials.work.json'
-            [System.IO.File]::WriteAllBytes($slot, [byte[]](0xDE,0xAD,0xBE,0xEF))
+            [System.IO.File]::WriteAllBytes($slot, [byte[]](0xDE,0xAD))
 
             Invoke-SwitchAction -Name 'work' 6>$null
 
-            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
-            (Get-Item -LiteralPath $slot).LinkType                | Should -Be 'HardLink'
-            [System.IO.File]::ReadAllBytes($script:CredFilePath)  | Should -Be ([byte[]](0xDE,0xAD,0xBE,0xEF))
+            (Read-ScaState).active_slot | Should -Be 'work'
+            # state.last_sync_hash matches the just-written .credentials.json
+            # so the next reconcile no-ops.
+            (Read-ScaState).last_sync_hash |
+                Should -Be (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
         }
 
-        It 'migration: switch when .credentials.json is a regular file produces hardlink' {
+        # Atomic-rename writes succeed even when Claude Code holds the
+        # destination open with FILE_SHARE_DELETE — this is the whole
+        # reason switch no longer requires closing Claude Code first.
+        It 'succeeds when .credentials.json is open with FileShare::ReadWrite|Delete' {
             $slot = Join-Path $script:CredDirPath '.credentials.work.json'
-            [System.IO.File]::WriteAllBytes($slot, [byte[]](0x41))
+            Set-Content -LiteralPath $slot                -Value 'NEW' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath -Value 'OLD' -NoNewline
 
-            { Get-Item -LiteralPath $script:CredFilePath }.LinkType | Should -Not -Be 'HardLink'
+            $stream = [System.IO.File]::Open($script:CredFilePath, 'Open', 'Read', 'ReadWrite, Delete')
+            try {
+                { Invoke-SwitchAction -Name 'work' 6>$null } | Should -Not -Throw
+            }
+            finally {
+                $stream.Dispose()
+            }
 
-            Invoke-SwitchAction -Name 'work' 6>$null
-
-            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'NEW'
         }
 
-        It 'rotation creates hardlinks on both endpoints' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.a.json') -Value 'A' -NoNewline
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.b.json') -Value 'B' -NoNewline
-            Set-Content -LiteralPath $script:CredFilePath                                  -Value 'A' -NoNewline
+        # Reconcile runs first, before the slot lookup. Verifies that a
+        # pending Claude Code refresh on the outgoing active slot is
+        # captured into its saved-slot file BEFORE we overwrite
+        # .credentials.json with the destination slot.
+        It 'reconciles before switching: outgoing slot bytes match the active file' {
+            # Outgoing slot 'old' is the active slot per state file but
+            # has stale bytes; .credentials.json carries newer bytes.
+            $oldSlot = Join-Path $script:CredDirPath '.credentials.old.json'
+            $newSlot = Join-Path $script:CredDirPath '.credentials.new.json'
+            Set-Content -LiteralPath $oldSlot              -Value 'STALE_OLD'  -NoNewline
+            Set-Content -LiteralPath $newSlot              -Value 'NEW_TARGET' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath  -Value 'REFRESHED'  -NoNewline
 
-            Invoke-SwitchAction -Name '' 6>$null
+            Update-ScaState -ActiveSlot 'old' -LastSyncHash 'STALE_HASH' | Out-Null
 
-            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'B'
-            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
+            Invoke-SwitchAction -Name 'new' 6>$null
+
+            # Outgoing slot was mirrored from the active file pre-switch.
+            Get-Content -LiteralPath $oldSlot              -Raw | Should -Be 'REFRESHED'
+            # Active file now has the new target's bytes.
+            Get-Content -LiteralPath $script:CredFilePath  -Raw | Should -Be 'NEW_TARGET'
+            (Read-ScaState).active_slot | Should -Be 'new'
         }
     }
 

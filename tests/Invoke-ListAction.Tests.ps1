@@ -1,9 +1,11 @@
 #Requires -Version 7.0
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
-# Pester 5 tests for Invoke-ListAction in switch_claude_account.ps1, including
-# the hardlink self-check warning. Per-test sandbox setup lives in
-# tests/Common.ps1.
+# Pester 5 tests for Invoke-ListAction in switch_claude_account.ps1.
+# After the state-file redesign Invoke-ListAction is a pure offline
+# render: no network, no hashing, no hardlink self-check. The active
+# marker `*` is sourced from .sca-state.json (with one-time hash-based
+# migration on first call). Per-test sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
@@ -123,55 +125,69 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'Invoke-ListAction (hardlink self-check)' {
+    Context 'Invoke-ListAction (state file)' {
         BeforeEach {
             $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
             $script:CredFilePath = Join-Path $script:CredDirPath '.credentials.json'
         }
 
-        It 'no warning when .credentials.json is a hardlink to the active slot' {
+        # The hardlink-broken / ActiveLocked / "not hardlinked to any
+        # slot" advisories are gone with the rest of the hardlink
+        # mechanism. List is now a pure offline render: NO advisories
+        # under any state. The pending-state cases the old advisories
+        # warned about are now handled silently by reconcile next time
+        # the user runs `sca usage` or `sca switch`.
+
+        It 'no advisory output ever, regardless of .credentials.json state' {
             Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
             Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
-            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'B' -NoNewline
-
-            # Establish hardlink
-            Remove-Item -LiteralPath $script:CredFilePath -Force
-            New-Item -ItemType HardLink -Path $script:CredFilePath -Target (Join-Path $script:CredDirPath '.credentials.bravo.json') | Out-Null
-
-            $out = Invoke-ListAction 6>&1 | Out-String
-            $out | Should -Not -Match 'Warning'
-        }
-
-        It 'warns when .credentials.json is a regular file that matches a slot' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
-            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'B' -NoNewline
-
-            $out = Invoke-ListAction 6>&1 | Out-String
-            $out | Should -Match 'Warning'
-            $out | Should -Match 'bravo'
-        }
-
-        It 'warns when .credentials.json is a regular file that matches no slot' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
             Set-Content -LiteralPath $script:CredFilePath                                      -Value 'UNKNOWN' -NoNewline
 
             $out = Invoke-ListAction 6>&1 | Out-String
-            $out | Should -Match 'Warning'
-            # The "no slot" warning says "not hardlinked to any slot" — no specific name.
-            $out | Should -Match 'not hardlinked to any slot'
+            $out | Should -Not -Match 'Warning'
+            $out | Should -Not -Match 'not hardlinked'
+            $out | Should -Not -Match 'auto-sync'
         }
 
-        It 'no warning when no .credentials.json exists' {
+        # Active marker comes from the state file when it exists.
+        It 'IsActive marker reflects state.active_slot' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+
+            Update-ScaState -ActiveSlot 'alpha' -LastSyncHash 'X' | Out-Null
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+\*\s+alpha\s'
+            $out | Should -Not -Match '(?m)^\s+\*\s+bravo\s'
+        }
+
+        # Auto-migration on first call (no state file): hash-match
+        # .credentials.json against existing slot files and seed state
+        # transparently. This keeps `sca list` correct after upgrading
+        # from the previous hardlink-based version.
+        It 'auto-migrates state on first call by hash-matching .credentials.json' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'B' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+
+            # Migration silently identifies bravo as active.
+            $out | Should -Match '(?m)^\s+\*\s+bravo\s'
+            # And persists for fast subsequent reads.
+            (Read-ScaState).active_slot | Should -Be 'bravo'
+        }
+
+        # No content-hash to compute when no .credentials.json exists.
+        # state.active_slot stays whatever it was (maybe null on a fresh
+        # install with no prior saves). Either way, no advisory.
+        It 'list works without .credentials.json (no active marker; no advisory)' {
             Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
 
             $out = Invoke-ListAction 6>&1 | Out-String
-            $out | Should -Not -Match 'Warning'
-        }
-
-        It 'no warning when no slots saved (early return)' {
-            $out = Invoke-ListAction 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+alpha\s'
+            $out | Should -Not -Match '(?m)^\s+\*\s+\w'
             $out | Should -Not -Match 'Warning'
         }
     }

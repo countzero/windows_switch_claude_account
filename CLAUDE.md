@@ -7,28 +7,30 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 ## Key facts
 
 - **Credential directory**: `%USERPROFILE%\.claude\`
-- **Active credentials**: `.credentials.json` — after the first `switch` or `save`, this is a hardlink to the active slot file. OAuth token refreshes in both paths simultaneously.
-- **Named slots**: `.credentials.<name>.json`
+- **Active credentials**: `.credentials.json` — written by Claude Code via atomic rename on every OAuth refresh. `sca` writes it via the same atomic-rename primitive (`Set-CredentialFileAtomic`) so the file is byte-equal to the tracked slot file after every `sca save` / `sca switch` / reconcile pass. **No hardlinks are involved** (the previous design's hardlink approach was structurally broken by Claude Code's atomic-rename refreshes; replaced in v2.0.0 with state-file tracking).
+- **State file**: `%USERPROFILE%\.claude\.sca-state.json` — schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." Read with `Read-ScaState` (auto-migrates from a 1.x install on first read by hashing `.credentials.json` against existing slot files); written via `Update-ScaState`.
+- **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled).
 - **PS version**: Requires PowerShell 7.0+ (`#Requires -Version 7.0`). Uses `$PROFILE.CurrentUserAllHosts` for the install target.
 - **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block
 
 ## Windows-specific gotchas
 
-- **File locks**: `Remove-Item` / `New-Item -HardLink` fail if Claude Code or VS Code has `.credentials.json` open. Always close the app before `save` or `switch`. `usage` tolerates a running Claude Code for the read path, but if it has to refresh an expired token the in-place `Set-Content` write may fail under lock; rerun after Claude Code exits.
+- **Atomic-rename writes survive an open Claude Code**. `Set-CredentialFileAtomic` calls `[System.IO.File]::Replace` / `::Move`, both of which invoke `MoveFileEx` and succeed against the FILE_SHARE_DELETE handle Claude Code keeps on `.credentials.json` while running. So `sca save` / `sca switch` no longer require closing Claude Code first. The retry policy is 3 attempts with 50 ms backoff to absorb transient sharing violations from antivirus / indexer scanners. Note: a running Claude Code session may keep using its in-memory tokens until restarted — the file swap is instant, but the process state isn't. The `[Info]` line on `switch` says so.
 - **Execution policy**: May need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
-- **Token expiry**: OAuth tokens refresh/expire after ~1 hour of inactivity. Hardlinked slots auto-sync, so stale slots are self-healing — Claude Code will refresh on the next call.
-- **Hardlink detection**: `list` warns if `.credentials.json` is no longer hardlinked (likely from a Claude Code write that broke the link). Run `sca switch <name>` to repair.
+- **Token expiry**: OAuth tokens refresh / expire after ~1 hour of inactivity. Without daemon the slot file is at most one Claude-Code-refresh behind the active file at any moment; the next `sca usage` or `sca switch` invocation captures the refresh into the slot via `Invoke-Reconcile`. "One refresh behind" is harmless in OAuth terms — the slot's previous refresh_token is still valid until rotated again, which Claude Code will do on its next API call. `Update-SlotTokens` (called by `sca usage` when the active slot's access token is expired) explicitly propagates the new tokens to BOTH the slot file AND `.credentials.json` so Claude Code's next call sees the latest refresh_token.
+- **Reconcile fires on usage and switch only** — not on `list` (kept as a pure offline render) or `remove`. The auto-migration path inside `Read-ScaState` handles upgrades from 1.x silently; users who have not yet reconciled see a stale `last_sync_hash` until their first `sca usage`.
+- **Cross-account swap detection**: when reconcile sees `.credentials.json` bytes differ from `state.last_sync_hash`, it makes one HTTP call to `/api/oauth/profile` to identify the new email. If the email matches the tracked slot's filename email, mirror through; if it differs, refuse to overwrite and auto-save under `auto-<UTC-timestamp>(<new-email>)` instead. Profile-fetch failure (offline / 401 / no-oauth) tolerantly falls into the mirror branch — preserving continuity over paranoia.
 - **Name sanitization**: Invalid Windows filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and spaces are replaced with `_`. Brackets are sanitized because PowerShell's `-Path` parameter treats them as character-class wildcards; without sanitization, `sca remove foo[bar]` would silently wildcard-match unrelated slot files. Paired with `-LiteralPath` on every credential-file op as defense-in-depth.
 
 ## Script actions
 
 | Action     | Requires name | What it does |
 |------------|---------------|--------------|
-| `save`     | Yes           | Copies `.credentials.json` → `.credentials.<name>.json`, then re-links `.credentials.json` as a hardlink to the new slot. Subsequent token refreshes flow into the saved slot. |
-| `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Output is a DarkYellow header line `[Switch] Switched to '<slot>' (<email>)` (no trailing period — matches the `[List]` / `[Usage]` header style), followed by the saved-slot table (same shape as `sca list`, header suppressed), and a cyan `[Info] Close and restart Claude Code to apply.` hint as the last line. Yellow advisories appear above the success line for the locked-active and no-active-detected edge cases; the single-slot-already-active no-op prints its yellow advisory and skips the success line, the table, and the `[Info]` hint. |
-| `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape and reuses `Format-AccountCell`, so account dedup and middle-truncation are identical across the two views. Pure offline render — no network IO. |
-| `remove`   | Yes           | Deletes a named slot |
-| `usage`    | Optional      | Calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens in place (hardlink-preserving). Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block including opus / sonnet / overage buckets. |
+| `save`     | Yes           | Atomic-writes `.credentials.json` bytes into `.credentials.<name>(<email>).json` (email resolved via `/api/oauth/profile`; falls back to unlabeled if offline). Updates `state.active_slot` and `state.last_sync_hash`. No reconcile prelude — explicit save IS the capture. |
+| `switch`   | Optional      | Reconciles first (so a pending Claude Code refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json` and updates state. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Output is a DarkYellow header line `[Switch] Switched to '<slot>' (<email>)`, the saved-slot table beneath, and a cyan `[Info] Restart Claude Code to fully apply the swap (running sessions may continue using the previous credentials until restarted).` Yellow advisory above the success line for the no-active-slot rotation edge case; single-slot-already-active no-op prints its advisory and skips the success line, table, and `[Info]` hint. |
+| `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape. Pure offline render — no network IO, no reconcile, no hashing. `*` marker comes from `state.active_slot`. |
+| `remove`   | Yes           | Deletes a named slot. Refuses to remove the slot tracked as active in state — user must `sca switch <other>` first. |
+| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens via `Update-SlotTokens`, which propagates the new tokens to `.credentials.json` when the slot is the tracked active. Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile |
 | `uninstall`| No            | Removes wrapper function + aliases from profile |
 | `help`     | No            | Shows detailed help |
@@ -39,13 +41,15 @@ The profile install/uninstall uses marker comments (`# === Claude Account Switch
 
 The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }` so tests can dot-source the script without triggering a live run. Each action body (`save`, `switch`, `list`, `remove`, `usage`) is extracted into an `Invoke-*Action` function so tests can call it directly. Keep this shape when adding new actions — put the body in `Invoke-<Action>Action` and add a one-line dispatch to `Invoke-Main`.
 
+The two credentials-touching actions that need a fresh slot file (`switch`, `usage`) call `Invoke-Reconcile` first; `save` skips reconcile (the explicit save IS the capture); `list` and `remove` skip reconcile too (`list` is a pure offline render; `remove` doesn't read slot bytes). New actions should follow the same rule: reconcile only when the slot file's bytes feed downstream logic.
+
 ### Color conventions
 
 - **DarkYellow** is reserved for **section-title headers**: `[Usage] Plan usage`, `[Usage] Slot '<name>'`, `[List] Saved slots`, and `[Switch] Switched to <ident>`. These are the four lines that introduce a block of data (a table or a verbose detail view).
-- **Yellow** is reserved for **advisories / warnings**: rate-limit notices, hardlink-broken warnings, locked-active and no-active-match branches in `switch`, save-time profile-fetch failures, `-interval` clamping, etc. Anything yellow means "attention required", never "this is a header".
+- **Yellow** is reserved for **advisories / warnings**: rate-limit notices, reconcile auto-save / identity-change advisories, no-active-slot rotation branch, save-time profile-fetch failures, `-interval` clamping, etc. Anything yellow means "attention required", never "this is a header".
 - **Green** marks success on actions that just produced a useful side effect (`[Save] Saved …`, `[Install] Installed!`).
 - **Red** marks completion of destructive actions (`[Remove] Removed …`, `[Uninstall] Uninstalled.`).
-- **Cyan** marks information hints, currently just `[Info] Close and restart Claude Code to apply.` under the `switch` action's table.
+- **Cyan** marks information hints, currently just the `[Info] Restart Claude Code …` line under the `switch` action's table.
 - **DarkGray** is for dimmed metadata (account row in the verbose view, "no plan-usage data" fallback, watch-mode footer).
 
 The DarkYellow choice tracks the warm amber `#ffcb6b` used for `warning` / `info` in OpenCode's material theme. PowerShell's `Write-Host -ForegroundColor` is restricted to the 16-value `ConsoleColor` enum and cannot hit truecolor; `DarkYellow` renders as warm amber/mustard in modern terminals (Windows Terminal Campbell ≈`#C19C00`, VS Code, Alacritty) and is the closest hue match within the palette. The split also restores a visual distinction between header and warning, which both used to be plain `Yellow`.
@@ -141,8 +145,9 @@ Layout: a blank line, the Session bar, a blank line, the Week bar, a blank line 
 
 **Slot-inclusion rule**:
 - Status `'ok'` only — HTTP-failure rows have no usable data.
-- Synth `<active>` matched (Name equals `$Script:ActiveSlotNameMatched`) is EXCLUDED to avoid double-counting against its hash-paired saved slot.
-- Synth `<active> (unsaved)` is INCLUDED — it represents a separate quota pool not yet captured by `sca save`.
+- Buckets with `null` / missing utilization counted as 0% used.
+
+After the v2.0.0 redesign there are no synth rows in the data model, so no slot-name special cases are needed.
 
 **Width**: bar fits to table edge. `barWidth = TotalLineWidth − 17`, floored at 8. The 17 is the per-line fixed overhead: 2 (indent) + 8 (label pad) + `[`+`]` + space + `"NNN%"` (4). `Format-UsageTable` computes `TotalLineWidth` after its column-width loop and passes it to `Format-AggregateBars`. The 8-char floor keeps narrow 1-slot tables visually meaningful — the bar line will be wider than `TotalLineWidth` in that degenerate case but never collapses to `[]`.
 
@@ -163,13 +168,13 @@ When no eligible rows exist (zero saved slots HTTP-ok), `Format-AggregateBars` e
 
 `Format-ListTable` renders 2 data columns (plus the leading `*` active marker): `Slot | Account`. Mirrors `Format-UsageTable`'s shape so the two views look like siblings — same header style (`[List] Saved slots` in DarkYellow), same active-marker conventions (`*` only, no trailing `(active)` text; the row is colored Green when active), same `Format-AccountCell` truncation (`—` for unlabeled / dedup-form slots, middle-truncated email otherwise).
 
-Pure offline render — no network calls. `Invoke-ListAction` only produces a network call indirectly if the user later re-runs `sca usage`. The hardlink-broken / `ActiveLocked` advisories are printed below the table (matching `Format-UsageFrame`'s ordering: data first, advisories below).
+Pure offline render — no network calls, no reconcile, no hashing. `Invoke-ListAction` reads `state.active_slot` (via `Get-Slots` -> `Read-ScaState`) for the `*` marker and renders. The hardlink-broken / `ActiveLocked` advisories were deleted with the rest of the hardlink mechanism in v2.0.0; pending-state cases the old advisories warned about are now handled silently by reconcile next time the user runs `sca usage` or `sca switch`.
 
 The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as siblings rather than factored into a generic helper. With only two callers and different per-cell rules (Status / merged-bucket cells live only on the usage table, the list table has neither), an abstraction would cost more than it saves.
 
 ### Switch action output
 
-`Invoke-SwitchAction` emits a DarkYellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line, so the user reads "what just happened" at a glance and immediately sees the new active slot in context (via the `*` marker on the just-activated row). The retired rotation banner is gone — the table beneath conveys the transition implicitly.
+`Invoke-SwitchAction` runs `Invoke-Reconcile` first (so a pending Claude Code refresh on the outgoing active slot is captured into its slot file before we overwrite `.credentials.json`), then atomic-writes the destination slot's bytes to `.credentials.json`, then prints a DarkYellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line.
 
 ```
 [Switch] Switched to 'slot-1' (ada.lovelace@arpa.net)
@@ -179,20 +184,20 @@ The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as
   * slot-1  ada.lovelace@arpa.net
     slot-2  ada@arpa.net
 
-[Info] Close and restart Claude Code to apply.
+[Info] Restart Claude Code to fully apply the swap (running sessions may continue using the previous credentials until restarted).
 ```
 
-- **Success line**: DarkYellow header, matches the `[List] Saved slots` / `[Usage] Plan usage` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence (same style as `[List] Saved slots`).
-- **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-completed hardlink swap. `-SuppressHeader` skips the `[List] Saved slots` DarkYellow header so the table sits cleanly under the `[Switch]` line. The hardlink-broken / `ActiveLocked` advisories that `Invoke-ListAction` emits cannot fire here (the hardlink was just established by `New-Item -ItemType HardLink`).
-- **`[Info]` apply hint**: cyan, last line beneath the table. Carries the "Close and restart Claude Code to apply." reminder split out of the success line so the success line stays scannable as a header. Suppressed for the single-slot no-op (nothing changed, nothing to apply).
+- **Success line**: DarkYellow header, matches the `[List] Saved slots` / `[Usage] Plan usage` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence.
+- **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-updated `state.active_slot`. `-SuppressHeader` skips the `[List] Saved slots` DarkYellow header so the table sits cleanly under the `[Switch]` line.
+- **`[Info]` apply hint**: cyan, last line beneath the table. Wording softened from the previous "Close and restart Claude Code to apply." to reflect that atomic-rename writes work even while Claude Code is open — the file is swapped now, but a running Claude Code session keeps using its in-memory tokens until restarted. Suppressed for the single-slot no-op (nothing changed, nothing to apply).
 - **Yellow advisory branches** (printed above the success line):
-  - **Locked active credentials file** (rotation only): `[Switch] Active credentials file is locked; cannot identify current slot. Rotating to <ident>.` Rotation still proceeds; the success line, table, and `[Info]` hint follow as usual.
-  - **No active match** (rotation only, hash of `.credentials.json` matches no saved slot): `[Switch] No currently active slot detected. Rotating to <ident>.` Rotation still proceeds; the success line, table, and `[Info]` hint follow as usual.
+  - **Reconcile advisories** (auto-save or identity-change): emitted by `Invoke-Reconcile` itself before the switch's own output. The user sees the unusual state explained before the success line.
+  - **No active slot detected** (rotation only): `[Switch] No currently active slot detected. Rotating to <ident>.` Fires when `state.active_slot` is null or points at a missing slot file. Rotation still proceeds; the success line, table, and `[Info]` hint follow as usual.
   - **Single-slot-already-active no-op** (rotation only): `[Switch] Only one slot (<ident>) and it is already active. Nothing to do.` Skips the success line, the table, AND the `[Info]` hint — nothing changed, no point re-rendering the unchanged state and no apply needed. Emitted by `Get-NextSlotName` itself, which then returns `$null` so the caller exits early.
 
 Slot identities are rendered via `Format-SlotIdentity`, the single source of truth for the dedup logic: returns `'<slot>' (<email>)` for labeled slots whose email differs from the slot name, and `'<slot>'` (no parens) for unlabeled or dedup-form slots. Same dedup rules as `Format-AccountCell` so the inline prose form and the table cell form stay consistent.
 
-`Get-NextSlotName`'s return shape: `{ To = { Name; Email }; HasActiveMatch = <bool>; Locked = <bool> }` (or `$null` for the single-slot no-op). `HasActiveMatch` differentiates the happy path (no advisory) from the no-active-match advisory branch; `Locked` is true only when the active credentials file existed but could not be hashed. The previous `From` field was dropped when the rotation banner was retired — no caller renders it any more.
+`Get-NextSlotName`'s return shape: `{ To = { Name; Email }; HasActiveSlot = <bool> }` (or `$null` for the single-slot no-op). `HasActiveSlot` differentiates the happy path (no advisory) from the no-active-slot advisory branch. The `Locked` field was deleted with the rest of the hardlink mechanism — `Get-Slots` no longer hashes the active file, so there's no lock to detect.
 
 ### Verbose view (`sca usage <slot>`)
 
@@ -235,8 +240,8 @@ Each per-slot entry carries the same fields as before plus a `plan_status` strin
 
 Design split driven by the watch loop:
 
-- **`Get-UsageSnapshot`** is the pure data-gathering function: enumerates slots, calls `Get-SlotUsage` (and `Get-SlotProfile` for the synth row), and returns `{ Results, HardlinkBroken, MatchedSlotName, NoSlots, HasSynthRow }`. Never renders. The one-shot path and the watch loop both call it.
-- **`Format-UsageFrame`** is the pure renderer: takes a snapshot plus an optional footer string and prints table-or-verbose + optional hardlink advisory + footer. Used identically from both entry points, so the frame shape is asserted by the suite and the watch loop automatically inherits every rendering guarantee.
+- **`Get-UsageSnapshot`** is the pure data-gathering function: enumerates slots, calls `Get-SlotUsage` per slot, and returns `{ Results, NoSlots, HasCacheFallback }`. Never renders. The one-shot path and the watch loop both call it. Reconcile runs once per poll boundary (in `Invoke-UsageAction` for the one-shot path, inside the watch loop's `$dueForPoll` branch) so by the time `Get-UsageSnapshot` reads slot files they are byte-equal to whatever Claude Code last wrote into `.credentials.json`.
+- **`Format-UsageFrame`** is the pure renderer: takes a snapshot plus an optional footer string and prints table-or-verbose + optional cache-fallback advisory + footer. Used identically from both entry points, so the frame shape is asserted by the suite and the watch loop automatically inherits every rendering guarantee.
 - **`Invoke-UsageWatch`** is the loop itself. Untested — its behavior is the alt-buffer + sync-mode wrapper described above around a `Format-UsageFrame` call on a 1-second `Start-Sleep` tick. No keyboard input handling: Ctrl-C terminates via the runtime's default handler, and the `finally` block emits `ESC[?25h` + `ESC[?1049l` (show cursor + leave alt buffer) and restores `[Console]::CursorVisible` to its pre-loop value.
 
 Runtime guards (both throw, neither runs the loop):
@@ -248,7 +253,7 @@ Interval clamping: values below `$Script:UsageWatchMinInterval = 60` get clamped
 
 Exit: Ctrl-C only. The loop installs no key listeners (no `[Console]::KeyAvailable` / `ReadKey`); the runtime's default Ctrl-C handler terminates the pipeline and PowerShell runs the `finally` block, which leaves the alternate screen buffer (so the user's pre-watch terminal scrollback is restored, mirroring `top` / `htop` / `vim`) and restores cursor visibility. There is no interactive force-refresh — to bypass the poll interval, quit and re-run.
 
-Error handling: if an HTTP call fails mid-loop, the previous snapshot stays on screen and a second line appears under the footer reading `[Watch] Last poll failed: <msg> (keeping previous data; will retry on next tick)`. The hardlink-broken advisory is suppressed on redraws between polls (only shown on freshly-polled frames) so the warning does not flash every second.
+Error handling: if an HTTP call fails mid-loop, the previous snapshot stays on screen and a second line appears under the footer reading `[Watch] Last poll failed: <msg> (keeping previous data; will retry on next tick)`.
 
 ### Profile endpoint + filename-encoded email
 
@@ -278,22 +283,11 @@ Save-time failure modes (all non-fatal; save still produces a usable slot):
 - Response missing `account.email` → unlabeled; advisory printed.
 - Any subsequent `sca save <name>` upgrades the file to the labeled form once the profile fetch succeeds.
 
-Synth `<active>` row: `.credentials.json` has no filename-encoded email, so when the hardlink is broken and the synth row is rendered, `Invoke-UsageAction` still makes one live profile call against the active file's token to show which account Claude Code is using. The only display-path HTTP profile call; fires only when a synth row appears.
+Reconcile's identity safeguard makes one extra `Get-SlotProfile` call per `sca usage` / `sca switch` invocation when `.credentials.json` bytes differ from `state.last_sync_hash`. The call is the only profile-endpoint hit on the display path; it returns the email of the freshly-written tokens so reconcile can compare against the tracked slot's filename email and either mirror through (same identity) or auto-save (cross-account swap). Profile-fetch failure (offline / 401 / no-oauth) is tolerated — it falls into the same-identity mirror branch, preferring continuity over paranoia.
 
 On-disk migration from the previous cache-based implementation: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` sidecars and the `.credentials.profile.json` file on each enumeration (the cleanup is cheap and idempotent once complete).
 
 Display contract: both `sca list` and `sca usage` render emails inline in the `Account` column on the same row as the slot name — there is no longer a `└─ <email>` continuation line anywhere. `Format-AccountCell` is the single source of truth for the dedup logic: it returns `—` when the slot is unlabeled (offline save) or when the slot name (case-insensitive) equals its embedded email, and the middle-truncated email otherwise. The full untruncated email always lives in `sca usage <name>` verbose output and in `sca usage -json`.
-
-### Synthetic `<active>` row + hardlink warning
-
-When `.credentials.json` exists but is not a hardlink to any saved slot (the state after Claude Code atomically replaces the file during an OAuth refresh), `Invoke-UsageAction`:
-
-1. Queries the active file directly as an extra virtual slot.
-2. Labels the resulting row `<active>` if the content hashes to a saved slot (same tokens, broken hardlink) or `<active> (unsaved)` if it matches nothing saved (fresh login).
-3. Suppresses the `*` marker on any content-hash-matched saved slot so the marker appears exactly once on the synth row.
-4. After the table, emits the same hardlink-broken advisory `Invoke-ListAction` produces, pointing at `sca switch <matched-slot>` (match case) or `sca save <name>` / `sca switch <name>` (unsaved case).
-
-The two synth labels (`<active>` and `<active> (unsaved)`) live in `$Script:ActiveSlotNameMatched` / `$Script:ActiveSlotNameUnsaved` and are the single source of truth. `sca usage <name>` accepts either the full label or the bare string `<active>` as an alias; users need to quote the argument in PowerShell so `<` / `>` are not parsed as redirection operators.
 
 ## Testing
 

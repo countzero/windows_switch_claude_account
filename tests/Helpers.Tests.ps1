@@ -3,7 +3,7 @@
 
 # Pester 5 tests for the small pure-helper functions in
 # switch_claude_account.ps1: Get-SafeName, Get-ProfileEncoding, Get-Slots,
-# Get-SlotFileInfo, Test-HardlinkSupport, Show-Help.
+# Get-SlotFileInfo, Show-Help.
 #
 # Per-test sandbox setup lives in tests/Common.ps1; see that file for the
 # scoping rationale. Each top-level Describe must wrap a BeforeEach (Pester 5
@@ -111,9 +111,9 @@ Describe 'switch_claude_account' {
 
     Context 'Get-Slots' {
         # Regression: a slot file whose literal name contains [ or ] must be
-        # hashed correctly so IsActive is true when that slot's content
-        # matches the active credentials. Before the -LiteralPath fix,
-        # Get-FileHash -Path wildcard-expanded the path and silently
+        # hashed correctly during the auto-migration path in Read-ScaState
+        # (which runs when no state file exists yet). Before the -LiteralPath
+        # fix, Get-FileHash -Path wildcard-expanded the path and silently
         # mis-identified which slot was active (or threw).
         It 'marks a literal bracket slot as active when its hash matches .credentials.json' {
             $credDir = Join-Path $script:SandboxHome '.claude'
@@ -127,7 +127,6 @@ Describe 'switch_claude_account' {
 
             $active.Count    | Should -Be 1
             $active[0].Name  | Should -Be 'foo[bar]'
-            $info.ActiveLocked | Should -BeFalse
         }
 
         # One-time migration from the pre-filename-encoding version:
@@ -209,18 +208,6 @@ Describe 'switch_claude_account' {
         It 'returns $null for filenames that do not match the .credentials.*.json convention' {
             Get-SlotFileInfo -FileName 'not-credentials.json' | Should -BeNullOrEmpty
             Get-SlotFileInfo -FileName '.credentials.json'    | Should -BeNullOrEmpty
-        }
-    }
-
-    Context 'Test-HardlinkSupport' {
-        It 'does not throw and cleans up sentinel files on success' {
-            $credDir = Join-Path $script:SandboxHome '.claude'
-            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
-
-            { Test-HardlinkSupport 6>$null } | Should -Not -Throw
-
-            Join-Path $credDir '.scahardlink.source'  | Test-Path | Should -BeFalse
-            Join-Path $credDir '.scahardlink.target'  | Test-Path | Should -BeFalse
         }
     }
 

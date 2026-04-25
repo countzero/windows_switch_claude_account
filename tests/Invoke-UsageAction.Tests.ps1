@@ -74,13 +74,13 @@ Describe 'switch_claude_account' {
         }
 
         It 'happy path: real /api/oauth/usage shape (buckets at root, utilization, ISO resets_at) renders table' {
+            # Saved slot + .credentials.json byte-equal: reconcile sees a
+            # hash match, no-ops, and the table renders the saved slot
+            # directly. The synth <active> row that previous versions
+            # appended on broken-hardlink state is gone — the active slot
+            # file IS the active credentials post-reconcile.
             $slotPath = New-Slot -Name 'work'
-            # Establish the hardlink the way Invoke-SaveAction would. Without
-            # this, .credentials.json would be missing and the synth <active>
-            # row would not fire — fine — but explicitly linking here
-            # documents the "happy path" configuration.
-            Remove-Item -LiteralPath $script:CredFilePath -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType HardLink -Path $script:CredFilePath -Target $slotPath | Out-Null
+            Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
 
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 return [pscustomobject]@{
@@ -115,11 +115,11 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)\s+ok\s*$'
             # Unofficial-endpoint footer must not leak into output.
             $out | Should -Not -Match 'unofficial endpoint'
-            # Hardlinked active credentials: no synth row, no warning.
+            # No synth row, no hardlink-broken warning (both gone).
             $out | Should -Not -Match '<active>'
             $out | Should -Not -Match 'not hardlinked'
-            # And no row other than 'work' (one saved slot → exactly one data row).
-            ($out -split "`n" | Where-Object { $_ -match '(?:^|\s)(work|<active>)\b' }).Count | Should -Be 1
+            # And no row other than 'work' (one saved slot -> exactly one data row).
+            ($out -split "`n" | Where-Object { $_ -match '(?:^|\s)work\b' }).Count | Should -Be 1
         }
 
         It 'true empty response ({}) renders "ok (no plan data)"' {
@@ -549,12 +549,21 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'Week\s+28%\s+Resets '
         }
 
-        It 'refresh preserves any hardlink to .credentials.json (active-slot refresh)' {
+        # When sca usage triggers a token refresh on the active slot,
+        # the new tokens must propagate to .credentials.json so Claude
+        # Code's next call uses the latest refresh_token. Pre-state-file
+        # this happened automatically through the hardlink; now
+        # Update-SlotTokens explicitly atomic-writes both endpoints when
+        # the slot is the tracked active. Regression guard for the
+        # correctness fix described in CLAUDE.md.
+        It 'refresh on active slot propagates new tokens to .credentials.json' {
             $slotPath = New-Slot -Name 'activeStale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
 
-            Remove-Item -LiteralPath $script:CredFilePath -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType HardLink -Path $script:CredFilePath -Target $slotPath | Out-Null
-            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
+            # Seed state pointing at this slot, with .credentials.json
+            # byte-equal so reconcile no-ops on entry.
+            Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
+            $hash = (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
+            Update-ScaState -ActiveSlot 'activeStale' -LastSyncHash $hash | Out-Null
 
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
                 return [pscustomobject]@{
@@ -569,11 +578,49 @@ Describe 'switch_claude_account' {
 
             Invoke-UsageAction 6>$null
 
-            (Get-Item -LiteralPath $script:CredFilePath).LinkType | Should -Be 'HardLink'
-            (Get-Item -LiteralPath $slotPath).LinkType            | Should -Be 'HardLink'
-
+            # Both endpoints carry the new access token after the refresh.
             $credJson = Get-Content -LiteralPath $script:CredFilePath -Raw | ConvertFrom-Json
+            $slotJson = Get-Content -LiteralPath $slotPath              -Raw | ConvertFrom-Json
             $credJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
+            $slotJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
+
+            # state.last_sync_hash updated so the next reconcile no-ops.
+            (Read-ScaState).last_sync_hash |
+                Should -Be (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
+        }
+
+        # Refresh on a slot that is NOT the tracked active slot must
+        # only write to the slot file, leaving .credentials.json alone.
+        # Without this guard, sca usage on inactive slots would clobber
+        # .credentials.json with the wrong account's tokens.
+        It 'refresh on inactive slot leaves .credentials.json untouched' {
+            $activeSlot   = New-Slot -Name 'active'   -AccessToken 'sk-ant-oat-ACTIVE'
+            $inactiveSlot = New-Slot -Name 'inactive' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
+
+            Copy-Item -LiteralPath $activeSlot -Destination $script:CredFilePath -Force
+            $hash = (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
+            Update-ScaState -ActiveSlot 'active' -LastSyncHash $hash | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{
+                    access_token  = 'sk-ant-oat-NEW'
+                    refresh_token = 'sk-ant-ort-NEW'
+                    expires_in    = 3600
+                }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{}
+            }
+
+            $beforeCred = Get-Content -LiteralPath $script:CredFilePath -Raw
+            Invoke-UsageAction -Name 'inactive' 6>$null
+            $afterCred  = Get-Content -LiteralPath $script:CredFilePath -Raw
+
+            # .credentials.json untouched (still active's tokens).
+            $afterCred | Should -Be $beforeCred
+            # Inactive slot got the new tokens.
+            $inactiveJson = Get-Content -LiteralPath $inactiveSlot -Raw | ConvertFrom-Json
+            $inactiveJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
         }
 
         It 'named-slot usage: verbose view shows only Session and Week buckets' {
@@ -624,140 +671,64 @@ Describe 'switch_claude_account' {
             { Invoke-UsageAction -Name 'missing' 6>$null } | Should -Throw -ExpectedMessage "*Slot 'missing' not found*"
         }
 
-        # --- synth <active> row + hardlink warning ---
+        # --- reconcile prelude ---
+        #
+        # Invoke-UsageAction calls Invoke-Reconcile before gathering the
+        # snapshot. The detailed reconcile branches are covered by
+        # tests/Invoke-Reconcile.Tests.ps1; here we only verify that the
+        # post-reconcile state is what the table renders.
 
-        # Claude Code replaces .credentials.json via atomic rename during an
-        # OAuth refresh; that breaks the hardlink chain the switcher sets up.
-        # The `usage` action detects this state and renders a synthetic
-        # <active> row for whatever .credentials.json currently points at,
-        # so users can see the account Claude Code is actually using even
-        # when no saved slot matches it. Paired with a list-style warning.
-        It 'synth <active> (unsaved) row appears when .credentials.json matches no saved slot' {
-            # Two saved slots with one set of tokens + a completely
-            # different .credentials.json with a third token. Content hash
-            # of the active file matches neither slot.
-            New-Slot -Name 'work' -AccessToken 'sk-ant-oat-work' | Out-Null
-            New-Slot -Name 'home' -AccessToken 'sk-ant-oat-home' | Out-Null
-            $activePayload = @{
+        It 'reconcile mirrors a refreshed .credentials.json into the tracked slot' {
+            # Saved slot has stale tokens; .credentials.json carries new
+            # tokens (simulating Claude Code refresh). Reconcile mirrors
+            # active -> slot before Get-UsageSnapshot reads the slot.
+            $slotPath = New-Slot -Name 'work' -AccessToken 'sk-ant-oat-OLD'
+            $newPayload = @{
                 claudeAiOauth = @{
-                    accessToken      = 'sk-ant-oat-ACTIVE-UNKNOWN'
-                    refreshToken     = 'sk-ant-ort-ACTIVE-UNKNOWN'
+                    accessToken      = 'sk-ant-oat-NEW'
+                    refreshToken     = 'sk-ant-ort-NEW'
                     expiresAt        = $script:FutureMs
                     scopes           = @('user:inference')
                     subscriptionType = 'team'
-                    rateLimitTier    = 'default_claude_max_5x'
                 }
             } | ConvertTo-Json -Compress
-            Set-Content -LiteralPath $script:CredFilePath -Value $activePayload -NoNewline -Encoding utf8NoBOM
+            Set-Content -LiteralPath $script:CredFilePath -Value $newPayload -NoNewline -Encoding utf8NoBOM
 
-            # Return three different responses keyed by the Authorization
-            # header so we can detect whether the synth row used the
-            # active-file token (it must) rather than a saved slot's token.
-            Mock Invoke-RestMethod -ParameterFilter {
-                $Uri -eq 'https://api.anthropic.com/api/oauth/usage' -and $Headers['Authorization'] -like '*ACTIVE-UNKNOWN*'
-            } -MockWith {
-                return [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 53.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
-                    seven_day = [pscustomobject]@{ utilization = 19.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(40))) }
-                }
-            }
-            Mock Invoke-RestMethod -ParameterFilter {
-                $Uri -eq 'https://api.anthropic.com/api/oauth/usage' -and $Headers['Authorization'] -notlike '*ACTIVE-UNKNOWN*'
-            } -MockWith {
-                return [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(3))) }
-                    seven_day = [pscustomobject]@{ utilization = 7.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(120))) }
-                }
-            }
+            # Seed state pointing at 'work' so reconcile mirrors there.
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
 
-            $out = Invoke-UsageAction 6>&1 | Out-String
-
-            # Saved slots still render (both rows), without the `*` marker
-            # (content hash does not match .credentials.json, so their
-            # natural IsActive is already false; nothing suppressed).
-            $out | Should -Match '(?m)^\s+work\s'
-            $out | Should -Match '(?m)^\s+home\s'
-
-            # Synth row is present, marked active, with the (unsaved) suffix
-            # because .credentials.json content doesn't hash-match any slot.
-            $out | Should -Match '(?m)^\s+\*\s+<active> \(unsaved\)\s'
-            # Its usage numbers come from the active-file token (53/19),
-            # not the saved-slot tokens (5/7).
-            $out | Should -Match '<active> \(unsaved\).*\b53%'
-            $out | Should -Match '<active> \(unsaved\).*\b19%'
-
-            # Hardlink-broken warning on the unsaved path.
-            $out | Should -Match 'Warning: .credentials.json is not hardlinked'
-            $out | Should -Match "sca save <name>"
-
-            # Three endpoint calls: one per saved slot, one for .credentials.json.
-            Should -Invoke Invoke-RestMethod -Times 3 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
-        }
-
-        It 'synth <active> row (no suffix) appears when .credentials.json is a copy of a saved slot' {
-            # Same tokens in the active file as in 'work'; both hash-match
-            # but the active file is a regular file, not a hardlink.
-            $slotPath = New-Slot -Name 'work' -AccessToken 'sk-ant-oat-WORK-TOKEN'
-            $workJson = Get-Content -LiteralPath $slotPath -Raw
-            Set-Content -LiteralPath $script:CredFilePath -Value $workJson -NoNewline -Encoding utf8NoBOM
-
+            # Default Common.ps1 mock makes Get-SlotProfile fail -> offline
+            # tolerance branch -> mirror through.
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                if ($Headers['Authorization'] -ne 'Bearer sk-ant-oat-NEW') {
+                    throw "expected new token in Authorization header, got '$($Headers['Authorization'])'"
+                }
                 return [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 10.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
-                    seven_day = [pscustomobject]@{ utilization = 12.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(72))) }
+                    five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
                 }
             }
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            # Synth row uses the no-suffix label because content matches
-            # an existing saved slot.
-            $out | Should -Match '(?m)^\s+\*\s+<active>\s'
-            # The saved-slot row for 'work' is still present but does NOT
-            # carry the `*` marker — `*` is on the synth row only.
-            $out | Should -Match '(?m)^\s+work\s'
-            $out | Should -Not -Match '(?m)^\s+\*\s+work\s'
-
-            # Warning points at the matched slot and suggests sca switch.
-            $out | Should -Match "Warning: .credentials.json is not hardlinked to 'work'"
-            $out | Should -Match "sca switch work"
+            # Slot file now byte-equal to .credentials.json (mirrored).
+            Get-Content -LiteralPath $slotPath -Raw | Should -Be $newPayload
+            $out | Should -Match '(?m)^\s+\*\s+work\s'
         }
 
-        It 'no synth row and no warning when .credentials.json is a hardlink to a saved slot' {
-            $slotPath = New-Slot -Name 'work'
-            Remove-Item -LiteralPath $script:CredFilePath -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType HardLink -Path $script:CredFilePath -Target $slotPath | Out-Null
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
-                return [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 0.0; resets_at = $null }
-                    seven_day = [pscustomobject]@{ utilization = 0.0; resets_at = $null }
-                }
-            }
-
-            $out = Invoke-UsageAction 6>&1 | Out-String
-
-            $out | Should -Not -Match '<active>'
-            $out | Should -Not -Match 'Warning: .credentials.json'
-            # Exactly one endpoint call: for the saved slot (the synth-row
-            # extra call must NOT happen on the hardlinked path).
-            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
-        }
-
-        It 'synth row renders even when there are no saved slots at all' {
-            # Fresh install edge case: .credentials.json exists (user ran
-            # `claude /login` once) but nothing has been `sca save`'d yet.
-            $activePayload = @{
+        It 'reconcile auto-saves an unknown active credential under a fresh name' {
+            # No saved slots, .credentials.json present with novel tokens
+            # -> reconcile auto-saves. The auto-saved slot is then the
+            # only saved slot; the table renders it as active.
+            $payload = @{
                 claudeAiOauth = @{
-                    accessToken      = 'sk-ant-oat-loner'
-                    refreshToken     = 'sk-ant-ort-loner'
+                    accessToken      = 'sk-ant-oat-LONER'
+                    refreshToken     = 'sk-ant-ort-LONER'
                     expiresAt        = $script:FutureMs
                     scopes           = @('user:inference')
                     subscriptionType = 'pro'
-                    rateLimitTier    = $null
                 }
             } | ConvertTo-Json -Compress
-            Set-Content -LiteralPath $script:CredFilePath -Value $activePayload -NoNewline -Encoding utf8NoBOM
+            Set-Content -LiteralPath $script:CredFilePath -Value $payload -NoNewline -Encoding utf8NoBOM
 
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 return [pscustomobject]@{
@@ -768,123 +739,39 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            # Must NOT print the zero-slots early-return message.
-            $out | Should -Not -Match 'No slots saved yet'
-            # Synth row present with (unsaved) suffix.
-            $out | Should -Match '<active> \(unsaved\)'
+            # Reconcile advisory printed.
+            $out | Should -Match '\[Sync\] Auto-saved unknown active credentials'
+            # Auto-saved slot row present and active.
+            $out | Should -Match '(?m)^\s+\*\s+auto-\d{8}T\d{6}Z\s'
             $out | Should -Match '\b2%'
-            $out | Should -Match 'Warning: .credentials.json is not hardlinked'
+            # No synth row, no hardlink advisory anywhere.
+            $out | Should -Not -Match '<active>'
+            $out | Should -Not -Match 'not hardlinked'
         }
 
-        It '`sca usage <active>` drills into the synth row verbose view' {
-            # Set up the unsaved-active state.
-            $activePayload = @{
+        It '-json mode suppresses reconcile advisory text from stdout' {
+            # The auto-save branch normally prints a yellow advisory; in
+            # -json mode the JSON output must remain parseable.
+            $payload = @{
                 claudeAiOauth = @{
-                    accessToken      = 'sk-ant-oat-ACTIVE'
-                    refreshToken     = 'sk-ant-ort-ACTIVE'
-                    expiresAt        = $script:FutureMs
-                    scopes           = @('user:inference')
-                    subscriptionType = 'team'
-                    rateLimitTier    = 'default_claude_max_5x'
-                }
-            } | ConvertTo-Json -Compress
-            Set-Content -LiteralPath $script:CredFilePath -Value $activePayload -NoNewline -Encoding utf8NoBOM
-            New-Slot -Name 'other' | Out-Null
-
-            Mock Invoke-RestMethod -ParameterFilter {
-                $Uri -eq 'https://api.anthropic.com/api/oauth/usage' -and $Headers['Authorization'] -like '*ACTIVE*'
-            } -MockWith {
-                return [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 53.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
-                    seven_day = [pscustomobject]@{ utilization = 19.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(40))) }
-                }
-            }
-            Mock Invoke-RestMethod -ParameterFilter {
-                $Uri -eq 'https://api.anthropic.com/api/oauth/usage' -and $Headers['Authorization'] -notlike '*ACTIVE*'
-            } -MockWith {
-                throw 'saved-slot token should not be queried when drilling into synth row'
-            }
-
-            $out = Invoke-UsageAction -Name '<active> (unsaved)' 6>&1 | Out-String
-
-            # Verbose view header carries the synth name.
-            $out | Should -Match "Slot '<active> \(unsaved\)'"
-            # Two-bucket render only.
-            $out | Should -Match 'Session\s+53%\s+Resets '
-            $out | Should -Match 'Week\s+19%\s+Resets '
-            # Drill-down must not emit the warning (only the summary table does).
-            $out | Should -Not -Match 'Warning: .credentials.json'
-
-            # Only the active-file token was queried.
-            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
-                $Uri -eq 'https://api.anthropic.com/api/oauth/usage' -and $Headers['Authorization'] -like '*ACTIVE*'
-            }
-        }
-
-        It '`sca usage <active>` also accepts the bare <active> alias' {
-            $activePayload = @{
-                claudeAiOauth = @{
-                    accessToken      = 'sk-ant-oat-ACTIVE2'
-                    refreshToken     = 'sk-ant-ort-ACTIVE2'
+                    accessToken      = 'sk-ant-oat-JSON'
+                    refreshToken     = 'sk-ant-ort-JSON'
                     expiresAt        = $script:FutureMs
                     scopes           = @('user:inference')
                     subscriptionType = 'team'
                 }
             } | ConvertTo-Json -Compress
-            Set-Content -LiteralPath $script:CredFilePath -Value $activePayload -NoNewline -Encoding utf8NoBOM
+            Set-Content -LiteralPath $script:CredFilePath -Value $payload -NoNewline -Encoding utf8NoBOM
 
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 return [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 40.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
-                    seven_day = [pscustomobject]@{ utilization = 60.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(72))) }
+                    five_hour = [pscustomobject]@{ utilization = 9.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
                 }
             }
 
-            $out = Invoke-UsageAction -Name '<active>' 6>&1 | Out-String
-
-            $out | Should -Match "Slot '<active> \(unsaved\)'"
-            $out | Should -Match '\b40%'
-            $out | Should -Match '\b60%'
-        }
-
-        It '`sca usage <active>` throws when there is nothing to synthesize' {
-            # No .credentials.json -> nothing to synthesize. Must refuse.
-            New-Slot -Name 'alpha' | Out-Null
-            { Invoke-UsageAction -Name '<active>' 6>$null } |
-                Should -Throw -ExpectedMessage '*No synthetic active slot*'
-        }
-
-        It '-json includes the synth row under its label key' {
-            $activePayload = @{
-                claudeAiOauth = @{
-                    accessToken      = 'sk-ant-oat-ACTIVE3'
-                    refreshToken     = 'sk-ant-ort-ACTIVE3'
-                    expiresAt        = $script:FutureMs
-                    scopes           = @('user:inference')
-                    subscriptionType = 'team'
-                }
-            } | ConvertTo-Json -Compress
-            Set-Content -LiteralPath $script:CredFilePath -Value $activePayload -NoNewline -Encoding utf8NoBOM
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
-                return [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(3))) }
-                    seven_day = [pscustomobject]@{ utilization = 2.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(50))) }
-                }
-            }
-
-            $raw    = Invoke-UsageAction -json
-            $parsed = $raw | ConvertFrom-Json
-
-            # ConvertFrom-Json exposes ordered-dictionary keys as
-            # NoteProperty names on the root object. The synth row's key is
-            # the literal label string.
-            $parsed.PSObject.Properties.Name | Should -Contain '<active> (unsaved)'
-            $active = $parsed.'<active> (unsaved)'
-            $active.status                        | Should -Be 'ok'
-            $active.is_active                     | Should -Be $true
-            $active.data.five_hour.utilization    | Should -Be 1
-            $active.data.seven_day.utilization    | Should -Be 2
+            $raw = Invoke-UsageAction -json
+            { $raw | ConvertFrom-Json } | Should -Not -Throw
+            $raw | Should -Not -Match '\[Sync\]'
         }
 
         # --- Get-UsageSnapshot / Format-UsageFrame / -watch guards ---
@@ -896,7 +783,7 @@ Describe 'switch_claude_account' {
         #   3. Invoke-UsageAction -watch refuses bad surfaces (redirected
         #      output, combined with -json).
 
-        It 'Get-UsageSnapshot returns Results + HardlinkBroken + NoSlots flags' {
+        It 'Get-UsageSnapshot returns Results + NoSlots flags' {
             New-Slot -Name 'alpha' | Out-Null
 
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
@@ -908,8 +795,6 @@ Describe 'switch_claude_account' {
             $snap = Get-UsageSnapshot
             $snap                    | Should -Not -BeNullOrEmpty
             $snap.NoSlots            | Should -Be $false
-            $snap.HardlinkBroken     | Should -Be $false
-            $snap.HasSynthRow        | Should -Be $false
             @($snap.Results).Count   | Should -Be 1
             @($snap.Results)[0].Name | Should -Be 'alpha'
         }
@@ -920,43 +805,13 @@ Describe 'switch_claude_account' {
             @($snap.Results).Count | Should -Be 0
         }
 
-        It 'Get-UsageSnapshot reports HardlinkBroken + synth row when .credentials.json is a regular file' {
-            # Unknown tokens in the active file -> synth row, hardlink broken,
-            # no matched slot.
-            $activePayload = @{
-                claudeAiOauth = @{
-                    accessToken      = 'sk-ant-oat-ACTIVE-NOVEL'
-                    refreshToken     = 'sk-ant-ort-ACTIVE-NOVEL'
-                    expiresAt        = $script:FutureMs
-                    scopes           = @('user:inference')
-                    subscriptionType = 'team'
-                }
-            } | ConvertTo-Json -Compress
-            Set-Content -LiteralPath $script:CredFilePath -Value $activePayload -NoNewline -Encoding utf8NoBOM
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
-                return [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 4.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
-                }
-            }
-
-            $snap = Get-UsageSnapshot
-            $snap.HardlinkBroken   | Should -Be $true
-            $snap.HasSynthRow      | Should -Be $true
-            $snap.MatchedSlotName  | Should -BeNullOrEmpty
-            @($snap.Results).Count | Should -Be 1
-            @($snap.Results)[0].Name | Should -Be '<active> (unsaved)'
-        }
-
         It 'Format-UsageFrame prints the footer under the table when -Footer is provided' {
             $snap = [pscustomobject]@{
                 Results = @([pscustomobject]@{ Name = 'alpha'; IsActive = $false; Status = 'ok';
                     Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) } }
                     Error = $null; Email = $null })
-                HardlinkBroken  = $false
-                MatchedSlotName = $null
-                NoSlots         = $false
-                HasSynthRow     = $false
+                NoSlots          = $false
+                HasCacheFallback = $false
             }
 
             $out = Format-UsageFrame -Snapshot $snap -Footer 'HELLO-FROM-FOOTER' 6>&1 | Out-String
@@ -965,24 +820,6 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'HELLO-FROM-FOOTER'
             # Footer sits after the data row.
             ($out.IndexOf('alpha')) | Should -BeLessThan ($out.IndexOf('HELLO-FROM-FOOTER'))
-        }
-
-        It 'Format-UsageFrame -SuppressAdvisory hides the hardlink-broken warning' {
-            $snap = [pscustomobject]@{
-                Results         = @([pscustomobject]@{ Name = '<active> (unsaved)'; IsActive = $true; Status = 'ok';
-                    Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) } }
-                    Error = $null; Email = $null })
-                HardlinkBroken  = $true
-                MatchedSlotName = $null
-                NoSlots         = $false
-                HasSynthRow     = $true
-            }
-
-            $suppressed = Format-UsageFrame -Snapshot $snap -SuppressAdvisory 6>&1 | Out-String
-            $shown      = Format-UsageFrame -Snapshot $snap                    6>&1 | Out-String
-
-            $suppressed | Should -Not -Match 'Warning: .credentials.json'
-            $shown      | Should -Match     'Warning: .credentials.json'
         }
 
         It 'Invoke-UsageAction -watch -json throws (mutually exclusive)' {
@@ -1167,21 +1004,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+30%\s*$'
         }
 
-        It 'synth <active> matched is excluded; <active> (unsaved) is included' {
-            # eligible = saved + <active> (unsaved); <active> matched
-            # is dropped to avoid double-counting its hash-paired saved
-            # slot.  N=2.
-            #   5h: (50 + 100)/200 = 75% used.
-            #   7d: ( 0 + 100)/200 = 50% used.
-            $rows = @(
-                (New-OkRow -Name 'saved'              -FiveUtil  50 -SevenUtil   0)
-                (New-OkRow -Name '<active>'           -FiveUtil  50 -SevenUtil   0)
-                (New-OkRow -Name '<active> (unsaved)' -FiveUtil 100 -SevenUtil 100)
-            )
-            $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
-            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+75%\s*$'
-            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+50%\s*$'
-        }
+
 
         It 'utilization above 100 is clamped to 100' {
             # 7d=150% gets clamped to 100% used.

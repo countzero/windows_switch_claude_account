@@ -78,6 +78,7 @@ Param (
 $ScriptPath  = (Resolve-Path $PSCommandPath).Path
 $CredDir     = Join-Path $env:USERPROFILE ".claude"
 $CredFile    = Join-Path $CredDir ".credentials.json"
+$StateFile   = Join-Path $CredDir ".sca-state.json"
 $ProfilePath = $PROFILE.CurrentUserAllHosts
 
 # Marker constants delimiting the block we manage in the user's profile.
@@ -170,13 +171,205 @@ $Script:AggregateYellowPct     = 50
 # `-json` output always carry the full email.
 $Script:AccountColumnMaxWidth  = 32
 
-# Synthetic slot names used when .credentials.json content matches none
-# of the saved slot files. These are user-visible; the verbose drill-down
-# (`sca usage <name>`) accepts them as-is. Kept as script-scope constants
-# so both Invoke-UsageAction (producer) and the dispatcher (consumer,
-# when matching -Name) share a single source of truth.
-$Script:ActiveSlotNameUnsaved = '<active> (unsaved)'
-$Script:ActiveSlotNameMatched = '<active>'
+# --- State file + atomic credential-file write primitives -----------------
+#
+# `sca` tracks the currently-active slot in $StateFile (a small JSON
+# document) rather than relying on inode equality between .credentials.json
+# and a saved slot file. This is robust against Claude Code's atomic-rename
+# token-refresh writes, which previously broke the hardlink and silently
+# detached .credentials.json from any tracked slot.
+#
+# Schema v1:
+#   { "schema": 1, "active_slot": "<name>"|null, "last_sync_hash": "<sha256>"|null }
+#
+# Concurrent writes: every write goes through Set-CredentialFileAtomic,
+# which is atomic on NTFS. Two concurrent updates -> last writer wins;
+# the loser's changes are silently dropped. Acceptable for an interactive
+# tool that is rarely (and never deliberately) invoked in parallel.
+
+# Atomic temp-file-plus-rename write of $Bytes to $Path. The single write
+# primitive used by every credential-shaped file (.credentials.json, slot
+# files, .sca-state.json).
+#
+# Why atomic-rename rather than truncate-and-write: Claude Code keeps
+# .credentials.json open with FILE_SHARE_DELETE while running, and the
+# only Windows write path that succeeds against an open-but-share-delete
+# handle is `MoveFileEx` / `ReplaceFile` (the Win32 primitives behind
+# [System.IO.File]::Move / ::Replace). A plain Set-Content / Out-File
+# would fail with a sharing violation while Claude Code is running.
+#
+# Side effect: the destination always becomes a fresh inode after Replace.
+# We accept this; the script no longer relies on hardlinks for any
+# auto-sync property — the state file tracks the active slot instead.
+#
+# Retry: up to 3 attempts on transient sharing violations with 50 ms
+# backoff. Persistent failure throws after the final attempt; the temp
+# file is cleaned up in the finally block whether we succeeded or not
+# (Replace consumes the temp on success so Test-Path is false there).
+function Set-CredentialFileAtomic {
+    Param (
+        [Parameter(Mandatory)] [String] $Path,
+        # AllowEmptyCollection so callers can write a zero-byte placeholder
+        # without tripping PowerShell's mandatory-collection guard. Real
+        # credential / state writes are always non-empty, but defensive
+        # callers (and tests) shouldn't have to special-case zero-length.
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [byte[]] $Bytes
+    )
+
+    # Random suffix lets two concurrent writes coexist safely: each picks
+    # its own tmp name, the rename then serializes at the destination.
+    $tmp = "$Path.sca-tmp.$([Guid]::NewGuid().ToString('N').Substring(0,8))"
+    $maxAttempts = 3
+
+    try {
+        [System.IO.File]::WriteAllBytes($tmp, $Bytes)
+
+        $lastErr = $null
+        for ($i = 1; $i -le $maxAttempts; $i++) {
+            try {
+                if (Test-Path -LiteralPath $Path) {
+                    # [NullString]::Value passes a real .NET null; a bare $null
+                    # would be coerced to "" by PowerShell's argument binder
+                    # and Replace would reject it as an invalid backup path.
+                    [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+                } else {
+                    [System.IO.File]::Move($tmp, $Path)
+                }
+                return
+            }
+            catch [System.IO.IOException] {
+                $lastErr = $_
+                if ($i -lt $maxAttempts) {
+                    Start-Sleep -Milliseconds 50
+                }
+            }
+        }
+        throw $lastErr
+    }
+    finally {
+        # Cleanup on failure path. Success path leaves $tmp consumed by
+        # Replace/Move so Test-Path is already false here.
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Persist $State to $StateFile via atomic rename. The schema field is
+# enforced to 1 here so callers cannot accidentally write a stale or
+# missing version. last_sync_hash and active_slot may be $null (initial
+# state where reconcile has not yet captured any sync).
+function Write-ScaState {
+    Param (
+        [Parameter(Mandatory)] [psobject] $State
+    )
+
+    $payload = [ordered]@{
+        schema         = 1
+        active_slot    = $State.active_slot
+        last_sync_hash = $State.last_sync_hash
+    }
+    $json  = $payload | ConvertTo-Json -Compress
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+
+    Set-CredentialFileAtomic -Path $StateFile -Bytes $bytes
+}
+
+# Load the state file. Returns a [pscustomobject] with .schema /
+# .active_slot / .last_sync_hash on success, or $null when the file is
+# missing, unreadable, or schema-incompatible.
+#
+# Auto-migration: when no state file exists AND .credentials.json exists,
+# this function attempts to identify the active slot by hashing every
+# slot file for a content match (mirrors the pre-state-file IsActive
+# computation). On a hit, it persists the fresh state and returns it. On
+# a miss it returns $null and lets callers decide:
+#   * Invoke-Reconcile auto-saves under a generated name,
+#   * Invoke-ListAction renders without an active marker.
+#
+# Errors are swallowed so a corrupt state file or a transient migration
+# write failure does not break the tool — the next state-mutating call
+# rewrites it.
+function Read-ScaState {
+    if (Test-Path -LiteralPath $StateFile) {
+        try {
+            $raw = Get-Content -LiteralPath $StateFile -Raw -ErrorAction Stop
+            $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($obj.schema -ne 1) { return $null }
+            return [pscustomobject]@{
+                schema         = [int]$obj.schema
+                active_slot    = if ($obj.active_slot)    { [string]$obj.active_slot }    else { $null }
+                last_sync_hash = if ($obj.last_sync_hash) { [string]$obj.last_sync_hash } else { $null }
+            }
+        }
+        catch {
+            return $null
+        }
+    }
+
+    # No state file. Try to bootstrap by hash-matching .credentials.json
+    # against existing slot files (transparent upgrade for users coming
+    # from the hardlink-based version).
+    if (-not (Test-Path -LiteralPath $CredFile)) { return $null }
+    try {
+        $activeHash = (Get-FileHash -LiteralPath $CredFile -Algorithm SHA256).Hash
+    }
+    catch {
+        return $null
+    }
+
+    $files = Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne '.credentials.json' }
+    foreach ($f in $files) {
+        $parsed = Get-SlotFileInfo -FileName $f.Name
+        if (-not $parsed) { continue }
+        try {
+            if ((Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash -eq $activeHash) {
+                $state = [pscustomobject]@{
+                    schema         = 1
+                    active_slot    = $parsed.Name
+                    last_sync_hash = $activeHash
+                }
+                # Persist the migration so subsequent reads are O(1).
+                # Failure here is non-fatal; callers see correct behavior
+                # for this call and the migration retries on the next read.
+                try { Write-ScaState -State $state } catch { }
+                return $state
+            }
+        }
+        catch { continue }
+    }
+    return $null
+}
+
+# Read-modify-write helper. Pass any subset of -ActiveSlot / -LastSyncHash;
+# parameters not bound are left at their current state-file value (or null
+# when no state file existed). -ClearActiveSlot wins over -ActiveSlot in
+# the unusual case both are bound, so callers expressing "forget the
+# active slot" cannot accidentally re-set it.
+function Update-ScaState {
+    Param (
+        [String] $ActiveSlot,
+        [String] $LastSyncHash,
+        [switch] $ClearActiveSlot
+    )
+
+    $current = Read-ScaState
+    if (-not $current) {
+        $current = [pscustomobject]@{
+            schema         = 1
+            active_slot    = $null
+            last_sync_hash = $null
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey('ActiveSlot'))   { $current.active_slot    = $ActiveSlot }
+    if ($PSBoundParameters.ContainsKey('LastSyncHash')) { $current.last_sync_hash = $LastSyncHash }
+    if ($ClearActiveSlot)                               { $current.active_slot    = $null }
+
+    Write-ScaState -State $current
+    return $current
+}
 
 # We are detecting the profile file's encoding so install/uninstall can
 # preserve it. Without this, reading a UTF-16 profile as UTF-8 corrupts
@@ -357,8 +550,13 @@ function Get-SlotFileName {
 # cosmetic, not functional.
 #
 # Returns an object with:
-#   Slots        : array of { Name, Email, Path, IsActive }
-#   ActiveLocked : $true if .credentials.json exists but could not be hashed
+#   Slots : array of { Name, Email, Path, IsActive }
+#
+# IsActive is sourced from $StateFile via Read-ScaState (which auto-
+# migrates by content-hash on first call, transparently upgrading users
+# from the previous hardlink-based identification). The function makes
+# zero network calls and zero hash computations on the slot files
+# themselves — `sca list` stays a pure offline render.
 function Get-Slots {
     # One-time sidecar cleanup. Cheap (fires only when sidecars exist).
     $orphans = Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.profile.json' -ErrorAction SilentlyContinue
@@ -375,42 +573,23 @@ function Get-Slots {
             Sort-Object -Property Name
     )
 
-    $activeHash   = $null
-    $activeLocked = $false
-    if (Test-Path -LiteralPath $CredFile) {
-        try {
-            $activeHash = (Get-FileHash -LiteralPath $CredFile -Algorithm SHA256).Hash
-        }
-        catch {
-            $activeLocked = $true
-        }
-    }
+    $state      = Read-ScaState
+    $activeName = if ($state) { $state.active_slot } else { $null }
 
     $slots = foreach ($file in $files) {
         $parsed = Get-SlotFileInfo -FileName $file.Name
         if (-not $parsed) { continue }
 
-        $isActive = $false
-        if ($activeHash) {
-            try {
-                $isActive = ((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -eq $activeHash)
-            }
-            catch {
-                $isActive = $false
-            }
-        }
-
         [pscustomobject]@{
             Name     = $parsed.Name
             Email    = $parsed.Email
             Path     = $file.FullName
-            IsActive = $isActive
+            IsActive = ($activeName -and $parsed.Name -eq $activeName)
         }
     }
 
     return [pscustomobject]@{
-        Slots        = @($slots)
-        ActiveLocked = $activeLocked
+        Slots = @($slots)
     }
 }
 
@@ -429,22 +608,17 @@ function Find-SlotByName {
 
 # We are determining which slot should become active when `switch` is
 # called without an explicit name. Behavior:
-#   * No slots saved       -> throw (nothing to rotate to).
-#   * One slot, active     -> print warning and return $null (caller exits).
-#   * Active slot found    -> return { To; HasActiveMatch=$true; Locked=$false }
-#                              for the next slot (alphabetical, wraps).
-#   * No active match      -> return { To=first; HasActiveMatch=$false;
-#                              Locked=<bool> } so the caller can emit a
-#                              context-appropriate advisory (locked active
-#                              file vs. missing / unrecognized active file).
+#   * No slots saved          -> throw (nothing to rotate to).
+#   * One slot, already active -> print warning and return $null (caller exits).
+#   * Active slot tracked      -> return { To; HasActiveSlot=$true } for the
+#                                next slot (alphabetical, wraps).
+#   * No active slot tracked   -> return { To=first; HasActiveSlot=$false }
+#                                so the caller can emit a yellow advisory.
 #
 # `To` is a `{ Name; Email }` object (Email may be $null for unlabeled
 # slots) so callers can render the filename-encoded email inline without
-# re-looking-up the slot. The previous `From` field was dropped when
-# Invoke-SwitchAction's rotation banner was retired in favour of the
-# slot-table-beneath layout — no caller renders it any more. `HasActiveMatch`
-# stayed because the caller still differentiates the happy path from the
-# no-active-match advisory branch.
+# re-looking-up the slot. Active-slot identification reads $StateFile
+# (slot.IsActive populated by Get-Slots from state); no content hashing.
 function Get-NextSlotName {
     $info  = Get-Slots
     $slots = @($info.Slots)
@@ -466,9 +640,8 @@ function Get-NextSlotName {
     $toSlot = if ($activeIdx -lt 0) { $slots[0] } else { $slots[($activeIdx + 1) % $slots.Count] }
 
     return [pscustomobject]@{
-        To             = [pscustomobject]@{ Name = $toSlot.Name; Email = $toSlot.Email }
-        HasActiveMatch = ($activeIdx -ge 0)
-        Locked         = ($activeIdx -lt 0 -and $info.ActiveLocked)
+        To            = [pscustomobject]@{ Name = $toSlot.Name; Email = $toSlot.Email }
+        HasActiveSlot = ($activeIdx -ge 0)
     }
 }
 
@@ -578,23 +751,123 @@ function Remove-From-Profile {
     }
 }
 
-# We verify that hardlinks can be created inside the credentials directory
-# before attempting any operation that depends on them.  This catches common
-# blockers (FAT32, network share, non-NTFS volume) with a clear error so the
-# user knows the environment does not support this feature.
-function Test-HardlinkSupport {
-    $sourceFile = Join-Path $CredDir '.scahardlink.source'
-    $linkFile   = Join-Path $CredDir '.scahardlink.target'
+# Reconcile .credentials.json with the saved slot tracked in $StateFile.
+# Called at the start of every credentials-touching action that needs the
+# tracked slot to reflect Claude Code's most recent token refresh (sca
+# switch and sca usage in the redesigned model). Replaces the hardlink
+# auto-sync mechanism the script used to depend on.
+#
+# Algorithm (4 outcomes; never throws):
+#   1. .credentials.json missing                   -> noop
+#   2. hash matches state.last_sync_hash           -> noop
+#   3. tracked slot exists, identity matches       -> mirror bytes -> slot
+#   4. tracked slot exists, identity DIFFERS       -> auto-save under new name
+#                                                     (cross-account swap detected;
+#                                                      old slot file preserved)
+#   5. no tracked slot, OR slot file is gone       -> auto-save under new name
+#
+# Identity check uses the OAuth /api/oauth/profile endpoint to resolve
+# the email of the current .credentials.json bytes, then compares it to
+# the email parsed out of the tracked slot's filename. A profile fetch
+# failure (offline, 401, no-oauth, rate limited) is treated as "unknown
+# new identity" and falls into the same-identity branch — i.e. we mirror
+# rather than risk over-eager auto-saves under transient network issues.
+# This is the safe failure mode: the slot's filename email is preserved
+# on disk; if Claude Code really did switch accounts while we were
+# offline, the user can see the labeled slot still claims the old email
+# and re-save manually.
+#
+# Race protection: bytes are read from .credentials.json once, then both
+# hashed and written. If Claude Code rewrites the file between our read
+# and our write, the slot file is consistent with our hash; the next
+# reconcile catches up to the newer bytes. No retry loop needed.
+#
+# Returns a [pscustomobject] describing the outcome so tests and callers
+# can assert on the action without parsing stdout. Stdout still carries
+# the user-visible advisory for the two non-silent branches (auto-save,
+# identity-change).
+function Invoke-Reconcile {
+    if (-not (Test-Path -LiteralPath $CredFile)) {
+        return [pscustomobject]@{ Action = 'noop'; Reason = 'no-active-credentials' }
+    }
 
+    $bytes = [System.IO.File]::ReadAllBytes($CredFile)
+
+    # Hash the bytes we just read (not the file path) so the (bytes, hash)
+    # pair is internally consistent even if Claude Code rewrites the file
+    # mid-reconcile. BitConverter + dash-strip yields uppercase hex,
+    # matching Get-FileHash output so values written here round-trip
+    # equality with state seeded by Read-ScaState's auto-migration.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        # Clean up from a previous failed run.
-        Remove-Item -LiteralPath $sourceFile, $linkFile -Force -ErrorAction SilentlyContinue
-
-        [System.IO.File]::WriteAllBytes($sourceFile, @())
-        New-Item -ItemType HardLink -Path $linkFile -Target $sourceFile | Out-Null
+        $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', ''
     }
     finally {
-        Remove-Item -LiteralPath $sourceFile, $linkFile -Force -ErrorAction SilentlyContinue
+        $sha.Dispose()
+    }
+
+    $state = Read-ScaState
+    if ($state -and $state.last_sync_hash -eq $hash) {
+        return [pscustomobject]@{ Action = 'noop'; Reason = 'hash-match' }
+    }
+
+    # Bytes differ from last sync. Resolve new identity (best-effort).
+    $newProfile = Get-SlotProfile -SlotPath $CredFile
+    $newEmail   = if ($newProfile.Status -eq 'ok') { $newProfile.Email } else { $null }
+
+    if ($state -and $state.active_slot) {
+        $slot = Find-SlotByName -Name $state.active_slot
+        if ($slot) {
+            # Tolerate offline / no-oauth on either side: we only block the
+            # mirror when BOTH emails are known AND they differ. This
+            # picks "preserve continuity" over "be paranoid about offline
+            # account-swaps", which is the right call for the 99% case
+            # (refreshes for the same account).
+            $sameIdentity = (-not $newEmail) -or (-not $slot.Email) -or ($newEmail -eq $slot.Email)
+            if ($sameIdentity) {
+                Set-CredentialFileAtomic -Path $slot.Path -Bytes $bytes
+                Update-ScaState -LastSyncHash $hash | Out-Null
+                return [pscustomobject]@{
+                    Action = 'mirror'
+                    Slot   = $state.active_slot
+                    Email  = $slot.Email
+                }
+            }
+
+            # Cross-account swap detected. DON'T overwrite; auto-save the
+            # new credentials under a fresh name so both identities are
+            # preserved on disk and the user can resolve the conflict.
+            $autoName = 'auto-' + ([DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'"))
+            $autoPath = Join-Path $CredDir (Get-SlotFileName -Name $autoName -Email $newEmail)
+            Set-CredentialFileAtomic -Path $autoPath -Bytes $bytes
+            Update-ScaState -ActiveSlot $autoName -LastSyncHash $hash | Out-Null
+
+            $oldIdent = Format-SlotIdentity -Name $state.active_slot -Email $slot.Email
+            Write-Host "[Sync] Active credentials are now $newEmail; previous slot $oldIdent preserved. Active slot is now '$autoName'." -ForegroundColor "Yellow"
+            return [pscustomobject]@{
+                Action       = 'identity-change'
+                Slot         = $autoName
+                PreviousSlot = $state.active_slot
+                Email        = $newEmail
+            }
+        }
+        # state.active_slot pointed at a slot file that no longer exists;
+        # fall through to the auto-save fallback so the new bytes still
+        # land in *some* slot.
+    }
+
+    # No tracked slot, or tracked slot file is gone. Auto-save fallback.
+    $autoName = 'auto-' + ([DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'"))
+    $autoPath = Join-Path $CredDir (Get-SlotFileName -Name $autoName -Email $newEmail)
+    Set-CredentialFileAtomic -Path $autoPath -Bytes $bytes
+    Update-ScaState -ActiveSlot $autoName -LastSyncHash $hash | Out-Null
+
+    $autoIdent = Format-SlotIdentity -Name $autoName -Email $newEmail
+    Write-Host "[Sync] Auto-saved unknown active credentials as $autoIdent." -ForegroundColor "Yellow"
+    return [pscustomobject]@{
+        Action = 'auto-save'
+        Slot   = $autoName
+        Email  = $newEmail
     }
 }
 
@@ -612,13 +885,17 @@ function Invoke-SaveAction {
         throw "$CredFile not found. Log in via Claude Code first."
     }
 
-    Test-HardlinkSupport
-
     # Find any pre-existing slot files for this slot name (labeled or
-    # unlabeled). We'll delete them before writing the new one so the
-    # save is idempotent even when the stored account has changed (and
+    # unlabeled). We delete them before writing the new one so the save
+    # is idempotent even when the stored account has changed (and
     # therefore the labeled form changes).
     $existing = @(Get-Slots).Slots | Where-Object { $_.Name -eq $safeName }
+
+    # Read .credentials.json bytes once. The same bytes are written to
+    # the slot file via atomic rename and hashed for state.last_sync_hash;
+    # this read-once-write-once approach ensures internal consistency
+    # even if Claude Code rewrites .credentials.json during the save.
+    $bytes = [System.IO.File]::ReadAllBytes($CredFile)
 
     # Write to the unlabeled filename first; rename to the labeled form
     # only after we successfully fetch the OAuth profile. This keeps
@@ -631,13 +908,9 @@ function Invoke-SaveAction {
             Remove-Item -LiteralPath $e.Path -Force
         }
     }
-    if (Test-Path -LiteralPath $unlabeledPath) {
-        Remove-Item -LiteralPath $unlabeledPath -Force
-    }
 
-    Copy-Item -LiteralPath $CredFile -Destination $unlabeledPath
-    Remove-Item -LiteralPath $CredFile -Force
-    New-Item -ItemType HardLink -Path $CredFile -Target $unlabeledPath | Out-Null
+    Set-CredentialFileAtomic -Path $unlabeledPath -Bytes $bytes
+    $finalSlotPath = $unlabeledPath
 
     # Eager profile fetch. Success -> rename to labeled form. Failure
     # (offline, 401, timeout, profile missing email) -> leave as
@@ -652,15 +925,16 @@ function Invoke-SaveAction {
             if (Test-Path -LiteralPath $labeledPath) {
                 Remove-Item -LiteralPath $labeledPath -Force
             }
-            # Rename preserves the inode on NTFS, so the hardlink from
-            # .credentials.json follows the file automatically. If the
-            # rename fails (e.g. email contains an NTFS-invalid character
+            # Plain Move-Item: hardlinks no longer in play, so the inode-
+            # preserving property the previous design relied on is moot.
+            # If the rename fails (email contains an NTFS-invalid character
             # like '<' or ':'), fall back to the unlabeled form and emit
             # an advisory so the save still succeeds — user can re-run
             # later if Anthropic ever returns a sanitizable email.
             try {
-                Rename-Item -LiteralPath $unlabeledPath -NewName $labeledName -ErrorAction Stop
-                $finalEmail = $profile.Email
+                Move-Item -LiteralPath $unlabeledPath -Destination $labeledPath -ErrorAction Stop
+                $finalEmail    = $profile.Email
+                $finalSlotPath = $labeledPath
             }
             catch {
                 Write-Host "[Save] Could not rename slot to labeled form (keeping unlabeled): $($_.Exception.Message)" -ForegroundColor "Yellow"
@@ -689,12 +963,33 @@ function Invoke-SaveAction {
         }
     }
 
+    # Update state: this slot is now the active one, and its bytes match
+    # .credentials.json (we just wrote them). Hash the bytes we wrote
+    # rather than re-reading either file, for the read-once-write-once
+    # consistency property described above.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', ''
+    }
+    finally {
+        $sha.Dispose()
+    }
+    Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
+
     $displayEmail = if ($finalEmail) { " ($finalEmail)" } else { '' }
     Write-Host "[Save] Saved as '$safeName'$displayEmail" -ForegroundColor "Green"
 }
 
 function Invoke-SwitchAction {
     Param ([String] $Name)
+
+    # Reconcile FIRST so any pending Claude Code refresh on the outgoing
+    # active slot is mirrored into the saved slot file before we
+    # overwrite .credentials.json. If reconcile triggers an auto-save or
+    # identity-change branch, its yellow advisory prints above the
+    # subsequent switch output — that is desired (the user sees
+    # context for the unusual state).
+    Invoke-Reconcile | Out-Null
 
     # When invoked without a name, rotate to the next saved slot
     # (alphabetical, wrap-around). Get-NextSlotName returns $null for
@@ -709,15 +1004,12 @@ function Invoke-SwitchAction {
         $safeName = $rotation.To.Name
         $toIdent  = Format-SlotIdentity -Name $rotation.To.Name -Email $rotation.To.Email
 
-        # Yellow advisory branches: surface unusual states before the
-        # green success line so the user notices them. Both states still
-        # proceed with the rotation (we just couldn't identify what we
-        # were rotating away from). The happy path (HasActiveMatch=true)
+        # No-active-slot advisory: yellow line surfaced before the green
+        # success line so the user notices the unusual state. Rotation
+        # proceeds either way. The happy path (HasActiveSlot=true)
         # emits no advisory — the slot table beneath the success line
         # makes the transition self-evident via the `*` marker.
-        if ($rotation.Locked) {
-            Write-Host "[Switch] Active credentials file is locked; cannot identify current slot. Rotating to $toIdent." -ForegroundColor "Yellow"
-        } elseif (-not $rotation.HasActiveMatch) {
+        if (-not $rotation.HasActiveSlot) {
             Write-Host "[Switch] No currently active slot detected. Rotating to $toIdent." -ForegroundColor "Yellow"
         }
     } else {
@@ -729,20 +1021,25 @@ function Invoke-SwitchAction {
         throw "Slot '$safeName' not found."
     }
 
-    Test-HardlinkSupport
-    if (Test-Path -LiteralPath $CredFile) {
-        Remove-Item -LiteralPath $CredFile -Force
+    # Atomic-rename copy: works even if Claude Code has .credentials.json
+    # open (it grants share-delete). Bytes are read from the slot file
+    # once and reused for both the write and the state hash.
+    $slotBytes = [System.IO.File]::ReadAllBytes($slot.Path)
+    Set-CredentialFileAtomic -Path $CredFile -Bytes $slotBytes
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = [BitConverter]::ToString($sha.ComputeHash($slotBytes)) -replace '-', ''
     }
-    New-Item -ItemType HardLink -Path $CredFile -Target $slot.Path | Out-Null
+    finally {
+        $sha.Dispose()
+    }
+    Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
 
     # DarkYellow header line — matches the `[List] Saved slots` /
-    # `[Usage] Plan usage` convention so all three actions
-    # present a consistent table-header look. No trailing period: this
-    # is a header, not a complete sentence (matches `[List] Saved slots`
-    # and `[Usage] Plan usage` style). DarkYellow is reserved
-    # for section titles; plain Yellow is reserved for advisories /
-    # warnings (the locked-active, no-active-match, and single-slot
-    # no-op branches above keep their Yellow on purpose).
+    # `[Usage] Plan usage` convention so all three actions present a
+    # consistent table-header look. No trailing period: this is a
+    # header, not a complete sentence.
     $toIdent = Format-SlotIdentity -Name $slot.Name -Email $slot.Email
     Write-Host "[Switch] Switched to $toIdent" -ForegroundColor "DarkYellow"
 
@@ -751,60 +1048,35 @@ function Invoke-SwitchAction {
     # the just-activated row). Re-enumerate via Get-Slots so IsActive
     # reflects the post-switch state. -SuppressHeader keeps the visual
     # weight low — the `[Switch]` line above is enough of a section
-    # header. The hardlink-broken / ActiveLocked advisories that
-    # Invoke-ListAction emits cannot fire here: we just established the
-    # hardlink, and we just hashed .credentials.json successfully via
-    # Test-HardlinkSupport + the New-Item call.
+    # header.
     Write-Host ''
     $postSwitchInfo = Get-Slots
     Format-ListTable -Slots @($postSwitchInfo.Slots) -SuppressHeader
 
-    # Cyan `[Info]` apply hint, last line beneath the table. Split out
-    # of the success line so the success line stays scannable as a
-    # header. Suppressed for the single-slot no-op (which returns early
-    # above and never reaches here) because nothing actually changed
-    # and there is nothing to apply. Format-ListTable already emitted
-    # a trailing blank line, so the Info line sits one row below the
-    # last table row.
-    Write-Host "[Info] Close and restart Claude Code to apply." -ForegroundColor "Cyan"
+    # Cyan `[Info]` apply hint, last line beneath the table. Wording
+    # softened from the previous "Close and restart" to reflect that
+    # atomic-rename writes work while Claude Code is open; the file is
+    # swapped now, but a running Claude Code session will keep using its
+    # in-memory tokens until restarted.
+    Write-Host "[Info] Restart Claude Code to fully apply the swap (running sessions may continue using the previous credentials until restarted)." -ForegroundColor "Cyan"
     Write-Host ''
 }
 
 function Invoke-ListAction {
-    $info  = Get-Slots
-    $slots = @($info.Slots)
+    # Pure offline render — no network calls, no hashing, no reconcile.
+    # Get-Slots reads the state file (Read-ScaState auto-migrates on
+    # first call) and stamps IsActive on each row. The hardlink-broken
+    # advisory and ActiveLocked branch are gone with the rest of the
+    # hardlink mechanism: there is no auto-sync to detect breakage of
+    # any more.
+    $slots = @((Get-Slots).Slots)
 
     if ($slots.Count -eq 0) {
         Write-Host "[List] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
         return
     }
 
-    # Render the saved-slot table first; advisories follow below so the
-    # data is the first thing the user reads (matches Format-UsageFrame's
-    # ordering convention).
     Format-ListTable -Slots $slots
-
-    # Get-Slots swallowed a hash failure on .credentials.json; surface
-    # it here so the user knows why no slot is marked active.
-    if ($info.ActiveLocked) {
-        Write-Host "[List] Could not read active credentials (file may be locked); active slot cannot be marked." -ForegroundColor "Yellow"
-    }
-
-    # Self-check: .credentials.json should be a hardlink to the active slot
-    # after the first switch/save.  If it is not, auto-sync is broken —
-    # likely because Claude Code replaced the file via atomic rename during a
-    # token refresh.  Surface this so the user can repair with `sca switch`.
-    if (Test-Path -LiteralPath $CredFile) {
-        $isHardlinked = (Get-Item -LiteralPath $CredFile).LinkType -eq 'HardLink'
-        if (-not $isHardlinked) {
-            $matchingSlot = $slots | Where-Object { $_.IsActive } | Select-Object -First 1
-            if ($matchingSlot) {
-                Write-Host "[List] Warning: .credentials.json is not hardlinked to '$($matchingSlot.Name)'. Auto-sync is broken. Run 'sca switch $($matchingSlot.Name)' to repair." -ForegroundColor "Yellow"
-            } else {
-                Write-Host "[List] Warning: .credentials.json is not hardlinked to any slot. Run 'sca save <name>' or 'sca switch <name>' to establish tracking." -ForegroundColor "Yellow"
-            }
-        }
-    }
 }
 
 function Invoke-RemoveAction {
@@ -817,6 +1089,15 @@ function Invoke-RemoveAction {
     $slot = Find-SlotByName -Name $safeName
     if (-not $slot) {
         throw "Slot '$safeName' not found."
+    }
+
+    # Refuse to remove the currently-active slot. Forces the user to
+    # explicitly switch to another slot first, which is the natural
+    # workflow and avoids leaving .credentials.json pointing at bytes
+    # we just deleted from disk.
+    $state = Read-ScaState
+    if ($state -and $state.active_slot -eq $safeName) {
+        throw "Cannot remove active slot '$safeName'. Run 'sca switch <other>' first, or delete .credentials.json manually if you want to drop tracking."
     }
 
     Remove-Item -LiteralPath $slot.Path -Force
@@ -902,10 +1183,15 @@ function Get-SlotOAuth {
 
 # Refresh the slot's OAuth tokens against platform.claude.com/v1/oauth/token,
 # using the same request shape Claude Code itself sends (verified against
-# claude.exe 2.1.119). The slot file is rewritten IN-PLACE (truncate +
-# write same inode) rather than replaced so any hardlink to .credentials.json
-# survives the refresh. Returns the new access token on success; throws
-# with a descriptive message on failure.
+# claude.exe 2.1.119). Writes the new tokens via Set-CredentialFileAtomic
+# (single write primitive shared with save / switch / state-file writes),
+# then — if the slot being refreshed is the currently-tracked active slot —
+# also writes the same bytes to .credentials.json so Claude Code's next
+# call sees the new refresh_token. This restores the auto-sync property
+# the previous hardlink-based design provided implicitly.
+#
+# Returns the new access token on success; throws with a descriptive
+# message on failure.
 function Update-SlotTokens {
     Param ([String] $SlotPath)
 
@@ -954,13 +1240,44 @@ function Update-SlotTokens {
     $raw.claudeAiOauth.refreshToken = $newRefresh
     $raw.claudeAiOauth.expiresAt    = $newExpMs
 
-    $newJson = $raw | ConvertTo-Json -Depth 10 -Compress
+    $newJson  = $raw | ConvertTo-Json -Depth 10 -Compress
+    $newBytes = [System.Text.Encoding]::UTF8.GetBytes($newJson)
 
-    # Set-Content truncates-and-writes the existing inode, which preserves
-    # any hardlink to .credentials.json. A Move-Item-based atomic-write
-    # would break the hardlink because it creates a new inode. utf8NoBOM
-    # matches the encoding Claude Code uses for its own credentials file.
-    Set-Content -LiteralPath $SlotPath -Value $newJson -NoNewline -Encoding utf8NoBOM
+    Set-CredentialFileAtomic -Path $SlotPath -Bytes $newBytes
+
+    # Active-slot auto-sync: if this slot is currently tracked as active,
+    # propagate the new tokens to .credentials.json so Claude Code's
+    # next call uses the latest refresh_token. Without this propagation
+    # the slot would silently drift ahead of .credentials.json after a
+    # refresh, and Anthropic's refresh-token rotation could invalidate
+    # the version Claude Code still holds. Belt-and-suspenders: also
+    # update state.last_sync_hash so the next Invoke-Reconcile no-ops
+    # rather than re-mirroring.
+    $state = Read-ScaState
+    if ($state -and $state.active_slot) {
+        $activeSlot = Find-SlotByName -Name $state.active_slot
+        if ($activeSlot -and $activeSlot.Path -eq $SlotPath) {
+            try {
+                Set-CredentialFileAtomic -Path $CredFile -Bytes $newBytes
+
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try {
+                    $newHash = [BitConverter]::ToString($sha.ComputeHash($newBytes)) -replace '-', ''
+                }
+                finally {
+                    $sha.Dispose()
+                }
+                Update-ScaState -LastSyncHash $newHash | Out-Null
+            }
+            catch {
+                # Slot file is the source of truth; .credentials.json
+                # propagation failed but the next reconcile (next sca
+                # invocation) will re-mirror. Yellow advisory so the
+                # user sees the partial-failure state explicitly.
+                Write-Host "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Next sca invocation will retry." -ForegroundColor "Yellow"
+            }
+        }
+    }
 
     return $newAccess
 }
@@ -1483,9 +1800,6 @@ function Get-AggregateBarColor {
 #
 # Slot inclusion rules:
 #   * Status='ok' only (HTTP-failure rows have no usable data).
-#   * Synth <active> matched (Name == $Script:ActiveSlotNameMatched)
-#     EXCLUDED — would double-count its hash-paired saved slot.
-#   * Synth <active> (unsaved) INCLUDED — separate quota pool.
 #   * Buckets with null/missing utilization counted as 0% used.
 #
 # Color thresholds via $Script:AggregateRedPct / $Script:AggregateYellowPct.
@@ -1507,9 +1821,7 @@ function Format-AggregateBars {
 
     if (-not $Results) { return }
 
-    $eligible = @($Results | Where-Object {
-        $_.Status -eq 'ok' -and $_.Name -ne $Script:ActiveSlotNameMatched
-    })
+    $eligible = @($Results | Where-Object { $_.Status -eq 'ok' })
     if ($eligible.Count -eq 0) { return }
 
     $n   = $eligible.Count
@@ -1830,95 +2142,45 @@ function Format-UsageVerbose {
 #
 # Snapshot shape (Get-UsageSnapshot):
 #   Results          : array of per-slot result rows
-#                      { Name, IsActive, Status, Data, Error, Email }
-#   HardlinkBroken   : $true when .credentials.json is a regular file
-#                      (not a hardlink) — drives the synth <active> row
-#                      and the post-table advisory.
-#   MatchedSlotName  : saved-slot whose content matches .credentials.json,
-#                      or $null. Used only to steer the advisory wording.
-#   NoSlots          : $true when there are zero saved slots AND no synth
-#                      row to render. Caller prints the "no slots" hint.
-#   HasSynthRow      : $true when a synth <active> row was appended to
-#                      Results. Convenience flag so the renderer does
-#                      not re-derive it.
+#                      { Name, IsActive, Status, Data, Error, Email,
+#                        IsCachedFallback }
+#   NoSlots          : $true when there are zero saved slots. Caller
+#                      prints the "no slots" hint.
+#   HasCacheFallback : $true when at least one row served from the 429
+#                      cache fallback. Drives the post-table advisory.
+#
+# The caller (Invoke-UsageAction) runs Invoke-Reconcile before invoking
+# this function, so by the time we enumerate slots, the active-slot file
+# is byte-equal to .credentials.json. The synthetic <active> row that
+# previous versions appended for the broken-hardlink state is no longer
+# needed: the active slot file IS the active credentials.
 
 # Gather the per-slot usage snapshot used by both the one-shot action and
-# the live watch loop. Performs all network IO (Get-SlotUsage per slot,
-# plus one extra Get-SlotProfile for the synth <active> row when the
-# hardlink is broken). Never renders; callers decide between table,
-# verbose, JSON, and watch-frame presentations.
+# the live watch loop. Performs all network IO (Get-SlotUsage per slot).
+# Never renders; callers decide between table, verbose, JSON, and
+# watch-frame presentations.
 function Get-UsageSnapshot {
     Param ([String] $Name)
 
     $info  = Get-Slots
     $slots = @($info.Slots)
 
-    # Decide whether to synthesize a row for .credentials.json itself.
-    # The active-slot detection in Get-Slots is by content-hash; but what
-    # Claude Code actually reads is whichever file inode .credentials.json
-    # refers to. When .credentials.json is a standalone regular file (not
-    # a hardlink to any saved slot), any refresh Claude Code performed
-    # won't flow into the saved slots, and our content-hash match may
-    # coincide with a saved slot only because of a prior identical snapshot.
-    # In that case we add a synthetic <active> row so the user sees the
-    # usage that Claude Code itself would see.
-    $credExists     = Test-Path -LiteralPath $CredFile
-    $credIsHardlink = $false
-    if ($credExists) {
-        try {
-            $credIsHardlink = (Get-Item -LiteralPath $CredFile).LinkType -eq 'HardLink'
-        }
-        catch {
-            # File open / locked during Get-Item: treat as non-hardlink for
-            # the purpose of this check; the usage call itself will surface
-            # any real read failure as an error row.
-            $credIsHardlink = $false
-        }
-    }
-
-    $needSynthActive = $credExists -and -not $credIsHardlink
-    $synthName       = $null
-    $matchedSlotName = $null
-    if ($needSynthActive) {
-        $matchedSlotName = ($slots | Where-Object { $_.IsActive } | Select-Object -First 1 -ExpandProperty Name)
-        $synthName       = if ($matchedSlotName) { $Script:ActiveSlotNameMatched } else { $Script:ActiveSlotNameUnsaved }
-        # A synthetic <active> row carries the `*` marker; suppress the
-        # content-hash match on saved slots so the `*` appears exactly
-        # once. The saved slot's row still lists; just without the marker.
-        foreach ($s in $slots) { $s.IsActive = $false }
-    }
-
-    if ($slots.Count -eq 0 -and -not $needSynthActive) {
+    if ($slots.Count -eq 0) {
         return [pscustomobject]@{
-            Results         = @()
-            HardlinkBroken  = $false
-            MatchedSlotName = $null
-            NoSlots         = $true
-            HasSynthRow     = $false
+            Results          = @()
+            NoSlots          = $true
+            HasCacheFallback = $false
         }
     }
 
-    # -Name filter: accept saved-slot names AND the two synth labels (they
-    # contain characters Get-SafeName would reject, so we special-case
-    # them before sanitizing). When a synth label is requested but
-    # .credentials.json is absent or normally-linked, fall through to the
-    # saved-slot match path which will throw 'not found' as usual.
-    $selectedSlots    = $slots
-    $includeSynthetic = $needSynthActive
+    # -Name filter: select a single slot by name (after Get-SafeName
+    # sanitization). Throws 'not found' when no match.
+    $selectedSlots = $slots
     if ($Name) {
-        if ($Name -eq $Script:ActiveSlotNameUnsaved -or $Name -eq $Script:ActiveSlotNameMatched -or $Name -eq '<active>') {
-            if (-not $needSynthActive) {
-                throw "No synthetic active slot present (.credentials.json is hardlinked or missing). Use a saved slot name."
-            }
-            $selectedSlots    = @()
-            $includeSynthetic = $true
-        } else {
-            $safeName         = Get-SafeName $Name
-            $selectedSlots    = @($slots | Where-Object { $_.Name -eq $safeName })
-            $includeSynthetic = $false
-            if ($selectedSlots.Count -eq 0) {
-                throw "Slot '$safeName' not found."
-            }
+        $safeName      = Get-SafeName $Name
+        $selectedSlots = @($slots | Where-Object { $_.Name -eq $safeName })
+        if ($selectedSlots.Count -eq 0) {
+            throw "Slot '$safeName' not found."
         }
     }
 
@@ -1939,34 +2201,9 @@ function Get-UsageSnapshot {
         }
     }
 
-    if ($includeSynthetic) {
-        $activeUsage = Get-SlotUsage -SlotPath $CredFile
-        # For the synth <active> row we do not have a filename-encoded
-        # email (the active file is always `.credentials.json`), so we
-        # keep the live profile call only for this row. At most one
-        # extra HTTP call per snapshot, and only when a synth row is
-        # rendered (hardlink broken / fresh login state).
-        $activeProfile = Get-SlotProfile -SlotPath $CredFile
-        $synthRow = [pscustomobject]@{
-            Name     = $synthName
-            IsActive = $true
-            Status   = $activeUsage.Status
-            Data     = $activeUsage.Data
-            Error            = $activeUsage.Error
-            Email            = if ($activeProfile.Status -eq 'ok') { $activeProfile.Email } else { $null }
-            IsCachedFallback = $activeUsage.IsCachedFallback
-        }
-        # Append so the synth row appears after the saved slots, matching
-        # the `sca list` ordering convention.
-        $results = @($results) + $synthRow
-    }
-
     return [pscustomobject]@{
-        Results         = @($results)
-        HardlinkBroken  = $needSynthActive
-        MatchedSlotName = $matchedSlotName
+        Results          = @($results)
         NoSlots          = $false
-        HasSynthRow      = $includeSynthetic
         HasCacheFallback = ($results | Where-Object { $_.IsCachedFallback }).Count -gt 0
     }
 }
@@ -1981,20 +2218,15 @@ function Get-UsageSnapshot {
 #                -> summary table.
 # -Snapshot    : output of Get-UsageSnapshot for this frame.
 # -Footer      : optional string printed below the table / verbose view
-#                and below the hardlink advisory, for the watch-mode
-#                "Last updated / next poll / keybindings" line. Multi-
-#                line strings are split and each line rendered in the
-#                DarkGray information color.
-# -SuppressAdvisory : when true, skip the hardlink-broken advisory (the
-#                verbose single-slot drill-down already-targeted; the
-#                warning is noise there).
+#                for the watch-mode "Last updated / next poll" line.
+#                Multi-line strings are split and each line rendered in
+#                the DarkGray information color.
 function Format-UsageFrame {
     Param (
         [String]                $Name,
         [pscustomobject]        $Snapshot,
         [AllowEmptyString()]
-        [AllowNull()] [String]  $Footer,
-        [switch]                $SuppressAdvisory
+        [AllowNull()] [String]  $Footer
     )
 
     if (-not $Snapshot -or $Snapshot.NoSlots) {
@@ -2023,16 +2255,6 @@ function Format-UsageFrame {
     # endpoint-agnostic wording.
     if ($Snapshot.HasCacheFallback) {
         Write-Host "  [Usage] Warning: Anthropic API rate limited — displaying cached data." -ForegroundColor "Yellow"
-    }
-
-    # Hardlink-broken advisory: only on the summary table; the verbose
-    # drill-down is already a targeted view and does not need it.
-    if ($Snapshot.HardlinkBroken -and -not $Name -and -not $SuppressAdvisory) {
-        if ($Snapshot.MatchedSlotName) {
-            Write-Host "[Usage] Warning: .credentials.json is not hardlinked to '$($Snapshot.MatchedSlotName)' (auto-sync broken). Run 'sca switch $($Snapshot.MatchedSlotName)' to repair." -ForegroundColor "Yellow"
-        } else {
-            Write-Host "[Usage] Warning: .credentials.json is not hardlinked to any saved slot. Run 'sca save <name>' to capture the active session, or 'sca switch <name>' to overwrite it with a saved slot." -ForegroundColor "Yellow"
-        }
     }
 
     if ($Footer) { Format-UsageFooter $Footer } else { Write-Host '' }
@@ -2065,6 +2287,18 @@ function Invoke-UsageAction {
     if ($watch) {
         Invoke-UsageWatch -Name $Name -Interval $interval
         return
+    }
+
+    # Reconcile first so the slot file matches whatever Claude Code may
+    # have written into .credentials.json since the last sca call. The
+    # subsequent Get-SlotUsage calls then read fresh tokens and the table
+    # marker is correct without relying on a synthetic <active> row.
+    # Suppress any reconcile advisory in -json mode so the JSON output
+    # stays parseable.
+    if ($json) {
+        Invoke-Reconcile 6>$null | Out-Null
+    } else {
+        Invoke-Reconcile | Out-Null
     }
 
     $snapshot = Get-UsageSnapshot -Name $Name
@@ -2179,6 +2413,13 @@ function Invoke-UsageWatch {
 
             if ($dueForPoll) {
                 try {
+                    # Reconcile at every poll boundary so a refresh that
+                    # happened since the last poll is captured into the
+                    # tracked slot before we read its bytes for the
+                    # /api/oauth/usage call. Suppressed stdout — any
+                    # advisory the reconcile emits would flash on every
+                    # poll and the per-frame ESC[2J would shred it anyway.
+                    Invoke-Reconcile 6>$null | Out-Null
                     $snapshot      = Get-UsageSnapshot -Name $Name
                     $lastPollError = $null
                 }
@@ -2212,13 +2453,7 @@ function Invoke-UsageWatch {
             # Clear-Host-style flicker — no regression.
             [Console]::Out.Write("`e[?2026h`e[2J`e[H")
             if ($null -ne $snapshot) {
-                # -SuppressAdvisory: during watch mode the hardlink warning
-                # is still useful but fires once per second of redraw; that
-                # is loud. Show it only on every poll boundary (when we
-                # just refreshed) so the user gets the message without
-                # the header flashing it constantly.
-                $suppress = -not $dueForPoll
-                Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer -SuppressAdvisory:$suppress
+                Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer
             } else {
                 # First poll failed and we have nothing to render yet.
                 Write-Host "[Watch] Waiting for first successful /api/oauth/usage response..." -ForegroundColor "Yellow"

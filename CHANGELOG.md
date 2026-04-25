@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-04-25
+
+### Changed
+- **Active-slot tracking moved from NTFS hardlinks to a state file** (`%USERPROFILE%\.claude\.sca-state.json`). The hardlink approach was structurally fragile against Claude Code's atomic-rename token-refresh writes (which silently detach `.credentials.json` from any hardlink graph), so even a working `sca save` could go stale within an hour. The new state file (schema v1: `{ active_slot, last_sync_hash }`) is the single source of truth for "which slot is active"; content-hash matching survives only as a one-time auto-migration path inside `Read-ScaState` for users upgrading from 1.x.
+- **All credential-file writes go through `Set-CredentialFileAtomic`** — a temp-file-plus-rename helper that calls `[System.IO.File]::Replace` / `::Move`. These succeed against the open-but-share-delete handle Claude Code keeps on `.credentials.json` while running, so `sca save` and `sca switch` no longer require closing Claude Code first. Switch's `[Info]` line was softened from `Close and restart Claude Code to apply.` to `Restart Claude Code to fully apply the swap (running sessions may continue using the previous credentials until restarted).` to reflect the relaxed constraint.
+- **`Invoke-Reconcile` runs at the start of every `sca usage` and `sca switch`** invocation. It hashes `.credentials.json`, compares against `state.last_sync_hash`, and on mismatch either silently mirrors the new bytes into the tracked slot file (same identity), auto-saves under a fresh `auto-<UTC-timestamp>` name (cross-account swap detected via `Get-SlotProfile`, or no tracked slot), or no-ops. Identity check is gated on the same profile fetch the synth `<active>` row used to make; offline / no-oauth tolerance falls into the silent-mirror branch. `sca list` does NOT reconcile — it stays a pure offline render reading state.
+- **`Update-SlotTokens` propagates active-slot refreshes to `.credentials.json`** automatically. When `sca usage` triggers a token refresh on the slot tracked as active, the new tokens are atomic-written to both the slot file and `.credentials.json`, and `state.last_sync_hash` is updated so the next reconcile no-ops. Restores the auto-sync property the previous hardlink design provided implicitly; without it the slot would silently drift ahead of `.credentials.json` and Anthropic's refresh-token rotation could invalidate the version Claude Code still holds.
+- `Invoke-RemoveAction` refuses to delete the slot tracked as active in state. Forces the user to `sca switch` away first; avoids leaving the state pointing at a now-missing slot.
+- `sca usage`'s synthetic `<active>` row is **gone from the data model**, not just the rendering. Reconcile guarantees the active credentials live in a real slot before `Get-UsageSnapshot` runs, so a virtual row is unnecessary. The `<active>` and `<active> (unsaved)` argument aliases for `sca usage <name>` are no longer accepted; use the auto-saved slot name shown in the `[Sync]` advisory instead.
+- `sca list`'s hardlink-broken / "not hardlinked to any slot" / `ActiveLocked` advisories are deleted with the rest of the hardlink mechanism. The state file's auto-migration handles upgrades from 1.x silently on first read.
+- `Get-Slots` shrinks to a thin enumerator: no per-slot SHA-256 hashing, no `ActiveLocked` field. `IsActive` is sourced from `Read-ScaState`. `Get-NextSlotName`'s return shape drops the `Locked` field; `HasActiveMatch` is renamed to `HasActiveSlot`.
+
+### Removed
+- `Test-HardlinkSupport` and its pre-flight call sites in `save` / `switch`. NTFS volumes (the only Windows filesystems that supported the previous design's hardlinks) are no longer required.
+- `$Script:ActiveSlotNameMatched` / `$Script:ActiveSlotNameUnsaved` constants and the `<active>` synthetic-slot machinery in `Get-UsageSnapshot` / `Format-UsageFrame`.
+- `Format-UsageFrame -SuppressAdvisory` parameter (the only suppressible advisory was the deleted hardlink-broken warning; the watch loop's call site no longer needs it).
+
+### Added
+- `Set-CredentialFileAtomic`, `Read-ScaState`, `Write-ScaState`, `Update-ScaState` foundational helpers (live near the top of the script, in their own `--- State file + atomic credential-file write primitives ---` block).
+- `Invoke-Reconcile` standalone (~30 lines + comments) covering 4 outcomes: `noop` / `mirror` / `identity-change` / `auto-save`. Returns a `[pscustomobject]` describing the action so callers can branch without parsing stdout.
+- `tests/State-File.Tests.ps1` (24 cases) — covers `Set-CredentialFileAtomic`'s atomic-rename behavior, share-delete tolerance, and retry on transient sharing violations; `Read-ScaState`'s schema-v1 round-trip, corrupt-JSON / schema-mismatch tolerance, and auto-migration (hit / miss); `Write-ScaState`'s schema enforcement; `Update-ScaState`'s read-modify-write semantics.
+- `tests/Invoke-Reconcile.Tests.ps1` (12 cases) — every reconcile branch including offline-tolerance mirror, identity-change auto-save, missing-slot fallback, and the silent migration path. Yellow advisory text is asserted on the auto-save and identity-change rendering paths.
+
 ## [1.2.0] - 2026-04-25
 
 ### Added

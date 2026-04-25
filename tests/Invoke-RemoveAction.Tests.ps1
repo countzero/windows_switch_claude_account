@@ -1,9 +1,11 @@
 #Requires -Version 7.0
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
-# Pester 5 tests for Invoke-RemoveAction in switch_claude_account.ps1,
-# including its hardlink behavior. Per-test sandbox setup lives in
-# tests/Common.ps1.
+# Pester 5 tests for Invoke-RemoveAction in switch_claude_account.ps1.
+# After the state-file redesign Invoke-RemoveAction refuses to remove
+# the currently-tracked active slot (the user must `sca switch` first)
+# and there is no longer any hardlink involvement to verify. Per-test
+# sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
@@ -82,26 +84,36 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'Invoke-RemoveAction (hardlink)' {
-        It 'removing the active slot leaves .credentials.json intact as a regular file' {
-            $credDir  = Join-Path $script:SandboxHome '.claude'
+    Context 'Invoke-RemoveAction (state file)' {
+        # Refusing to remove the active slot forces the user to switch
+        # away first. Without this guard, the user could delete the slot
+        # whose tokens .credentials.json depends on, leaving the script
+        # with a state file pointing at a now-missing slot.
+        It 'refuses to remove the slot tracked as active in state' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $credDir -Force | Out-Null
-            $credFile = Join-Path $credDir '.credentials.json'
-            $slot     = Join-Path $credDir '.credentials.work.json'
-            Set-Content -LiteralPath $credFile -Value 'DATA' -NoNewline
-            Set-Content -LiteralPath $slot     -Value 'DATA' -NoNewline
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.work.json')  -Value 'W' -NoNewline
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.other.json') -Value 'O' -NoNewline
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'X' | Out-Null
 
-            # Establish the hardlink (simulate a prior switch)
-            Remove-Item -LiteralPath $credFile -Force
-            New-Item -ItemType HardLink -Path $credFile -Target $slot | Out-Null
-            (Get-Item -LiteralPath $credFile).LinkType | Should -Be 'HardLink'
+            { Invoke-RemoveAction -Name 'work' 6>$null } |
+                Should -Throw -ExpectedMessage "*Cannot remove active slot 'work'*"
 
-            Invoke-RemoveAction -Name 'work' 6>$null
+            # Slot file untouched.
+            Test-Path -LiteralPath (Join-Path $credDir '.credentials.work.json') | Should -BeTrue
+        }
 
-            Test-Path -LiteralPath $slot | Should -BeFalse
-            Test-Path -LiteralPath $credFile | Should -BeTrue
-            Get-Content -LiteralPath $credFile -Raw | Should -Be 'DATA'
-            (Get-Item -LiteralPath $credFile).LinkType | Should -Not -Be 'HardLink'
+        It 'removes a non-active slot without disturbing state.active_slot' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.work.json')  -Value 'W' -NoNewline
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.other.json') -Value 'O' -NoNewline
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'X' | Out-Null
+
+            Invoke-RemoveAction -Name 'other' 6>$null
+
+            Test-Path -LiteralPath (Join-Path $credDir '.credentials.other.json') | Should -BeFalse
+            (Read-ScaState).active_slot | Should -Be 'work'
         }
     }
 
