@@ -111,11 +111,14 @@ Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { u
   | 5h bucket ≥ `UtilLimitPct`                  | `limited 5h`        | Red |
   | 7d bucket ≥ `UtilLimitPct`                  | `limited 7d`        | Red |
   | Both buckets ≥ `UtilLimitPct`               | `limited`           | Red |
+  | HTTP 429 (token refresh OR usage endpoint), no fresh cache | `rate-limited` | Yellow |
   | HTTP failure states                         | `expired` / `unauthorized` / `error: …` / `no-oauth (api key or non-claude.ai slot)` | Yellow / Red / Red / DarkGray |
 
   The thresholds are script-scope constants (`$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`) next to the usage endpoint constants. `100%` is the hard cap Anthropic enforces; `90%` is the heads-up tier. `Get-StatusColor` is the single source of truth for the color mapping so the summary table and verbose view stay in lockstep.
 
 A row flagged `limited 5h` / `limited 7d` / `limited` cannot serve new prompts until the named window resets. This was previously rendered as `ok` in the old HTTP-only Status column, which was misleading — the rewrite is the reason this section exists.
+
+**429 / `rate-limited` handling**: a 429 from either `/api/oauth/usage` or `/v1/oauth/token` (the latter triggered by `Get-SlotUsage`'s pre-call refresh of an expired token) is detected by the `Test-Is429` helper and routed through the same fallback policy: serve fresh cached usage data when `$Script:SlotUsageCache` has a `<UsageCacheTTL = 10`-minute entry for the slot, otherwise return `Status='rate-limited'`. The advisory text under the table reads `Anthropic API rate limited — displaying cached data.` — endpoint-agnostic, since either call may have triggered it. Long error messages on the `'expired'` and `'error'` arms are normalized through `Format-StatusErrorTail` (whitespace collapse + 60-char cap) so a verbose underlying exception cannot wrap the row. Without this normalization, a 429 from the token endpoint used to render as a multi-line `expired: Response status code does not indicate success: 429 (Too Many Requests).` and break the table layout.
 
 ### Aggregate progress bars
 
@@ -212,16 +215,17 @@ Each per-slot entry carries the same fields as before plus a `plan_status` strin
 ```jsonc
 {
   "slot-1": {
-    "status":      "ok",
-    "is_active":   false,
-    "plan_status": "limited 5h",          // absent for HTTP-failure rows
-    "account":     { "email": "ada@arpa.net" },
-    "data":        { /* raw /api/oauth/usage body */ }
+    "status":             "ok",
+    "is_active":          false,
+    "plan_status":        "limited 5h",   // absent for HTTP-failure rows
+    "is_cached_fallback": true,           // present (and true) only when the row was served from $Script:SlotUsageCache after a 429; absent otherwise
+    "account":            { "email": "ada@arpa.net" },
+    "data":               { /* raw /api/oauth/usage body */ }
   }
 }
 ```
 
-`plan_status` values match the Status column labels verbatim so scripts can branch on usability without re-deriving the thresholds. The full untruncated email always lives in `account.email`, regardless of the summary table's truncation width.
+`plan_status` values match the Status column labels verbatim so scripts can branch on usability without re-deriving the thresholds. The full untruncated email always lives in `account.email`, regardless of the summary table's truncation width. `is_cached_fallback` is the JSON-side signal of the same condition the `Anthropic API rate limited — displaying cached data.` advisory surfaces in the human view; absence means the data was fetched live for this run.
 
 ### Watch mode (`sca usage -watch`)
 

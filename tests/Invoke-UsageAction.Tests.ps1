@@ -244,6 +244,142 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
         }
 
+        # --- refresh-endpoint 429 handling ---
+        #
+        # Regression for the bug originally reported via screenshot: a 429
+        # from /v1/oauth/token surfaced as `expired: Response status code
+        # does not indicate success: 429 (Too Many Requests).` — long
+        # enough to wrap the table row, and mislabeled relative to the
+        # 'rate-limited' handling that already existed for the usage
+        # endpoint. After the fix the same 429 routes through Test-Is429
+        # and renders cleanly, with cache fallback when available.
+
+        It 'refresh 429 with no cache: status is rate-limited (not expired); no long error tail' {
+            $slotPath = New-Slot -Name 'slot-1' -ExpiresAt $script:PastMs
+            $before   = [System.IO.File]::ReadAllBytes($slotPath)
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Response status code does not indicate success: 429 (Too Many Requests).')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw 'should not be called when refresh 429s'
+            }
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+
+            # Status renders as the short 'rate-limited' label, never as
+            # the long 'expired: …429 (Too Many Requests)' string.
+            $out | Should -Match 'rate-limited'
+            $out | Should -Not -Match 'Too Many Requests'
+            # The slot name's own data row carries 'rate-limited', not 'expired'.
+            $out | Should -Match '(?m)^\s+slot-1\b.*\brate-limited\s*$'
+            $out | Should -Not -Match '(?m)^\s+slot-1\b.*\bexpired\b'
+
+            # Slot file untouched (refresh failed, nothing to write).
+            $after = [System.IO.File]::ReadAllBytes($slotPath)
+            $after.Length | Should -Be $before.Length
+            for ($i = 0; $i -lt $before.Length; $i++) { $after[$i] | Should -Be $before[$i] }
+
+            # Usage endpoint was never called — refresh failure short-circuits.
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
+        }
+
+        It 'refresh 429 with fresh cache: serves cached usage data + emits cache-fallback advisory' {
+            $slotPath = New-Slot -Name 'slot-1' -ExpiresAt $script:PastMs
+
+            # Pre-populate the in-memory cache with a recent successful
+            # response. `$Script:SlotUsageCache` is reinitialized to @{}
+            # in each BeforeEach (Common.ps1 dot-sources the script),
+            # so we start from a clean slate here.
+            $cachedReset = (Format-IsoReset ([TimeSpan]::FromHours(2)))
+            $Script:SlotUsageCache[$slotPath] = @{
+                Data      = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 42.0; resets_at = $cachedReset }
+                    seven_day = [pscustomobject]@{ utilization = 73.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(50))) }
+                }
+                Timestamp = [DateTime]::UtcNow
+            }
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw 'should not be called when refresh 429s'
+            }
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+
+            # Cached values render via the regular 'ok' Status path.
+            $out | Should -Match '\b42%'
+            $out | Should -Match '\b73%'
+            # New endpoint-agnostic advisory text fires for the cache fallback.
+            $out | Should -Match 'Anthropic API rate limited.+displaying cached data'
+            # Old advisory wording must not leak through.
+            $out | Should -Not -Match '/api/oauth/usage rate limited'
+        }
+
+        It 'refresh failure with non-429 long message: expired tail is truncated' {
+            New-Slot -Name 'slot-long' -ExpiresAt $script:PastMs | Out-Null
+
+            $longMessage = 'X' * 200
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Exception]::new($longMessage)
+            }
+
+            $out = Invoke-UsageAction 6>&1 | Out-String
+
+            # Still classified as 'expired' (no Response.StatusCode = 429).
+            $out | Should -Match '(?m)^\s+slot-long\b.*\bexpired:'
+            # Truncation marker present (the helper appends '...').
+            $out | Should -Match 'expired: X+\.\.\.'
+            # The full 200-char tail must NOT appear verbatim — defense-in-depth
+            # against the original wrapping bug for non-429 long messages.
+            $out | Should -Not -Match ('X' * 100)
+        }
+
+        It '-json emits is_cached_fallback when cache served the row' {
+            $slotPath = New-Slot -Name 'slot-1' -ExpiresAt $script:PastMs
+
+            $Script:SlotUsageCache[$slotPath] = @{
+                Data      = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
+                }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $parsed = Invoke-UsageAction -json | ConvertFrom-Json
+            $parsed.'slot-1'.status              | Should -Be 'ok'
+            $parsed.'slot-1'.is_cached_fallback  | Should -Be $true
+            $parsed.'slot-1'.data.five_hour.utilization | Should -Be 1
+        }
+
+        It '-json omits is_cached_fallback for fresh live responses' {
+            New-Slot -Name 'fresh' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(2))) }
+                }
+            }
+
+            $parsed = Invoke-UsageAction -json | ConvertFrom-Json
+            $parsed.fresh.status | Should -Be 'ok'
+            # Property either absent or explicitly false — never true.
+            $hasField = ($parsed.fresh | Get-Member -Name 'is_cached_fallback' -MemberType NoteProperty)
+            if ($hasField) { $parsed.fresh.is_cached_fallback | Should -Not -Be $true }
+        }
+
         It '-json emits a per-slot dictionary that round-trips via ConvertFrom-Json' {
             New-Slot -Name 'alpha' | Out-Null
             New-Slot -Name 'bravo' -AccessToken 'sk-ant-oat-bravo' -RefreshToken 'sk-ant-ort-bravo' | Out-Null
@@ -874,6 +1010,70 @@ Describe 'switch_claude_account' {
             }
             { Invoke-UsageAction -watch 6>$null } |
                 Should -Throw -ExpectedMessage '*-watch requires an interactive terminal*'
+        }
+    }
+
+    Context 'Test-Is429' {
+        It 'returns true for the test-mock pscustomobject Response shim' {
+            $ex = [System.Exception]::new('429 Too Many Requests')
+            $ex | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = 429 })
+            Test-Is429 $ex | Should -BeTrue
+        }
+
+        It 'returns true for the real System.Net.HttpStatusCode enum value' {
+            # PS7's Invoke-RestMethod surfaces 429 via HttpResponseException
+            # whose Response.StatusCode is an [HttpStatusCode] enum. Casting
+            # that enum to [int] yields 429 — Test-Is429 must accept it.
+            $ex = [System.Exception]::new('rate limited')
+            $ex | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = [System.Net.HttpStatusCode]::TooManyRequests })
+            Test-Is429 $ex | Should -BeTrue
+        }
+
+        It 'returns false for non-429 status codes' {
+            foreach ($code in 400, 401, 403, 500, 503) {
+                $ex = [System.Exception]::new("status $code")
+                $ex | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = $code })
+                Test-Is429 $ex | Should -BeFalse -Because "code $code is not 429"
+            }
+        }
+
+        It 'returns false when the exception has no Response member (network errors)' {
+            $ex = [System.Net.WebException]::new('The operation has timed out.')
+            Test-Is429 $ex | Should -BeFalse
+        }
+
+        It 'returns false for null / empty inputs' {
+            Test-Is429 $null | Should -BeFalse
+            $ex = [System.Exception]::new('plain exception')
+            Test-Is429 $ex | Should -BeFalse
+        }
+    }
+
+    Context 'Format-StatusErrorTail' {
+        It 'collapses internal whitespace runs into a single space' {
+            Format-StatusErrorTail "line1`r`nline2`tline3" | Should -Be 'line1 line2 line3'
+        }
+
+        It 'trims leading and trailing whitespace' {
+            Format-StatusErrorTail "   hello world   " | Should -Be 'hello world'
+        }
+
+        It 'truncates messages longer than the cap and appends ellipsis dots' {
+            $long = 'A' * 100
+            $out  = Format-StatusErrorTail -Message $long -Max 60
+            $out.Length    | Should -Be 63          # 60 + '...'
+            $out           | Should -Match '\.\.\.$'
+            $out.Substring(0, 60) | Should -Be ('A' * 60)
+        }
+
+        It 'returns the trimmed message untouched when it fits within the cap' {
+            $msg = 'short message'
+            Format-StatusErrorTail -Message $msg -Max 60 | Should -Be $msg
+        }
+
+        It 'returns empty string for null / empty input (no exception)' {
+            Format-StatusErrorTail $null | Should -Be ''
+            Format-StatusErrorTail ''    | Should -Be ''
         }
     }
 

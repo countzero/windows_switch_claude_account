@@ -671,8 +671,22 @@ function Invoke-SaveAction {
             $finalEmail = $profile.Email
         }
     } else {
-        $reason = if ($profile.Error) { $profile.Error } else { $profile.Status }
-        Write-Host "[Save] Could not resolve account email (slot saved unlabeled): $reason" -ForegroundColor "Yellow"
+        # Distinct user-facing message for the 'rate-limited' status —
+        # otherwise users hitting Anthropic's 429 would see an opaque
+        # "(slot saved unlabeled): rate-limited" line and might assume
+        # the save itself was rate-limited (it wasn't; only the email
+        # lookup was). The slot is fully usable; only the labeled
+        # filename suffix is missing and can be fixed by re-running
+        # `sca save <name>` once the rate limit clears. All other
+        # non-ok statuses (offline, unauthorized, error, no-oauth) keep
+        # the original generic wording with the underlying reason as
+        # the tail; long messages are kept terse via Format-StatusErrorTail.
+        if ($profile.Status -eq 'rate-limited') {
+            Write-Host "[Save] Could not resolve account email (Anthropic API rate limited; slot saved unlabeled — re-run 'sca save $safeName' later to label it)." -ForegroundColor "Yellow"
+        } else {
+            $reason = if ($profile.Error) { Format-StatusErrorTail $profile.Error } else { $profile.Status }
+            Write-Host "[Save] Could not resolve account email (slot saved unlabeled): $reason" -ForegroundColor "Yellow"
+        }
     }
 
     $displayEmail = if ($finalEmail) { " ($finalEmail)" } else { '' }
@@ -811,6 +825,42 @@ function Invoke-RemoveAction {
 
 # --- usage action internals ---
 
+# True if $Exception came from an Invoke-RestMethod call that hit HTTP 429.
+# Tolerates the two shapes our codebase encounters in practice:
+#   * Real Microsoft.PowerShell.Commands.HttpResponseException whose
+#     .Response.StatusCode is a System.Net.HttpStatusCode enum value
+#     ([int][HttpStatusCode]::TooManyRequests = 429).
+#   * The lightweight pscustomobject Response shim used by tests
+#     (Invoke-UsageAction.Tests.ps1's 401 mock pattern), where
+#     .Response.StatusCode is already an integer.
+# Returns $false for null exceptions, exceptions without a Response member,
+# and any non-429 status — the caller's catch block falls through to its
+# pre-existing error handling for those.
+function Test-Is429 {
+    Param ($Exception)
+    if (-not $Exception) { return $false }
+    $r = $Exception.Response
+    if (-not $r -or -not $r.StatusCode) { return $false }
+    return ([int]$r.StatusCode -eq 429)
+}
+
+# Collapse and tail-truncate an exception message for rendering inside the
+# Status column of the usage table. 60 characters keeps long messages from
+# wrapping the row in typical 100-col terminals while still conveying enough
+# context to debug; the whitespace collapse drops embedded newlines (some
+# socket exceptions span multiple lines). Single helper so the 'expired'
+# and 'error' arms of Format-UsageTable's status switch stay in lockstep.
+function Format-StatusErrorTail {
+    Param (
+        [AllowNull()] [String] $Message,
+        [int] $Max = 60
+    )
+    if ([string]::IsNullOrEmpty($Message)) { return '' }
+    $msg = ($Message -replace "\s+", ' ').Trim()
+    if ($msg.Length -gt $Max) { $msg = $msg.Substring(0, $Max) + '...' }
+    return $msg
+}
+
 # Read OAuth material from a slot file. Returns an object carrying the
 # parsed token fields plus the raw parsed JSON so Update-SlotTokens can
 # round-trip unknown fields (subscriptionType, rateLimitTier, scopes,
@@ -918,8 +968,10 @@ function Update-SlotTokens {
 # Call /api/oauth/usage for one slot. Auto-refreshes a token that is
 # expired or within 60s of expiry. Returns:
 #   @{ Status = 'ok';           Data = <parsed response> }
+#   @{ Status = 'ok'; Data; IsCachedFallback = $true }      # served from cache after a 429
 #   @{ Status = 'no-oauth' }                                # slot has no claudeAiOauth
-#   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed
+#   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed (non-429)
+#   @{ Status = 'rate-limited' }                            # 429 from refresh OR usage endpoint, no fresh cache
 #   @{ Status = 'unauthorized' }                            # 401/403 from usage endpoint
 #   @{ Status = 'error';   Error = <msg> }                  # network / shape / other
 # Never throws to callers; surfaces every failure mode as a Status value
@@ -951,6 +1003,25 @@ function Get-SlotUsage {
             $accessToken = Update-SlotTokens -SlotPath $SlotPath
         }
         catch {
+            # 429 from the token endpoint shares the rate-limit policy
+            # with the usage endpoint below: serve fresh cached usage
+            # data when available, otherwise surface a clean
+            # 'rate-limited' status. No retry — the token endpoint shares
+            # an upstream limiter with the usage endpoint, so a 5s sleep
+            # would just extend the user's wait without changing the
+            # outcome (and the watch loop will retry on its 60s tick).
+            if (Test-Is429 $_.Exception) {
+                if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
+                    $entry = $Script:SlotUsageCache[$SlotPath]
+                    if (([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -lt $Script:UsageCacheTTL) {
+                        return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
+                    }
+                }
+                return [pscustomobject]@{ Status = 'rate-limited' }
+            }
+            # Non-429 refresh failure (timeout, 4xx other than 429, 5xx,
+            # malformed JSON, …): the token IS expired and we couldn't
+            # refresh it, so 'expired' remains the accurate label.
             return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
         }
     }
@@ -987,33 +1058,45 @@ function Get-SlotUsage {
         # On 429 (rate limited), fall back to cached data if available and
         # still fresh. This keeps the watch display functional during rate-
         # limited periods — usage data only changes every few hours at most.
+        # Three explicit branches (vs. the previous if/else where a stale
+        # cache fell through to the bottom 'error' return at the end of
+        # the catch — that hid behind Format-UsageTable's truncation but
+        # mislabeled the status):
+        #   1. Fresh cache  -> return cached as 'ok' with IsCachedFallback.
+        #   2. Stale cache  -> 'rate-limited' (no retry; the cache being
+        #                      stale means we've been seeing 429s for a
+        #                      while and a 5s sleep won't change that).
+        #   3. No cache yet -> one retry after a short delay; the original
+        #                      back-to-back-poll-collision case.
         if ($status -eq 429) {
             if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
                 $entry = $Script:SlotUsageCache[$SlotPath]
                 if (([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -lt $Script:UsageCacheTTL) {
                     return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
                 }
-            } else {
-                # No cached data — retry once after a short delay so back-to-back
-                # slot polls don't all hit the rate limit simultaneously.
-                Start-Sleep -Seconds 5
-                try {
-                    $resp2 = Invoke-RestMethod -Method Get `
-                                              -Uri $Script:UsageEndpoint `
-                                              -Headers $headers `
-                                              -TimeoutSec $Script:UsageTimeoutSec `
-                                              -ErrorAction Stop
-                    # Cache the successful retry.
-                    $Script:SlotUsageCache[$SlotPath] = @{
-                        Data      = $resp2
-                        Timestamp = [DateTime]::UtcNow
-                    }
-                    return [pscustomobject]@{ Status = 'ok'; Data = $resp2 }
+                # Stale cache: drop straight to 'rate-limited' rather
+                # than retry — see comment above.
+                return [pscustomobject]@{ Status = 'rate-limited' }
+            }
+            # No cached data — retry once after a short delay so back-to-back
+            # slot polls don't all hit the rate limit simultaneously.
+            Start-Sleep -Seconds 5
+            try {
+                $resp2 = Invoke-RestMethod -Method Get `
+                                          -Uri $Script:UsageEndpoint `
+                                          -Headers $headers `
+                                          -TimeoutSec $Script:UsageTimeoutSec `
+                                          -ErrorAction Stop
+                # Cache the successful retry.
+                $Script:SlotUsageCache[$SlotPath] = @{
+                    Data      = $resp2
+                    Timestamp = [DateTime]::UtcNow
                 }
-                catch {
-                    # Second attempt also failed — return clean rate-limited status.
-                    return [pscustomobject]@{ Status = 'rate-limited' }
-                }
+                return [pscustomobject]@{ Status = 'ok'; Data = $resp2 }
+            }
+            catch {
+                # Second attempt also failed — return clean rate-limited status.
+                return [pscustomobject]@{ Status = 'rate-limited' }
             }
         }
         return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
@@ -1023,7 +1106,8 @@ function Get-SlotUsage {
 # Resolve the OAuth account email for a slot. Returns one of:
 #   @{ Status = 'ok';           Email = <string> }
 #   @{ Status = 'no-oauth' }                        # slot has no claudeAiOauth
-#   @{ Status = 'expired' }                         # token expired + refresh skipped/failed
+#   @{ Status = 'expired' }                         # token expired + refresh failed (non-429)
+#   @{ Status = 'rate-limited' }                    # 429 from refresh endpoint OR profile endpoint
 #   @{ Status = 'unauthorized' }                    # 401/403 from profile endpoint
 #   @{ Status = 'error';        Error = <msg> }     # network / shape / other
 #
@@ -1064,6 +1148,15 @@ function Get-SlotProfile {
             $accessToken = Update-SlotTokens -SlotPath $SlotPath
         }
         catch {
+            # Mirror Get-SlotUsage's 429 handling: if the token endpoint
+            # is rate-limited, surface a clean 'rate-limited' status
+            # rather than 'expired: <long 429 message>'. There is no
+            # profile cache to fall back on (Get-SlotProfile is no-cache
+            # by design — see this function's docstring), so the
+            # rate-limited status is the only signal we can give.
+            if (Test-Is429 $_.Exception) {
+                return [pscustomobject]@{ Status = 'rate-limited' }
+            }
             return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
         }
     }
@@ -1086,6 +1179,9 @@ function Get-SlotProfile {
         if ($r -and $r.StatusCode) { $status = [int]$r.StatusCode }
         if ($status -eq 401 -or $status -eq 403) {
             return [pscustomobject]@{ Status = 'unauthorized' }
+        }
+        if ($status -eq 429) {
+            return [pscustomobject]@{ Status = 'rate-limited' }
         }
         return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
     }
@@ -1517,16 +1613,17 @@ function Format-UsageTable {
         $accountCell = Format-AccountCell -SlotName $r.Name -Email $email
 
         # Status: plan-usability when HTTP was ok, HTTP-state otherwise.
+        # The 'expired' and 'error' arms both route through
+        # Format-StatusErrorTail so a long underlying exception cannot
+        # wrap the row — the previous 'expired' arm interpolated the raw
+        # message with no length cap, which produced multi-line table
+        # rows when the token endpoint returned 429 with a long body.
         $statusText = switch ($r.Status) {
             'ok'           { Get-PlanStatus $r.Data }
             'no-oauth'     { 'no-oauth (api key or non-claude.ai slot)' }
-            'expired'      { if ($r.Error) { "expired: $($r.Error)" } else { 'expired (run sca switch to refresh)' } }
+            'expired'      { if ($r.Error) { "expired: $(Format-StatusErrorTail $r.Error)" } else { 'expired (run sca switch to refresh)' } }
             'unauthorized' { 'unauthorized (token revoked; run sca switch then /login)' }
-            'error'        {
-                $msg = ($r.Error -replace "\s+", ' ').Trim()
-                if ($msg.Length -gt 60) { $msg = $msg.Substring(0, 60) + '...' }
-                "error: $msg"
-            }
+            'error'        { "error: $(Format-StatusErrorTail $r.Error)" }
             'rate-limited' { 'rate-limited' }
             default        { [string]$r.Status }
         }
@@ -1919,9 +2016,13 @@ function Format-UsageFrame {
     }
 
     # Cache-fallback advisory: inform the user that data is stale because
-    # /api/oauth/usage returned 429 and we fell back to cached responses.
+    # an Anthropic API returned 429 and we fell back to cached responses.
+    # The 429 may have come from /api/oauth/usage (existing path) OR from
+    # /v1/oauth/token during a token refresh that triggered the cache
+    # fallback in Get-SlotUsage's refresh-failure handler — hence the
+    # endpoint-agnostic wording.
     if ($Snapshot.HasCacheFallback) {
-        Write-Host "  [Usage] Warning: /api/oauth/usage rate limited — displaying cached data." -ForegroundColor "Yellow"
+        Write-Host "  [Usage] Warning: Anthropic API rate limited — displaying cached data." -ForegroundColor "Yellow"
     }
 
     # Hardlink-broken advisory: only on the summary table; the verbose
@@ -1988,6 +2089,14 @@ function Invoke-UsageAction {
             if ($r.Status -eq 'ok') {
                 $entry.plan_status = Get-PlanStatus $r.Data
             }
+            # is_cached_fallback: true when the row's 'ok' status was
+            # served from $Script:SlotUsageCache after a 429 from either
+            # the usage endpoint or the token-refresh endpoint (rather
+            # than from a fresh live response). Exposed on the JSON
+            # contract so scripts can detect stale data without parsing
+            # the human-readable advisory text. Only emitted when true
+            # to keep the output minimal; absence == fresh.
+            if ($r.IsCachedFallback) { $entry.is_cached_fallback = $true }
             if ($r.Email) { $entry.account = [ordered]@{ email = $r.Email } }
             if ($r.Data)  { $entry.data    = $r.Data }
             if ($r.Error) { $entry.error   = $r.Error }
