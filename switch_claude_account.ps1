@@ -2118,11 +2118,25 @@ $Script:UsageWatchMinInterval = 60
 
 # Live `sca usage -watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. Interactive only — throws when output
-# is redirected because Clear-Host would poison a captured log. Exits
-# on Ctrl-C via the runtime's default handler; the `finally` block
-# restores [Console]::CursorVisible. On HTTP failure the previous
-# snapshot stays visible and an advisory is appended to the footer so
-# the display never blanks.
+# is redirected because the alt-screen + cursor-control sequences would
+# poison a captured log. Exits on Ctrl-C via the runtime's default
+# handler; the `finally` block leaves the alternate screen buffer and
+# restores cursor visibility. On HTTP failure the previous snapshot
+# stays visible and an advisory is appended to the footer so the display
+# never blanks.
+#
+# Flicker-free rendering. Each frame is wrapped in DEC mode 2026
+# (synchronized output: ESC[?2026h … ESC[?2026l) with ESC[2J + cursor-
+# home (ESC[H) at the start. Inside the sync envelope the terminal
+# buffers the clear-and-redraw and presents one atomic frame, so the
+# user never sees the intermediate "blank screen" frame that Clear-Host
+# produced. The watch also enters the alternate screen buffer
+# (ESC[?1049h) so the pre-watch terminal scrollback is restored on
+# exit, mirroring how top / htop / vim behave. Terminals without DEC
+# 2026 support (e.g. legacy ConHost) silently ignore the unknown DEC
+# private mode and fall back to the previous Clear-Host-style flicker
+# — no regression. Renderer functions are reused unchanged; only this
+# loop emits the wrapper sequences.
 #
 # The loop is deliberately simple: blocking Invoke-RestMethod (via
 # Get-UsageSnapshot) inside the poll step, then a plain 1 s sleep
@@ -2145,7 +2159,14 @@ function Invoke-UsageWatch {
     }
 
     $origCursor = [Console]::CursorVisible
+    $enteredAlt = $false
     try {
+        # Enter alt screen buffer + hide cursor in one write. The alt
+        # buffer gives a clean canvas and ensures the user's pre-watch
+        # scrollback is restored on exit. Cursor-hide stops the caret
+        # from blinking inside the table during the (atomic) repaint.
+        [Console]::Out.Write("`e[?1049h`e[?25l")
+        $enteredAlt = $true
         [Console]::CursorVisible = $false
 
         $snapshot      = $null
@@ -2180,7 +2201,16 @@ function Invoke-UsageWatch {
             }
             $footer = $footerLines -join "`n"
 
-            Clear-Host
+            # Atomic frame: begin sync update, clear screen, cursor home,
+            # draw via the existing renderer, end sync update. All output
+            # between ESC[?2026h and ESC[?2026l is buffered by the
+            # terminal and presented in one swap — no flicker on
+            # terminals that support the mode (Win Terminal, VS Code,
+            # iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal,
+            # mintty, modern ConHost). Older terminals ignore the
+            # unknown DEC mode markers and exhibit the prior
+            # Clear-Host-style flicker — no regression.
+            [Console]::Out.Write("`e[?2026h`e[2J`e[H")
             if ($null -ne $snapshot) {
                 # -SuppressAdvisory: during watch mode the hardlink warning
                 # is still useful but fires once per second of redraw; that
@@ -2194,14 +2224,23 @@ function Invoke-UsageWatch {
                 Write-Host "[Watch] Waiting for first successful /api/oauth/usage response..." -ForegroundColor "Yellow"
                 Format-UsageFooter $footer
             }
+            [Console]::Out.Write("`e[?2026l")
 
             # 1-second inter-frame wait. Ctrl-C terminates the loop via
             # the runtime's default handler; the surrounding `finally`
-            # block restores [Console]::CursorVisible on exit.
+            # block leaves the alt buffer and restores cursor visibility
+            # on exit.
             Start-Sleep -Seconds 1
         }
     }
     finally {
+        # Order matters: show cursor + leave alt buffer in one write so
+        # the user's pre-watch terminal state is restored atomically.
+        # The CursorVisible API restore is belt-and-suspenders for the
+        # .NET-side state.
+        if ($enteredAlt) {
+            [Console]::Out.Write("`e[?25h`e[?1049l")
+        }
         [Console]::CursorVisible = $origCursor
     }
 }

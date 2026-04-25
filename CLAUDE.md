@@ -155,7 +155,7 @@ Layout: a blank line, the Session bar, a blank line, the Week bar, a blank line 
 
 `Get-AggregateBarColor` is a pure helper extracted specifically so the threshold logic is unit-testable without mocking `Write-Host` (Pester's parameter-capture across mock scope boundaries was unreliable in practice).
 
-**Why `Write-Host`, not `Write-Progress`**: (1) `Write-Progress` lives on stream 4, which the suite's `6>&1 | Out-String` capture pattern would miss; (2) it is host-managed and transient — it would not sit inline above the table; (3) it does not compose with the `Clear-Host`-based watch redraw inside `Invoke-UsageWatch`. The bars use the same `Write-Host -ForegroundColor` machinery as every other rendering helper in the file.
+**Why `Write-Host`, not `Write-Progress`**: (1) `Write-Progress` lives on stream 4, which the suite's `6>&1 | Out-String` capture pattern would miss; (2) it is host-managed and transient — it would not sit inline above the table; (3) it does not compose with the synchronized-output watch redraw inside `Invoke-UsageWatch` (the loop wraps each frame in DEC mode 2026 + `ESC[2J` so every `Write-Host` line lands inside one atomic frame; `Write-Progress` writes outside that envelope and would tear). The bars use the same `Write-Host -ForegroundColor` machinery as every other rendering helper in the file.
 
 When no eligible rows exist (zero saved slots HTTP-ok), `Format-AggregateBars` emits nothing — the post-`[Usage]`-header blank line still separates the header from the column header so the table doesn't stick to the title.
 
@@ -231,20 +231,22 @@ Each per-slot entry carries the same fields as before plus a `plan_status` strin
 
 `Invoke-UsageWatch` provides a self-refreshing live view of the usage table or verbose view. It re-polls the endpoint every `-interval` seconds (default **60 s**, floor **60 s**) and redraws the frame once per second so reset deltas (`in 2h 37m`) and the countdown footer tick visibly between polls.
 
+**Flicker-free rendering.** The loop enters the alternate screen buffer (`ESC[?1049h`) and hides the cursor (`ESC[?25l`) on entry; the `finally` block restores both on Ctrl-C. Each frame is wrapped in DEC mode 2026 (synchronized output: `ESC[?2026h` … `ESC[?2026l`) with `ESC[2J` + cursor-home (`ESC[H`) at the start, then the existing `Format-UsageFrame` renderer is called unchanged. Inside the sync envelope the terminal buffers the clear-and-redraw and presents one atomic frame, so the user never sees the intermediate "blank screen" frame that the prior `Clear-Host` produced. Terminals that support DEC 2026 (Windows Terminal ≥ v1.13, VS Code, iTerm2 ≥ 3.4.13, kitty, alacritty, WezTerm, foot, gnome-terminal/vte, mintty, modern ConHost) render flicker-free; older terminals silently ignore the unknown DEC private mode and exhibit the previous `Clear-Host`-style flicker (no regression). Renderer functions (`Format-UsageFrame`, `Format-UsageTable`, `Format-AggregateBars`, `Format-UsageVerbose`, `Format-UsageFooter`) are untouched — only `Invoke-UsageWatch` emits the wrapper sequences, so the one-shot `sca usage` / `sca list` / `sca switch` paths are unaffected.
+
 Design split driven by the watch loop:
 
 - **`Get-UsageSnapshot`** is the pure data-gathering function: enumerates slots, calls `Get-SlotUsage` (and `Get-SlotProfile` for the synth row), and returns `{ Results, HardlinkBroken, MatchedSlotName, NoSlots, HasSynthRow }`. Never renders. The one-shot path and the watch loop both call it.
 - **`Format-UsageFrame`** is the pure renderer: takes a snapshot plus an optional footer string and prints table-or-verbose + optional hardlink advisory + footer. Used identically from both entry points, so the frame shape is asserted by the suite and the watch loop automatically inherits every rendering guarantee.
-- **`Invoke-UsageWatch`** is the loop itself. Untested — its behavior is `Clear-Host` + `Format-UsageFrame` on a 1-second `Start-Sleep` tick. No keyboard input handling: Ctrl-C terminates via the runtime's default handler, and the `finally` block restores `[Console]::CursorVisible`.
+- **`Invoke-UsageWatch`** is the loop itself. Untested — its behavior is the alt-buffer + sync-mode wrapper described above around a `Format-UsageFrame` call on a 1-second `Start-Sleep` tick. No keyboard input handling: Ctrl-C terminates via the runtime's default handler, and the `finally` block emits `ESC[?25h` + `ESC[?1049l` (show cursor + leave alt buffer) and restores `[Console]::CursorVisible` to its pre-loop value.
 
 Runtime guards (both throw, neither runs the loop):
 
 - `-watch -json` — mutually exclusive; `-watch` is interactive, `-json` is for scripting.
-- `[Console]::IsOutputRedirected` — `sca usage -watch > file.txt` is refused rather than silently filling the file with `Clear-Host`-shredded frames; the error message points at `-json`.
+- `[Console]::IsOutputRedirected` — `sca usage -watch > file.txt` is refused rather than silently filling the file with alt-buffer / cursor-control / sync-mode escape sequences; the error message points at `-json`.
 
 Interval clamping: values below `$Script:UsageWatchMinInterval = 60` get clamped up to 60 with a one-line yellow advisory. The floor matches the default so `-interval` can only *slow* the poll — this is deliberate, the unofficial endpoint has no published rate limit and we prefer conservative cadence.
 
-Exit: Ctrl-C only. The loop installs no key listeners (no `[Console]::KeyAvailable` / `ReadKey`); the runtime's default Ctrl-C handler terminates the pipeline and PowerShell runs the `finally` block, which restores `[Console]::CursorVisible` to its pre-loop value. There is no interactive force-refresh — to bypass the poll interval, quit and re-run.
+Exit: Ctrl-C only. The loop installs no key listeners (no `[Console]::KeyAvailable` / `ReadKey`); the runtime's default Ctrl-C handler terminates the pipeline and PowerShell runs the `finally` block, which leaves the alternate screen buffer (so the user's pre-watch terminal scrollback is restored, mirroring `top` / `htop` / `vim`) and restores cursor visibility. There is no interactive force-refresh — to bypass the poll interval, quit and re-run.
 
 Error handling: if an HTTP call fails mid-loop, the previous snapshot stays on screen and a second line appears under the footer reading `[Watch] Last poll failed: <msg> (keeping previous data; will retry on next tick)`. The hardlink-broken advisory is suppressed on redraws between polls (only shown on freshly-polled frames) so the warning does not flash every second.
 
