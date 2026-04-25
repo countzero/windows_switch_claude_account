@@ -25,8 +25,8 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 | Action     | Requires name | What it does |
 |------------|---------------|--------------|
 | `save`     | Yes           | Copies `.credentials.json` → `.credentials.<name>.json`, then re-links `.credentials.json` as a hardlink to the new slot. Subsequent token refreshes flow into the saved slot. |
-| `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). |
-| `list`     | No            | Lists saved slot names |
+| `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Output is a single green success line `[Switch] Switched to '<slot>' (<email>). Close and restart Claude Code to apply.` followed by the saved-slot table (same shape as `sca list`, header suppressed) so the user sees the new active slot in context via the `*` marker. Yellow advisories appear above the success line for the locked-active and no-active-detected edge cases; the single-slot-already-active no-op prints its yellow advisory and skips both the success line and the table. |
+| `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape and reuses `Format-AccountCell`, so account dedup and middle-truncation are identical across the two views. Pure offline render — no network IO. |
 | `remove`   | Yes           | Deletes a named slot |
 | `usage`    | Optional      | Calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens in place (hardlink-preserving). Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block including opus / sonnet / overage buckets. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile |
@@ -105,6 +105,38 @@ Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { u
   The thresholds are script-scope constants (`$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`) next to the usage endpoint constants. `100%` is the hard cap Anthropic enforces; `90%` is the heads-up tier. `Get-StatusColor` is the single source of truth for the color mapping so the summary table and verbose view stay in lockstep.
 
 A row flagged `limited 5h` / `limited 7d` / `limited` cannot serve new prompts until the named window resets. This was previously rendered as `ok` in the old HTTP-only Status column, which was misleading — the rewrite is the reason this section exists.
+
+### List table layout (`sca list`)
+
+`Format-ListTable` renders 2 data columns (plus the leading `*` active marker): `Slot | Account`. Mirrors `Format-UsageTable`'s shape so the two views look like siblings — same header style (`[List] Saved slots` in yellow), same active-marker conventions (`*` only, no trailing `(active)` text; the row is colored Green when active), same `Format-AccountCell` truncation (`—` for unlabeled / dedup-form slots, middle-truncated email otherwise).
+
+Pure offline render — no network calls. `Invoke-ListAction` only produces a network call indirectly if the user later re-runs `sca usage`. The hardlink-broken / `ActiveLocked` advisories are printed below the table (matching `Format-UsageFrame`'s ordering: data first, advisories below).
+
+The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as siblings rather than factored into a generic helper. With only two callers and different per-cell rules (Status / merged-bucket cells live only on the usage table, the list table has neither), an abstraction would cost more than it saves.
+
+### Switch action output
+
+`Invoke-SwitchAction` emits a single green success line followed by the saved-slot table beneath, so the user reads "what just happened" in one line and immediately sees the new active slot in context (via the `*` marker on the just-activated row). The retired rotation banner is gone — the table beneath conveys the transition implicitly.
+
+```
+[Switch] Switched to 'slot-1' (finn.kumkar@stadtwerk.org). Close and restart Claude Code to apply.
+
+    Slot    Account
+    ------  -------------------------
+  * slot-1  finn.kumkar@stadtwerk.org
+    slot-2  kumkar@stadtwerk.org
+```
+
+- **Success line**: green, matches the active-row convention used by the `list` and `usage` tables (the slot is now the active one).
+- **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-completed hardlink swap. `-SuppressHeader` skips the `[List] Saved slots` yellow header so the table sits cleanly under the `[Switch]` line. The hardlink-broken / `ActiveLocked` advisories that `Invoke-ListAction` emits cannot fire here (the hardlink was just established by `New-Item -ItemType HardLink`).
+- **Yellow advisory branches** (printed above the success line):
+  - **Locked active credentials file** (rotation only): `[Switch] Active credentials file is locked; cannot identify current slot. Rotating to <ident>.` Rotation still proceeds.
+  - **No active match** (rotation only, hash of `.credentials.json` matches no saved slot): `[Switch] No currently active slot detected. Rotating to <ident>.` Rotation still proceeds.
+  - **Single-slot-already-active no-op** (rotation only): `[Switch] Only one slot (<ident>) and it is already active. Nothing to do.` Skips both the success line and the table — nothing changed, no point re-rendering the unchanged state. Emitted by `Get-NextSlotName` itself, which then returns `$null` so the caller exits early.
+
+Slot identities are rendered via `Format-SlotIdentity`, the single source of truth for the dedup logic: returns `'<slot>' (<email>)` for labeled slots whose email differs from the slot name, and `'<slot>'` (no parens) for unlabeled or dedup-form slots. Same dedup rules as `Format-AccountCell` so the inline prose form and the table cell form stay consistent.
+
+`Get-NextSlotName`'s return shape: `{ To = { Name; Email }; HasActiveMatch = <bool>; Locked = <bool> }` (or `$null` for the single-slot no-op). `HasActiveMatch` differentiates the happy path (no advisory) from the no-active-match advisory branch; `Locked` is true only when the active credentials file existed but could not be hashed. The previous `From` field was dropped when the rotation banner was retired — no caller renders it any more.
 
 ### Verbose view (`sca usage <slot>`)
 
@@ -191,7 +223,7 @@ Synth `<active>` row: `.credentials.json` has no filename-encoded email, so when
 
 On-disk migration from the previous cache-based implementation: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` sidecars and the `.credentials.profile.json` file on each enumeration (the cleanup is cheap and idempotent once complete).
 
-Display contract: the `  └─ <email>` second line under a slot row in `sca list` only appears when the slot's labeled email (case-insensitive) differs from the slot name. Slots saved with the deduplicated form, and unlabeled slots (offline save), render as a single line. `sca usage` no longer uses the continuation line at all — emails live in the `Account` column on the same row (see the Summary-table layout section above).
+Display contract: both `sca list` and `sca usage` render emails inline in the `Account` column on the same row as the slot name — there is no longer a `└─ <email>` continuation line anywhere. `Format-AccountCell` is the single source of truth for the dedup logic: it returns `—` when the slot is unlabeled (offline save) or when the slot name (case-insensitive) equals its embedded email, and the middle-truncated email otherwise. The full untruncated email always lives in `sca usage <name>` verbose output and in `sca usage -json`.
 
 ### Synthetic `<active>` row + hardlink warning
 

@@ -434,6 +434,99 @@ Describe 'switch_claude_account' {
 
             Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'BC'
         }
+
+        # The new switch output renders the filename-encoded email
+        # alongside the slot name so the user sees which account they
+        # just activated. The format is `'<slot>' (<email>)` for labeled
+        # slots, plain `'<slot>'` for unlabeled / dedup slots.
+        It "renders email in success message when target slot is labeled" {
+            $labeled = Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json'
+            Set-Content -LiteralPath $labeled -Value 'X' -NoNewline
+
+            $out = Invoke-SwitchAction -Name 'work' 6>&1 | Out-String
+
+            $out | Should -Match "Switched to 'work' \(alice@example\.com\)"
+        }
+
+        It "omits email parens when target slot is unlabeled" {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.work.json') -Value 'X' -NoNewline
+
+            $out = Invoke-SwitchAction -Name 'work' 6>&1 | Out-String
+
+            $out | Should -Match "Switched to 'work'\."
+            $out | Should -Not -Match '\([^)]*@[^)]*\)'
+        }
+
+        It "omits email parens when slot name equals the embedded email (dedup form)" {
+            $email = 'alice@example.com'
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath ".credentials.$email.json") -Value 'X' -NoNewline
+
+            $out = Invoke-SwitchAction -Name $email 6>&1 | Out-String
+
+            $out | Should -Match "Switched to '$([regex]::Escape($email))'\."
+            # No `(alice@example.com)` suffix duplicating the slot name.
+            $out | Should -Not -Match "'$([regex]::Escape($email))' \($([regex]::Escape($email))\)"
+        }
+
+        # Rotation prints only the success line (for the destination)
+        # plus the saved-slot table beneath. The previous two-line
+        # `[Switch] Rotating from ... to ...` banner is gone — the table
+        # beneath conveys the new active slot via its `*` marker.
+        It 'rotation prints success line for destination + table beneath' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.slot-1(alice@example.com).json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.slot-2(bob@example.com).json')   -Value 'B' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                                          -Value 'B' -NoNewline
+
+            $out = Invoke-SwitchAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match "Switched to 'slot-1' \(alice@example\.com\)"
+            # Table beneath: column headers and both rows present.
+            $out | Should -Match '(?m)^\s+Slot\s+Account\s*$'
+            $out | Should -Match '(?m)^\s+\*\s+slot-1\s+alice@example\.com\b'
+            $out | Should -Match '(?m)^\s+slot-2\s+bob@example\.com\b'
+            # No trace of the retired rotation banner.
+            $out | Should -Not -Match 'Rotating from'
+        }
+
+        It 'rotation does not print the rotation banner' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'A' -NoNewline
+
+            $out = Invoke-SwitchAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Not -Match 'Rotating'
+            $out | Should -Match "Switched to 'bravo'"
+        }
+
+        It 'named switch prints the saved-slot table beneath the success line' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+
+            $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
+
+            $out | Should -Match "Switched to 'alpha'"
+            # Column header row present.
+            $out | Should -Match '(?m)^\s+Slot\s+Account\s*$'
+            # No `[List] Saved slots` header — Format-ListTable was called
+            # with -SuppressHeader so the table sits cleanly under the
+            # `[Switch]` line.
+            $out | Should -Not -Match '\[List\] Saved slots'
+        }
+
+        It 'switch table marks the just-activated slot with *' {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'B' -NoNewline
+
+            $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
+
+            # alpha is now active (just hardlinked), bravo is not.
+            $out | Should -Match '(?m)^\s+\*\s+alpha\s'
+            $out | Should -Match '(?m)^\s+bravo\s'
+            # Defensive: bravo must NOT carry a `*` after the switch.
+            $out | Should -Not -Match '(?m)^\s+\*\s+bravo\s'
+        }
     }
 
     Context 'Invoke-ListAction' {
@@ -455,8 +548,16 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
-            $out | Should -Match 'alpha'
-            $out | Should -Match '\* bravo \(active\)'
+            # Table-shape rows: leading ` ` (inactive) or `*` (active),
+            # then the slot name. The `(active)` suffix is gone now —
+            # the `*` marker plus row coloring is the single source of
+            # truth, matching the usage table.
+            $out | Should -Match '(?m)^\s+alpha\s'
+            $out | Should -Match '(?m)^\s+\*\s+bravo\s'
+            $out | Should -Not -Match '\(active\)'
+            # Header row present with both column labels.
+            $out | Should -Match 'Slot'
+            $out | Should -Match 'Account'
         }
 
         It 'lists slots without * when no active file exists' {
@@ -464,8 +565,10 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
-            $out | Should -Match 'alpha'
+            $out | Should -Match '(?m)^\s+alpha\s'
             $out | Should -Not -Match '\(active\)'
+            # No row carries a `*` marker when no active file exists.
+            $out | Should -Not -Match '(?m)^\s+\*\s+\w'
         }
 
         It 'excludes .credentials.json itself from the slot listing' {
@@ -481,6 +584,55 @@ Describe 'switch_claude_account' {
             # (leading ' * ' or '   ' indent) so this assertion catches the
             # leak without false-positiving on legitimate slot names.
             $out | Should -Not -Match '(?m)^\s*\*?\s+\.credentials(\s|$)'
+        }
+
+        # Email column rendering: parallels the Invoke-UsageAction email
+        # rendering tests below. The list table now carries the email
+        # inline in an Account column instead of the old `└─ <email>`
+        # continuation line.
+        It 'renders the email in the Account column when slot is labeled' {
+            $labeled = '.credentials.work(finn.kumkar@stadtwerk.org).json'
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value 'X' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+
+            # Slot name and email on the same row; no '└─' continuation.
+            $out | Should -Match '(?m)^\s+work\s+finn\.kumkar@stadtwerk\.org\b'
+            $out | Should -Not -Match '└─'
+        }
+
+        It "renders '-' in the Account column when slot name equals the embedded email (dedup form)" {
+            $email = 'alice@example.com'
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath ".credentials.$email.json") -Value 'X' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+
+            # The whole-email slot name appears, then the em-dash sentinel
+            # in place of a redundant Account cell.
+            $out | Should -Match "(?m)^\s+$([regex]::Escape($email))\s+—\s*$"
+            $out | Should -Not -Match '└─'
+        }
+
+        It "renders '-' in the Account column for unlabeled slot" {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.pending.json') -Value 'X' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+
+            $out | Should -Match '(?m)^\s+pending\s+—\s*$'
+            $out | Should -Not -Match '└─'
+        }
+
+        It 'middle-truncates long emails in the Account column' {
+            $longEmail = 'extremely.long.local.part@extraordinarily-long-domain.example.com'
+            $longEmail.Length | Should -BeGreaterThan $Script:AccountColumnMaxWidth
+
+            $labeled = ".credentials.longslot($longEmail).json"
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value 'X' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+
+            $out | Should -Match '…'
+            $out | Should -Not -Match ([regex]::Escape($longEmail))
         }
     }
 

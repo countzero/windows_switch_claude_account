@@ -412,11 +412,20 @@ function Find-SlotByName {
 # called without an explicit name. Behavior:
 #   * No slots saved       -> throw (nothing to rotate to).
 #   * One slot, active     -> print warning and return $null (caller exits).
-#   * Active slot found    -> return { From, To } for the next slot (wraps).
-#   * No active match      -> return { From=$null, To=first, Locked=? } so
-#                              the caller can emit a context-appropriate
-#                              warning (locked active file vs. missing /
-#                              unrecognized active file).
+#   * Active slot found    -> return { To; HasActiveMatch=$true; Locked=$false }
+#                              for the next slot (alphabetical, wraps).
+#   * No active match      -> return { To=first; HasActiveMatch=$false;
+#                              Locked=<bool> } so the caller can emit a
+#                              context-appropriate advisory (locked active
+#                              file vs. missing / unrecognized active file).
+#
+# `To` is a `{ Name; Email }` object (Email may be $null for unlabeled
+# slots) so callers can render the filename-encoded email inline without
+# re-looking-up the slot. The previous `From` field was dropped when
+# Invoke-SwitchAction's rotation banner was retired in favour of the
+# slot-table-beneath layout — no caller renders it any more. `HasActiveMatch`
+# stayed because the caller still differentiates the happy path from the
+# no-active-match advisory branch.
 function Get-NextSlotName {
     $info  = Get-Slots
     $slots = @($info.Slots)
@@ -431,23 +440,16 @@ function Get-NextSlotName {
     }
 
     if ($slots.Count -eq 1 -and $activeIdx -eq 0) {
-        Write-Host "[Switch] Only one slot ('$($slots[0].Name)') and it is already active. Nothing to do." -ForegroundColor "Yellow"
+        Write-Host "[Switch] Only one slot ($(Format-SlotIdentity -Name $slots[0].Name -Email $slots[0].Email)) and it is already active. Nothing to do." -ForegroundColor "Yellow"
         return $null
     }
 
-    if ($activeIdx -lt 0) {
-        return [pscustomobject]@{
-            From   = $null
-            To     = $slots[0].Name
-            Locked = $info.ActiveLocked
-        }
-    }
+    $toSlot = if ($activeIdx -lt 0) { $slots[0] } else { $slots[($activeIdx + 1) % $slots.Count] }
 
-    $nextIdx = ($activeIdx + 1) % $slots.Count
     return [pscustomobject]@{
-        From   = $slots[$activeIdx].Name
-        To     = $slots[$nextIdx].Name
-        Locked = $false
+        To             = [pscustomobject]@{ Name = $toSlot.Name; Email = $toSlot.Email }
+        HasActiveMatch = ($activeIdx -ge 0)
+        Locked         = ($activeIdx -lt 0 -and $info.ActiveLocked)
     }
 }
 
@@ -663,19 +665,27 @@ function Invoke-SwitchAction {
 
     # When invoked without a name, rotate to the next saved slot
     # (alphabetical, wrap-around). Get-NextSlotName returns $null for
-    # the single-slot-already-active no-op and prints its own warning,
-    # so we simply return in that case rather than emit a duplicate msg.
+    # the single-slot-already-active no-op and prints its own yellow
+    # advisory; we return in that case so neither the success line nor
+    # the table render (nothing has changed — the user already saw the
+    # advisory).
     if ([string]::IsNullOrWhiteSpace($Name)) {
         $rotation = Get-NextSlotName
         if (-not $rotation) { return }
 
-        $safeName = $rotation.To
-        if ($rotation.From) {
-            Write-Host "[Switch] Rotating from '$($rotation.From)' to '$safeName'" -ForegroundColor "Cyan"
-        } elseif ($rotation.Locked) {
-            Write-Host "[Switch] Active credentials file is locked; cannot identify current slot. Rotating to '$safeName'." -ForegroundColor "Yellow"
-        } else {
-            Write-Host "[Switch] No currently active slot detected. Rotating to '$safeName'." -ForegroundColor "Yellow"
+        $safeName = $rotation.To.Name
+        $toIdent  = Format-SlotIdentity -Name $rotation.To.Name -Email $rotation.To.Email
+
+        # Yellow advisory branches: surface unusual states before the
+        # green success line so the user notices them. Both states still
+        # proceed with the rotation (we just couldn't identify what we
+        # were rotating away from). The happy path (HasActiveMatch=true)
+        # emits no advisory — the slot table beneath the success line
+        # makes the transition self-evident via the `*` marker.
+        if ($rotation.Locked) {
+            Write-Host "[Switch] Active credentials file is locked; cannot identify current slot. Rotating to $toIdent." -ForegroundColor "Yellow"
+        } elseif (-not $rotation.HasActiveMatch) {
+            Write-Host "[Switch] No currently active slot detected. Rotating to $toIdent." -ForegroundColor "Yellow"
         }
     } else {
         $safeName = Get-SafeName $Name
@@ -691,7 +701,25 @@ function Invoke-SwitchAction {
         Remove-Item -LiteralPath $CredFile -Force
     }
     New-Item -ItemType HardLink -Path $CredFile -Target $slot.Path | Out-Null
-    Write-Host "[Switch] Switched to '$safeName'. Close and restart Claude Code to apply." -ForegroundColor "Cyan"
+
+    # Green success line — matches the active-row convention used by the
+    # `list` and `usage` tables (the slot we just hardlinked to is now
+    # the active one).
+    $toIdent = Format-SlotIdentity -Name $slot.Name -Email $slot.Email
+    Write-Host "[Switch] Switched to $toIdent. Close and restart Claude Code to apply." -ForegroundColor "Green"
+
+    # Render the saved-slot table beneath the success line so the user
+    # sees the new active slot in context (the `*` marker now points at
+    # the just-activated row). Re-enumerate via Get-Slots so IsActive
+    # reflects the post-switch state. -SuppressHeader keeps the visual
+    # weight low — the `[Switch]` line above is enough of a section
+    # header. The hardlink-broken / ActiveLocked advisories that
+    # Invoke-ListAction emits cannot fire here: we just established the
+    # hardlink, and we just hashed .credentials.json successfully via
+    # Test-HardlinkSupport + the New-Item call.
+    Write-Host ''
+    $postSwitchInfo = Get-Slots
+    Format-ListTable -Slots @($postSwitchInfo.Slots) -SuppressHeader
 }
 
 function Invoke-ListAction {
@@ -702,6 +730,11 @@ function Invoke-ListAction {
         Write-Host "[List] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
         return
     }
+
+    # Render the saved-slot table first; advisories follow below so the
+    # data is the first thing the user reads (matches Format-UsageFrame's
+    # ordering convention).
+    Format-ListTable -Slots $slots
 
     # Get-Slots swallowed a hash failure on .credentials.json; surface
     # it here so the user knows why no slot is marked active.
@@ -722,25 +755,6 @@ function Invoke-ListAction {
             } else {
                 Write-Host "[List] Warning: .credentials.json is not hardlinked to any slot. Run 'sca save <name>' or 'sca switch <name>' to establish tracking." -ForegroundColor "Yellow"
             }
-        }
-    }
-
-    Write-Host "[List] Saved slots:" -ForegroundColor "Yellow"
-    foreach ($slot in $slots) {
-        if ($slot.IsActive) {
-            Write-Host " * $($slot.Name) (active)" -ForegroundColor "Green"
-        } else {
-            Write-Host "   $($slot.Name)"
-        }
-
-        # Email comes straight from the parsed filename (Get-SlotFileInfo
-        # in Get-Slots). Render as an indented second line only when it
-        # adds information — i.e. when the labeled form of the filename
-        # carries an email distinct from the slot name. Slots named as
-        # their own email, and unlabeled slots (email not yet resolved
-        # at save time), both render as a single line.
-        if ($slot.Email -and $slot.Email.ToLowerInvariant() -ne $slot.Name.ToLowerInvariant()) {
-            Write-Host "      └─ $($slot.Email)" -ForegroundColor "DarkGray"
         }
     }
 }
@@ -1193,6 +1207,23 @@ function Format-AccountCell {
     return Format-Truncate -Text $Email -Max $Script:AccountColumnMaxWidth
 }
 
+# Render a slot identity for inline prose (the `switch` action's status
+# messages). Renders as `'<slot>'` for unlabeled / dedup-form slots and
+# `'<slot>' (<email>)` for labeled slots whose email differs from the
+# slot name. Single source of truth so the rotation banner and the
+# success line carry the same shape, and so future callers can render
+# slot identities consistently without rebuilding the dedup logic.
+function Format-SlotIdentity {
+    Param (
+        [AllowNull()] [String] $Name,
+        [AllowNull()] [String] $Email
+    )
+
+    if ([string]::IsNullOrEmpty($Email)) { return "'$Name'" }
+    if ($Name -and $Name.ToLowerInvariant() -eq $Email.ToLowerInvariant()) { return "'$Name'" }
+    return "'$Name' ($Email)"
+}
+
 # Merge a utilization value and its reset timestamp into a single cell
 # for the summary table. Layout rules:
 #   null utilization, any reset     -> '   —'                (no data at all)
@@ -1381,6 +1412,67 @@ function Format-UsageTable {
     foreach ($entry in $rows) {
         $color = Get-StatusColor -Label $entry.Status -IsActive ([bool]$entry.Row.IsActive)
         Write-Host ($fmt -f $entry.Marker, $entry.Name, $entry.Account, $entry.Five, $entry.Seven, $entry.Status) -ForegroundColor $color
+    }
+}
+
+# Render the saved-slot inventory as a fixed-width 2-data-column table:
+# `Slot | Account`, plus the leading active-marker column. Mirrors
+# Format-UsageTable's column-width algorithm and row-coloring rules so
+# `sca list` and `sca usage` look like sibling views (same header style,
+# same active-marker conventions, same Account-cell truncation). Pure
+# offline render — no network calls, unlike Format-UsageTable. Used by
+# Invoke-ListAction; kept as a sibling rather than a generic helper
+# because the column counts and per-cell rules differ enough that an
+# abstraction would cost more than it saves with only two callers.
+function Format-ListTable {
+    Param (
+        [object[]] $Slots,
+        # When set, skip the `[List] Saved slots` header and the leading
+        # blank line. Used by Invoke-SwitchAction so the table renders
+        # cleanly under the switch's own success line without a redundant
+        # second yellow header.
+        [switch]   $SuppressHeader
+    )
+
+    if (-not $Slots) { return }
+
+    # Precompute account cells so column widths can auto-fit. The Slot
+    # column carries the parsed slot name (Get-SlotFileInfo); the Account
+    # column reuses Format-AccountCell so dedup and truncation match the
+    # usage table.
+    $rows = foreach ($s in $Slots) {
+        [pscustomobject]@{
+            Slot     = $s
+            Marker   = if ($s.IsActive) { '*' } else { ' ' }
+            Name     = $s.Name
+            Account  = Format-AccountCell -SlotName $s.Name -Email $s.Email
+        }
+    }
+
+    # Minimum widths are the header label lengths so the headers never
+    # get clipped on a 1-2 slot table.
+    $nameW = 4; $acctW = 7
+    foreach ($e in $rows) {
+        if ($e.Name.Length    -gt $nameW) { $nameW = $e.Name.Length }
+        if ($e.Account.Length -gt $acctW) { $acctW = $e.Account.Length }
+    }
+
+    $fmt = "  {0} {1,-$nameW}  {2}"
+
+    if (-not $SuppressHeader) {
+        Write-Host "[List] Saved slots" -ForegroundColor "Yellow"
+        Write-Host ''
+    }
+    Write-Host ($fmt -f ' ',  'Slot',         'Account')
+    Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW))
+
+    foreach ($entry in $rows) {
+        $color = if ($entry.Slot.IsActive) { 'Green' } else { $null }
+        if ($color) {
+            Write-Host ($fmt -f $entry.Marker, $entry.Name, $entry.Account) -ForegroundColor $color
+        } else {
+            Write-Host ($fmt -f $entry.Marker, $entry.Name, $entry.Account)
+        }
     }
 }
 
