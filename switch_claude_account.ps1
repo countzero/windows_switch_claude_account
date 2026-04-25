@@ -1063,12 +1063,14 @@ function Invoke-SwitchAction {
 }
 
 function Invoke-ListAction {
-    # Pure offline render — no network calls, no hashing, no reconcile.
-    # Get-Slots reads the state file (Read-ScaState auto-migrates on
-    # first call) and stamps IsActive on each row. The hardlink-broken
-    # advisory and ActiveLocked branch are gone with the rest of the
-    # hardlink mechanism: there is no auto-sync to detect breakage of
-    # any more.
+    # Reconcile first so the slot file matches whatever Claude Code may
+    # have written into .credentials.json since the last sca call. This
+    # ensures the active-slot marker is always accurate — without it,
+    # `sca list` could show stale state when .credentials.json differs
+    # from state.last_sync_hash (see Invoke-SwitchAction /
+    # Invoke-UsageAction for the same pattern).
+    Invoke-Reconcile | Out-Null
+
     $slots = @((Get-Slots).Slots)
 
     if ($slots.Count -eq 0) {
