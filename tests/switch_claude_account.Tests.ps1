@@ -453,7 +453,11 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-SwitchAction -Name 'work' 6>&1 | Out-String
 
-            $out | Should -Match "Switched to 'work'\."
+            # `(?m)...$` anchors the slot identity to end-of-line so an
+            # accidental `(email)` suffix or a stale trailing period would
+            # both fail this assertion. The success line is now a yellow
+            # header without a trailing dot.
+            $out | Should -Match "(?m)Switched to 'work'\s*$"
             $out | Should -Not -Match '\([^)]*@[^)]*\)'
         }
 
@@ -463,7 +467,7 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-SwitchAction -Name $email 6>&1 | Out-String
 
-            $out | Should -Match "Switched to '$([regex]::Escape($email))'\."
+            $out | Should -Match "(?m)Switched to '$([regex]::Escape($email))'\s*$"
             # No `(alice@example.com)` suffix duplicating the slot name.
             $out | Should -Not -Match "'$([regex]::Escape($email))' \($([regex]::Escape($email))\)"
         }
@@ -526,6 +530,58 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)^\s+bravo\s'
             # Defensive: bravo must NOT carry a `*` after the switch.
             $out | Should -Not -Match '(?m)^\s+\*\s+bravo\s'
+        }
+
+        # The success line is a yellow header, not a sentence — the
+        # apply hint moved to a separate `[Info]` line beneath the table.
+        # Verify (a) no "Close and restart" text on the success line,
+        # (b) no trailing period after the slot identity.
+        It 'success line drops the "Close and restart" wording and the trailing period' {
+            $labeled = Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json'
+            Set-Content -LiteralPath $labeled -Value 'X' -NoNewline
+
+            $out = Invoke-SwitchAction -Name 'work' 6>&1 | Out-String
+
+            # The "Close and restart" string MUST NOT appear on the same
+            # line as "Switched to ...". Negated CR/LF char class anchors
+            # the assertion to a single line.
+            $out | Should -Not -Match "Switched to[^`r`n]*Close and restart"
+            # Negative lookahead: the closing paren of the email must
+            # NOT be followed by a literal `.` on the success line.
+            $out | Should -Match "Switched to 'work' \(alice@example\.com\)(?!\.)"
+        }
+
+        It "[Info] hint appears beneath the table" {
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+
+            $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
+
+            $out | Should -Match '\[Info\] Close and restart Claude Code to apply\.'
+
+            # Ordering check: [Switch] header < table row < [Info] hint.
+            $switchIdx = $out.IndexOf('[Switch] Switched')
+            $rowIdx    = ($out | Select-String -Pattern '(?m)^\s+\*\s+alpha\s').Matches[0].Index
+            $infoIdx   = $out.IndexOf('[Info] Close')
+            $switchIdx | Should -BeLessThan $rowIdx
+            $rowIdx    | Should -BeLessThan $infoIdx
+        }
+
+        It "single-slot no-op suppresses the [Info] hint" {
+            # Exactly one slot, and it's already active -> Get-NextSlotName
+            # prints its yellow advisory and returns $null; the caller
+            # exits BEFORE the table render and the [Info] line.
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.only.json') -Value 'X' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath                                     -Value 'X' -NoNewline
+
+            $out = Invoke-SwitchAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match 'Only one slot'
+            $out | Should -Match 'already active'
+            # No apply hint: nothing changed, nothing to apply.
+            $out | Should -Not -Match '\[Info\] Close and restart'
+            # No success line either.
+            $out | Should -Not -Match 'Switched to'
         }
     }
 

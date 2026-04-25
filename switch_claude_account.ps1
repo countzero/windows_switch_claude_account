@@ -702,11 +702,13 @@ function Invoke-SwitchAction {
     }
     New-Item -ItemType HardLink -Path $CredFile -Target $slot.Path | Out-Null
 
-    # Green success line — matches the active-row convention used by the
-    # `list` and `usage` tables (the slot we just hardlinked to is now
-    # the active one).
+    # Yellow header line — matches the `[List] Saved slots` / `[Usage]
+    # Plan usage per slot` convention so all three actions present a
+    # consistent table-header look. No trailing period: this is a
+    # header, not a complete sentence (matches `[List] Saved slots`
+    # and `[Usage] Plan usage per slot` style).
     $toIdent = Format-SlotIdentity -Name $slot.Name -Email $slot.Email
-    Write-Host "[Switch] Switched to $toIdent. Close and restart Claude Code to apply." -ForegroundColor "Green"
+    Write-Host "[Switch] Switched to $toIdent" -ForegroundColor "Yellow"
 
     # Render the saved-slot table beneath the success line so the user
     # sees the new active slot in context (the `*` marker now points at
@@ -720,6 +722,16 @@ function Invoke-SwitchAction {
     Write-Host ''
     $postSwitchInfo = Get-Slots
     Format-ListTable -Slots @($postSwitchInfo.Slots) -SuppressHeader
+
+    # Cyan `[Info]` apply hint, last line beneath the table. Split out
+    # of the success line so the success line stays scannable as a
+    # header. Suppressed for the single-slot no-op (which returns early
+    # above and never reaches here) because nothing actually changed
+    # and there is nothing to apply. Format-ListTable already emitted
+    # a trailing blank line, so the Info line sits one row below the
+    # last table row.
+    Write-Host "[Info] Close and restart Claude Code to apply." -ForegroundColor "Cyan"
+    Write-Host ''
 }
 
 function Invoke-ListAction {

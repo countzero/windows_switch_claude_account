@@ -25,7 +25,7 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 | Action     | Requires name | What it does |
 |------------|---------------|--------------|
 | `save`     | Yes           | Copies `.credentials.json` → `.credentials.<name>.json`, then re-links `.credentials.json` as a hardlink to the new slot. Subsequent token refreshes flow into the saved slot. |
-| `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Output is a single green success line `[Switch] Switched to '<slot>' (<email>). Close and restart Claude Code to apply.` followed by the saved-slot table (same shape as `sca list`, header suppressed) so the user sees the new active slot in context via the `*` marker. Yellow advisories appear above the success line for the locked-active and no-active-detected edge cases; the single-slot-already-active no-op prints its yellow advisory and skips both the success line and the table. |
+| `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Output is a yellow header line `[Switch] Switched to '<slot>' (<email>)` (no trailing period — matches the `[List]` / `[Usage]` header style), followed by the saved-slot table (same shape as `sca list`, header suppressed), and a cyan `[Info] Close and restart Claude Code to apply.` hint as the last line. Yellow advisories appear above the success line for the locked-active and no-active-detected edge cases; the single-slot-already-active no-op prints its yellow advisory and skips the success line, the table, and the `[Info]` hint. |
 | `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape and reuses `Format-AccountCell`, so account dedup and middle-truncation are identical across the two views. Pure offline render — no network IO. |
 | `remove`   | Yes           | Deletes a named slot |
 | `usage`    | Optional      | Calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens in place (hardlink-preserving). Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block including opus / sonnet / overage buckets. |
@@ -116,23 +116,26 @@ The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as
 
 ### Switch action output
 
-`Invoke-SwitchAction` emits a single green success line followed by the saved-slot table beneath, so the user reads "what just happened" in one line and immediately sees the new active slot in context (via the `*` marker on the just-activated row). The retired rotation banner is gone — the table beneath conveys the transition implicitly.
+`Invoke-SwitchAction` emits a yellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line, so the user reads "what just happened" at a glance and immediately sees the new active slot in context (via the `*` marker on the just-activated row). The retired rotation banner is gone — the table beneath conveys the transition implicitly.
 
 ```
-[Switch] Switched to 'slot-1' (finn.kumkar@stadtwerk.org). Close and restart Claude Code to apply.
+[Switch] Switched to 'slot-1' (finn.kumkar@stadtwerk.org)
 
     Slot    Account
     ------  -------------------------
   * slot-1  finn.kumkar@stadtwerk.org
     slot-2  kumkar@stadtwerk.org
+
+[Info] Close and restart Claude Code to apply.
 ```
 
-- **Success line**: green, matches the active-row convention used by the `list` and `usage` tables (the slot is now the active one).
+- **Success line**: yellow header, matches the `[List] Saved slots` / `[Usage] Plan usage per slot` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence (same style as `[List] Saved slots`).
 - **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-completed hardlink swap. `-SuppressHeader` skips the `[List] Saved slots` yellow header so the table sits cleanly under the `[Switch]` line. The hardlink-broken / `ActiveLocked` advisories that `Invoke-ListAction` emits cannot fire here (the hardlink was just established by `New-Item -ItemType HardLink`).
+- **`[Info]` apply hint**: cyan, last line beneath the table. Carries the "Close and restart Claude Code to apply." reminder split out of the success line so the success line stays scannable as a header. Suppressed for the single-slot no-op (nothing changed, nothing to apply).
 - **Yellow advisory branches** (printed above the success line):
-  - **Locked active credentials file** (rotation only): `[Switch] Active credentials file is locked; cannot identify current slot. Rotating to <ident>.` Rotation still proceeds.
-  - **No active match** (rotation only, hash of `.credentials.json` matches no saved slot): `[Switch] No currently active slot detected. Rotating to <ident>.` Rotation still proceeds.
-  - **Single-slot-already-active no-op** (rotation only): `[Switch] Only one slot (<ident>) and it is already active. Nothing to do.` Skips both the success line and the table — nothing changed, no point re-rendering the unchanged state. Emitted by `Get-NextSlotName` itself, which then returns `$null` so the caller exits early.
+  - **Locked active credentials file** (rotation only): `[Switch] Active credentials file is locked; cannot identify current slot. Rotating to <ident>.` Rotation still proceeds; the success line, table, and `[Info]` hint follow as usual.
+  - **No active match** (rotation only, hash of `.credentials.json` matches no saved slot): `[Switch] No currently active slot detected. Rotating to <ident>.` Rotation still proceeds; the success line, table, and `[Info]` hint follow as usual.
+  - **Single-slot-already-active no-op** (rotation only): `[Switch] Only one slot (<ident>) and it is already active. Nothing to do.` Skips the success line, the table, AND the `[Info]` hint — nothing changed, no point re-rendering the unchanged state and no apply needed. Emitted by `Get-NextSlotName` itself, which then returns `$null` so the caller exits early.
 
 Slot identities are rendered via `Format-SlotIdentity`, the single source of truth for the dedup logic: returns `'<slot>' (<email>)` for labeled slots whose email differs from the slot name, and `'<slot>'` (no parens) for unlabeled or dedup-form slots. Same dedup rules as `Format-AccountCell` so the inline prose form and the table cell form stay consistent.
 
