@@ -144,6 +144,20 @@ $Script:UsageCacheTTL  = 10
 $Script:UtilWarnPct            = 90
 $Script:UtilLimitPct           = 100
 
+# Color thresholds for the aggregate progress bars rendered above the
+# usage table. The bars show pool-wide AVAILABLE headroom (sum of
+# remaining capacity across HTTP-ok slots), so the thresholds are
+# inverse to the per-slot utilization thresholds above:
+#
+#   availPct >= AggregateGreenPct   -> Green  (plenty of headroom)
+#   availPct >= AggregateYellowPct  -> Yellow (running low)
+#   otherwise                       -> Red    (pool nearly exhausted)
+#
+# Defaults chosen to match the per-slot palette's intent: 50% pool
+# headroom is comfortable, below 10% is alarming.
+$Script:AggregateGreenPct      = 50
+$Script:AggregateYellowPct     = 10
+
 # Middle-truncation target for the Account column in the usage table.
 # Emails longer than this get rendered as `aaa…zzz` with an ellipsis in
 # the middle so the domain (which disambiguates accounts under the same
@@ -202,7 +216,7 @@ function Show-Help {
         "  switch [name]    Restore a named slot; without <name>, rotate to the next slot (alphabetical, wraps)",
         "  list             List saved slots (active slot marked with *)",
         "  remove <name>    Delete a named slot",
-        "  usage [name]     Show 5h / weekly plan usage per slot (network; unofficial Anthropic API)",
+        "  usage [name]     Show Session / Week plan usage per slot (network; unofficial Anthropic API)",
         "  install          Add 'sca' + 'switch-claude-account' aliases to your PS profile",
         "  uninstall        Remove the aliases from your PS profile",
         "  help, -h         Show this help",
@@ -213,7 +227,7 @@ function Show-Help {
         "  $cmd switch                      # rotate to the next saved slot",
         "  $cmd list                        # show all slots",
         "  $cmd remove slot-1               # delete a slot",
-        "  $cmd usage                       # show 5h + weekly usage for every slot",
+        "  $cmd usage                       # show Session + Week usage for every slot",
         "  $cmd usage -watch                # live refresh; 60s polls; Ctrl-C to quit",
         "  $cmd usage -watch -interval 300  # slower refresh (floor is 60s)",
         "  $cmd usage -json                 # emit usage as JSON for scripting",
@@ -1338,6 +1352,111 @@ function Get-StatusRationale {
     }
 }
 
+# Map a pool-wide AVAILABLE-headroom percentage (0..100) to the Write-Host
+# color used by the aggregate bars. Extracted as a pure helper rather
+# than inlined so it can be unit-tested without mocking Write-Host (whose
+# parameter capture across Pester scope boundaries is fragile).
+function Get-AggregateBarColor {
+    Param ([int] $AvailablePct)
+
+    if ($AvailablePct -ge $Script:AggregateGreenPct)  { return 'Green'  }
+    if ($AvailablePct -ge $Script:AggregateYellowPct) { return 'Yellow' }
+    return 'Red'
+}
+
+# Render aggregate progress bars showing pool-wide AVAILABLE headroom
+# above the usage table. Two bars: 'Session' (five_hour) and 'Week'
+# (seven_day). For each bucket the function sums per-slot utilization
+# across HTTP-ok rows, computes pool-available % as (cap - used) / cap
+# where cap = N * 100, and draws a fit-to-table-width bar.
+#
+# Width math: bar width = TotalLineWidth - 17, floored at 8. The 17 is
+# 2 (indent) + 8 (label pad) + 1 ('[') + 1 (']') + 1 (space) + 4
+# ("NNN%"). Floor keeps narrow 1-slot tables visually meaningful.
+#
+# Slot inclusion rules:
+#   * Status='ok' only (HTTP-failure rows have no usable data).
+#   * Synth <active> matched (Name == $Script:ActiveSlotNameMatched)
+#     EXCLUDED — would double-count its hash-paired saved slot.
+#   * Synth <active> (unsaved) INCLUDED — separate quota pool.
+#   * Buckets with null/missing utilization counted as 0% used (full
+#     headroom contribution to that bucket's aggregate).
+#
+# Color thresholds via $Script:AggregateGreenPct / $Script:AggregateYellowPct.
+#
+# Output: 5 Write-Host lines (blank, Session, blank, Week, blank). When
+# no qualifying rows exist, emits nothing — the table below renders
+# cleanly without orphan padding.
+#
+# Uses Write-Host (information stream / 6) rather than Write-Progress
+# (stream 4) for three reasons: (1) the suite's `6>&1 | Out-String`
+# capture pattern would miss stream-4 output; (2) Write-Progress is
+# host-managed and transient — it would not sit inline above the table;
+# (3) it does not compose with Clear-Host watch redraws.
+function Format-AggregateBars {
+    Param (
+        [object[]] $Results,
+        [int]      $TotalLineWidth
+    )
+
+    if (-not $Results) { return }
+
+    $eligible = @($Results | Where-Object {
+        $_.Status -eq 'ok' -and $_.Name -ne $Script:ActiveSlotNameMatched
+    })
+    if ($eligible.Count -eq 0) { return }
+
+    $n   = $eligible.Count
+    $cap = $n * 100
+
+    # Width derivation explained above. Floor 8 so 1-slot tables with
+    # short status text still render a visible bar instead of an
+    # empty `[]` next to the right label.
+    $barWidth = [math]::Max(8, $TotalLineWidth - 17)
+
+    $buckets = @(
+        @{ Key = 'five_hour'; Label = 'Session' },
+        @{ Key = 'seven_day'; Label = 'Week'    }
+    )
+
+    # Each iteration emits one bar line followed by one blank. With the
+    # caller's pre-bars blank line (from Format-UsageTable) the visual
+    # cadence is:
+    #   <caller blank> / Session bar / <blank> / Week bar / <blank>
+    # which gives the requested padding before, between, and after.
+    foreach ($b in $buckets) {
+        $key   = $b.Key
+        $label = $b.Label
+
+        $usedSum = 0.0
+        foreach ($r in $eligible) {
+            if ($r.Data -and $r.Data.$key -and $null -ne $r.Data.$key.utilization) {
+                $u = [double]$r.Data.$key.utilization
+                if ($u -lt 0)   { $u = 0 }
+                if ($u -gt 100) { $u = 100 }
+                $usedSum += $u
+            }
+            # null / missing utilization -> 0 used (full headroom contribution).
+        }
+
+        $availSum = $cap - $usedSum
+        if ($availSum -lt 0) { $availSum = 0 }
+        $availPct = [int][math]::Round(($availSum / $cap) * 100)
+
+        $filled = [int][math]::Round(($availPct / 100.0) * $barWidth)
+        if ($filled -lt 0)         { $filled = 0 }
+        if ($filled -gt $barWidth) { $filled = $barWidth }
+
+        $bar = ('█' * $filled) + ('░' * ($barWidth - $filled))
+
+        $color = Get-AggregateBarColor -AvailablePct $availPct
+
+        $line = '  {0,-8}[{1}] {2,3}%' -f $label, $bar, $availPct
+        Write-Host $line -ForegroundColor $color
+        Write-Host ''
+    }
+}
+
 # Render per-slot usage rows as a fixed-width table. Uses Write-Host (the
 # information stream) to match the other Invoke-*Action functions so the
 # existing `$out = Invoke-*Action 6>&1 | Out-String` test pattern keeps
@@ -1346,18 +1465,27 @@ function Get-StatusRationale {
 # responsive-width formatter.
 #
 # Column shape (5 data columns + leading active-marker):
-#   *  Slot    Account                      5h              7d            Status
+#   *  Slot    Account                      Session         Week         Status
 #
-# - `5h` / `7d` cells merge utilization and reset delta into one string
-#   ('100% in 2h 37m'); width auto-fits to the widest cell in the batch.
+# - `Session` / `Week` cells merge utilization and reset delta into one
+#   string ('100% in 2h 37m'); width auto-fits to the widest cell in the batch.
 # - `Account` renders the slot's filename-encoded email, middle-truncated
 #   at $Script:AccountColumnMaxWidth. Slots with no email (offline save)
 #   or whose email equals the slot name (dedup form) render as '—'.
 # - `Status` mixes HTTP health (expired / unauthorized / error / no-oauth)
 #   with plan-usability derived via Get-PlanStatus; see that helper for
 #   the threshold semantics.
+#
+# -IncludeAggregateBars : when set, render the pool-wide aggregate bar
+# block (Format-AggregateBars) between the [Usage] header and the
+# column header. Set by Format-UsageFrame for the table view; not set
+# by Format-UsageVerbose's non-ok fallback (which reuses this function
+# for a single failed-row render).
 function Format-UsageTable {
-    Param ([object[]] $Results)
+    Param (
+        [object[]] $Results,
+        [switch]   $IncludeAggregateBars
+    )
 
     if (-not $Results) { return }
 
@@ -1406,19 +1534,37 @@ function Format-UsageTable {
 
     # Minimum widths are the header label lengths so headers never get
     # clipped. Data-driven max keeps narrow tables narrow for 1-2 slots.
-    $nameW = 4; $acctW = 7; $fiveW = 2; $sevenW = 2
+    # 'Session' (7) / 'Week' (4) are the new header literals; min widths
+    # match. Status header is 6 chars but the column flows; track the
+    # widest rendered status so $totalLineWidth below is accurate.
+    $nameW = 4; $acctW = 7; $fiveW = 7; $sevenW = 4; $statusW = 6
     foreach ($e in $rows) {
-        if ($e.Name.Length    -gt $nameW)  { $nameW  = $e.Name.Length }
-        if ($e.Account.Length -gt $acctW)  { $acctW  = $e.Account.Length }
-        if ($e.Five.Length    -gt $fiveW)  { $fiveW  = $e.Five.Length }
-        if ($e.Seven.Length   -gt $sevenW) { $sevenW = $e.Seven.Length }
+        if ($e.Name.Length    -gt $nameW)   { $nameW   = $e.Name.Length }
+        if ($e.Account.Length -gt $acctW)   { $acctW   = $e.Account.Length }
+        if ($e.Five.Length    -gt $fiveW)   { $fiveW   = $e.Five.Length }
+        if ($e.Seven.Length   -gt $sevenW)  { $sevenW  = $e.Seven.Length }
+        if ($e.Status.Length  -gt $statusW) { $statusW = $e.Status.Length }
     }
 
     $fmt = "  {0} {1,-$nameW}  {2,-$acctW}  {3,-$fiveW}  {4,-$sevenW}  {5}"
 
+    # Total rendered line width — used to fit-to-table the aggregate
+    # bars above the header. Mirrors the $fmt pattern: 2 (indent) + 1
+    # (marker) + 1 (sep) + nameW + 2 + acctW + 2 + fiveW + 2 + sevenW
+    # + 2 + statusW.
+    $totalLineWidth = 2 + 1 + 1 + $nameW + 2 + $acctW + 2 + $fiveW + 2 + $sevenW + 2 + $statusW
+
     Write-Host "[Usage] Plan usage per slot" -ForegroundColor "Yellow"
     Write-Host ''
-    Write-Host ($fmt -f ' ',  'Slot',         'Account',       '5h',           '7d',            'Status')
+    # Aggregate bars sit between the post-header blank and the column
+    # header. Format-AggregateBars emits per bar: 'bar line' + blank,
+    # so the caller's blank above acts as the leading padding. When
+    # there are no eligible rows the helper returns silently; the
+    # leading blank still separates header from column header.
+    if ($IncludeAggregateBars) {
+        Format-AggregateBars -Results $Results -TotalLineWidth $totalLineWidth
+    }
+    Write-Host ($fmt -f ' ',  'Slot',         'Account',       'Session',     'Week',          'Status')
     Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW),  ('-' * $fiveW), ('-' * $sevenW), '------')
 
     foreach ($entry in $rows) {
@@ -1547,7 +1693,10 @@ function Format-UsageVerbose {
         }
         $pctCell   = Format-UtilCell $util
         $resetCell = if ($reset) { Format-ResetAbsolute $reset } else { '—' }
-        Write-Host ("  {0,-22} {1}  {2}" -f $Label, $pctCell, $resetCell)
+        # Label pad of 10 matches the bar block's 8-pad plus the
+        # verbose view's natural breathing room (longest label 'Session'
+        # = 7 chars, leaving 3 trailing spaces before the percent).
+        Write-Host ("  {0,-10} {1}  {2}" -f $Label, $pctCell, $resetCell)
     }
 
     $five  = $Result.Data.five_hour
@@ -1558,8 +1707,8 @@ function Format-UsageVerbose {
         return
     }
 
-    & $renderOne 'Session (5h)'        $five
-    & $renderOne 'Weekly (all models)' $seven
+    & $renderOne 'Session' $five
+    & $renderOne 'Week'    $seven
 }
 
 # --- usage action: data + rendering split ---------------------------------
@@ -1751,7 +1900,12 @@ function Format-UsageFrame {
     if ($Name -and $results.Count -eq 1) {
         Format-UsageVerbose -Result $results[0]
     } else {
-        Format-UsageTable -Results @($results)
+        # -IncludeAggregateBars: render the pool-wide Session/Week
+        # progress bars above the column header. Format-UsageVerbose's
+        # non-ok fallback also calls Format-UsageTable but does NOT pass
+        # this switch — bars are a pool-level summary and would be
+        # off-topic on a single-slot drill-down.
+        Format-UsageTable -Results @($results) -IncludeAggregateBars
     }
 
     # Cache-fallback advisory: inform the user that data is stale because

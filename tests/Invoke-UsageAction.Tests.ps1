@@ -405,9 +405,12 @@ Describe 'switch_claude_account' {
             # alone.
             $out | Should -Match '(?m)^\s+Status:\s+limited 5h - no prompts until 5h window resets'
 
-            # Bucket rows still render below the Status line.
-            $out | Should -Match 'Session \(5h\)\s+100%\s+Resets '
-            $out | Should -Match 'Weekly \(all models\)\s+28%\s+Resets '
+            # Bucket rows still render below the Status line. Renamed
+            # from 'Session (5h)' / 'Weekly (all models)' to 'Session' /
+            # 'Week' to match the table column headers and the
+            # aggregate-bar labels above the table.
+            $out | Should -Match 'Session\s+100%\s+Resets '
+            $out | Should -Match 'Week\s+28%\s+Resets '
         }
 
         It 'refresh preserves any hardlink to .credentials.json (active-slot refresh)' {
@@ -437,7 +440,7 @@ Describe 'switch_claude_account' {
             $credJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
         }
 
-        It 'named-slot usage: verbose view shows only Session and Weekly buckets' {
+        It 'named-slot usage: verbose view shows only Session and Week buckets' {
             New-Slot -Name 'alpha' | Out-Null
             New-Slot -Name 'bravo' | Out-Null
 
@@ -459,9 +462,10 @@ Describe 'switch_claude_account' {
             $out | Should -Match "Slot 'alpha'"
             $out | Should -Not -Match "Slot 'bravo'"
 
-            # The two rendered buckets.
-            $out | Should -Match 'Session \(5h\)'
-            $out | Should -Match 'Weekly \(all models\)'
+            # The two rendered buckets — labels match the table column
+            # headers and the aggregate-bar labels.
+            $out | Should -Match '(?m)^\s+Session\s+\d'
+            $out | Should -Match '(?m)^\s+Week\s+\d'
             $out | Should -Match 'Resets '
 
             # Explicitly absent: labels for buckets we deliberately stopped
@@ -670,8 +674,8 @@ Describe 'switch_claude_account' {
             # Verbose view header carries the synth name.
             $out | Should -Match "Slot '<active> \(unsaved\)'"
             # Two-bucket render only.
-            $out | Should -Match 'Session \(5h\)\s+53%\s+Resets '
-            $out | Should -Match 'Weekly \(all models\)\s+19%\s+Resets '
+            $out | Should -Match 'Session\s+53%\s+Resets '
+            $out | Should -Match 'Week\s+19%\s+Resets '
             # Drill-down must not emit the warning (only the summary table does).
             $out | Should -Not -Match 'Warning: .credentials.json'
 
@@ -870,6 +874,236 @@ Describe 'switch_claude_account' {
             }
             { Invoke-UsageAction -watch 6>$null } |
                 Should -Throw -ExpectedMessage '*-watch requires an interactive terminal*'
+        }
+    }
+
+    Context 'Format-AggregateBars' {
+        # Builds a per-slot result row matching the shape Get-UsageSnapshot
+        # emits. Keeping it here (not in the outer Invoke-UsageAction
+        # BeforeAll) avoids visibility surprises if either Context is
+        # later moved or split into a separate file.
+        BeforeAll {
+            function New-OkRow {
+                Param (
+                    [string] $Name,
+                    [bool]   $IsActive = $false,
+                    $FiveUtil  = 'unset',
+                    $SevenUtil = 'unset'
+                )
+                # Sentinel 'unset' distinguishes "bucket missing entirely"
+                # (-> $null Data.<bucket>) from "bucket present, util=null"
+                # (-> object with utilization=$null). Format-AggregateBars
+                # treats both as 0% used; we exercise the missing-bucket
+                # path here.
+                $five  = $null
+                $seven = $null
+                if ($FiveUtil  -ne 'unset') { $five  = [pscustomobject]@{ utilization = [double]$FiveUtil;  resets_at = $null } }
+                if ($SevenUtil -ne 'unset') { $seven = [pscustomobject]@{ utilization = [double]$SevenUtil; resets_at = $null } }
+                $data = [pscustomobject]@{ five_hour = $five; seven_day = $seven }
+                return [pscustomobject]@{
+                    Name     = $Name
+                    IsActive = $IsActive
+                    Status   = 'ok'
+                    Data     = $data
+                    Error    = $null
+                    Email    = $null
+                }
+            }
+        }
+
+        It 'returns silently when Results is empty' {
+            $out = Format-AggregateBars -Results @() -TotalLineWidth 70 6>&1 | Out-String
+            $out.Trim() | Should -BeNullOrEmpty
+        }
+
+        It 'returns silently when no HTTP-ok rows are present' {
+            $rows = @(
+                [pscustomobject]@{ Name='a'; IsActive=$false; Status='expired';  Data=$null; Error='x';  Email=$null }
+                [pscustomobject]@{ Name='b'; IsActive=$false; Status='no-oauth'; Data=$null; Error=$null; Email=$null }
+            )
+            $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out.Trim() | Should -BeNullOrEmpty
+        }
+
+        It 'single ok slot at 30% / 40% util renders 70% / 60% available' {
+            $rows = @( New-OkRow -Name 'a' -FiveUtil 30 -SevenUtil 40 )
+            $out  = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+70%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+60%\s*$'
+        }
+
+        It 'two ok slots aggregate as Sigma-used over N*100 (Session 50%, Week 75% from the doc example)' {
+            # 5h: (10+90)/200 = 50% used -> 50% available.
+            # 7d: ( 0+50)/200 = 25% used -> 75% available.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 10 -SevenUtil  0)
+                (New-OkRow -Name 'b' -FiveUtil 90 -SevenUtil 50)
+            )
+            $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+50%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+75%\s*$'
+        }
+
+        It 'null/missing buckets count as 0% used (full headroom contribution)' {
+            # 5h: (10 + 0)/200 = 5% used  -> 95% available.
+            # 7d: ( 0 + 50)/200 = 25% used -> 75% available.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 10)              # SevenUtil missing -> 0 used
+                (New-OkRow -Name 'b' -SevenUtil 50)             # FiveUtil missing -> 0 used
+            )
+            $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+95%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+75%\s*$'
+        }
+
+        It 'HTTP-failure rows are excluded from the aggregate' {
+            # Only the ok row contributes to N. 1-slot pool, 5h=20% used -> 80%.
+            $rows = @(
+                (New-OkRow -Name 'good' -FiveUtil 20 -SevenUtil 30)
+                [pscustomobject]@{ Name='bad'; IsActive=$false; Status='error'; Data=$null; Error='boom'; Email=$null }
+            )
+            $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+80%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+70%\s*$'
+        }
+
+        It 'synth <active> matched is excluded; <active> (unsaved) is included' {
+            # eligible = saved + <active> (unsaved); <active> matched
+            # is dropped to avoid double-counting its hash-paired saved
+            # slot.  N=2.
+            #   5h: (50 + 100)/200 = 75% used -> 25% available.
+            #   7d: ( 0 + 100)/200 = 50% used -> 50% available.
+            $rows = @(
+                (New-OkRow -Name 'saved'              -FiveUtil  50 -SevenUtil   0)
+                (New-OkRow -Name '<active>'           -FiveUtil  50 -SevenUtil   0)
+                (New-OkRow -Name '<active> (unsaved)' -FiveUtil 100 -SevenUtil 100)
+            )
+            $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+25%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+50%\s*$'
+        }
+
+        It 'utilization above 100 is clamped to 100' {
+            # 7d=150% gets clamped to 100% used -> 0% available.
+            $rows = @( (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 150) )
+            $out  = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+0%\s*$'
+        }
+
+        It 'each rendered bar line equals TotalLineWidth (fits to table edge)' {
+            $rows = @( (New-OkRow -Name 'a' -FiveUtil 50 -SevenUtil 50) )
+            $w    = 70
+            $out  = Format-AggregateBars -Results $rows -TotalLineWidth $w 6>&1 | Out-String
+            $bars = @($out -split "`r?`n" | Where-Object { $_ -match '\[' })
+            $bars.Count | Should -Be 2
+            foreach ($line in $bars) { $line.Length | Should -Be $w }
+        }
+
+        It 'bar width clamps to 8 when TotalLineWidth is below floor (line is 25 chars regardless)' {
+            $rows = @( (New-OkRow -Name 'a' -FiveUtil 50 -SevenUtil 50) )
+            # 17 fixed + 8 floor = 25. Caller's TotalLineWidth=10 cannot
+            # shrink the bar further; we render an "ugly but informative"
+            # line instead of a zero-width bracket pair.
+            $out  = Format-AggregateBars -Results $rows -TotalLineWidth 10 6>&1 | Out-String
+            $bars = @($out -split "`r?`n" | Where-Object { $_ -match '\[' })
+            foreach ($line in $bars) { $line.Length | Should -Be 25 }
+        }
+
+        It 'emits one trailing blank line after each bar (4 lines total per render)' {
+            $rows = @( (New-OkRow -Name 'a' -FiveUtil 25 -SevenUtil 75) )
+            $out  = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            # Out-String appends a trailing newline. Splitting on `r?`n
+            # gives: <Session line>, <blank>, <Week line>, <blank>, ''.
+            $lines = $out -split "`r?`n"
+            ($lines | Where-Object { $_ -match '\[' }).Count       | Should -Be 2
+            # Trailing empty string + 2 inter-line blanks = 3 empty entries.
+            ($lines | Where-Object { $_ -eq '' }).Count            | Should -BeGreaterOrEqual 3
+        }
+
+    }
+
+    Context 'Get-AggregateBarColor' {
+        # Pure-helper unit tests for the aggregate bar color thresholds.
+        # Runs the threshold boundaries explicitly so a future tweak of
+        # $Script:AggregateGreenPct / $Script:AggregateYellowPct shows up
+        # here as a failing test rather than a silent visual change.
+        It 'returns Green at and above AggregateGreenPct (50% by default)' {
+            Get-AggregateBarColor -AvailablePct 100 | Should -Be 'Green'
+            Get-AggregateBarColor -AvailablePct  50 | Should -Be 'Green'
+        }
+
+        It 'returns Yellow between AggregateYellowPct (10%) and AggregateGreenPct-1 (49%)' {
+            Get-AggregateBarColor -AvailablePct 49 | Should -Be 'Yellow'
+            Get-AggregateBarColor -AvailablePct 10 | Should -Be 'Yellow'
+        }
+
+        It 'returns Red below AggregateYellowPct (under 10%)' {
+            Get-AggregateBarColor -AvailablePct 9 | Should -Be 'Red'
+            Get-AggregateBarColor -AvailablePct 0 | Should -Be 'Red'
+        }
+    }
+
+    Context 'Format-UsageTable -IncludeAggregateBars integration' {
+        # Reuses the New-OkRow factory from the Format-AggregateBars
+        # context above but runs in its own Context scope; redeclare
+        # locally so the file can be split later without coupling.
+        BeforeAll {
+            function New-OkRow {
+                Param (
+                    [string] $Name,
+                    [bool]   $IsActive = $false,
+                    $FiveUtil  = 30,
+                    $SevenUtil = 40
+                )
+                return [pscustomobject]@{
+                    Name     = $Name
+                    IsActive = $IsActive
+                    Status   = 'ok'
+                    Data     = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = [double]$FiveUtil;  resets_at = $null }
+                        seven_day = [pscustomobject]@{ utilization = [double]$SevenUtil; resets_at = $null }
+                    }
+                    Error    = $null
+                    Email    = $null
+                }
+            }
+        }
+
+        It 'renders bar lines between [Usage] header and column header when -IncludeAggregateBars is set' {
+            $rows = @( (New-OkRow -Name 'alpha') )
+            $out  = Format-UsageTable -Results $rows -IncludeAggregateBars 6>&1 | Out-String
+
+            $out | Should -Match '\[Usage\] Plan usage per slot'
+            $out | Should -Match '(?m)^\s+Session\s*\['
+            $out | Should -Match '(?m)^\s+Week\s*\['
+
+            # Order: header < Session bar < Week bar < column header.
+            $iHeader  = $out.IndexOf('[Usage] Plan usage per slot')
+            $iSession = $out.IndexOf('Session [')
+            $iWeek    = $out.IndexOf('Week    [')
+            $iSlotCol = ($out -split "`r?`n" | ForEach-Object { if ($_ -match '^\s+Slot\s+Account') { $_ } } | Select-Object -First 1)
+            $iSlotIdx = $out.IndexOf($iSlotCol)
+            $iHeader  | Should -BeLessThan $iSession
+            $iSession | Should -BeLessThan $iWeek
+            $iWeek    | Should -BeLessThan $iSlotIdx
+        }
+
+        It 'omits bar lines when -IncludeAggregateBars is not set (regression guard for verbose-fallback callers)' {
+            # Format-UsageVerbose -> Format-UsageTable (no switch) for non-ok
+            # rows. The bars are a pool-level summary; rendering them on a
+            # single failed-row drill-down would be off-topic.
+            $rows = @( (New-OkRow -Name 'alpha') )
+            $out  = Format-UsageTable -Results $rows 6>&1 | Out-String
+            $out | Should -Not -Match '(?m)^\s+Session\s*\['
+            $out | Should -Not -Match '(?m)^\s+Week\s*\['
+        }
+
+        It 'renamed table column headers: "Session" / "Week" replace "5h" / "7d"' {
+            $rows = @( (New-OkRow -Name 'alpha') )
+            $out  = Format-UsageTable -Results $rows 6>&1 | Out-String
+            # New literals present; old literals absent in header line.
+            $out | Should -Match '(?m)^\s+Slot\s+Account\s+Session\s+Week\s+Status\s*$'
+            $out | Should -Not -Match '(?m)^\s+Slot\s+Account\s+5h\s+7d\s+Status\s*$'
         }
     }
 

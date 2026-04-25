@@ -78,7 +78,7 @@ Response schema (verified against a live Team-plan call on 2026-04-24):
 
 All branches are optional; free-tier / API-key accounts receive `{}`. The `-json` switch emits the raw response under `data` per slot so scripts can pull any field the script itself does not format.
 
-By design the script only **renders** two buckets in both the summary table and the verbose view: `five_hour` (labelled *Session (5h)*) and `seven_day` (labelled *Weekly (all models)*) — matching Claude Code's own `/usage` screen's first two bars. Every other bucket the endpoint returns (`seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal codenames) still round-trips through `-json`; it just does not have a human-readable row in the normal view.
+By design the script only **renders** two buckets in both the summary table and the verbose view: `five_hour` (labelled *Session*) and `seven_day` (labelled *Week*) — matching Claude Code's own `/usage` screen's first two bars. Every other bucket the endpoint returns (`seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal codenames) still round-trips through `-json`; it just does not have a human-readable row in the normal view. The labels were originally `Session (5h)` / `Weekly (all models)`; they were shortened to match the table column headers and the aggregate-bar labels (single visual cadence across all three surfaces).
 
 Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { used_percentage, resets_at } } }` before handing it to its status-line hook — that is the schema you will find by grepping `used_percentage` in `claude.exe`. **Do not** trust the hook-input schema for parsing the raw endpoint response; use the shape above.
 
@@ -86,9 +86,9 @@ Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { u
 
 ### Summary-table layout + Status column semantics
 
-`Format-UsageTable` renders 5 data columns (plus the leading `*` active marker): `Slot | Account | 5h | 7d | Status`.
+`Format-UsageTable` renders 5 data columns (plus the leading `*` active marker): `Slot | Account | Session | Week | Status`.
 
-- **Merged bucket cells**. `5h` and `7d` each combine utilization and reset delta in a single cell: `100% in 2h 37m`. A cold bucket (`utilization = 0`, `resets_at = null`) renders as just ` 0%` — the em-dash reset sentinel is only emitted when the bucket itself has no data at all. Column widths auto-fit to the widest cell in the batch.
+- **Merged bucket cells**. `Session` and `Week` each combine utilization and reset delta in a single cell: `100% in 2h 37m`. A cold bucket (`utilization = 0`, `resets_at = null`) renders as just ` 0%` — the em-dash reset sentinel is only emitted when the bucket itself has no data at all. Column widths auto-fit to the widest cell in the batch. Headers were renamed from `5h` / `7d` to match the aggregate-bar labels above the table; status text such as `limited 5h` keeps the time-window shorthand because that string is also a `-json plan_status` contract value.
 - **Account column**. Pulls the email parsed from the slot filename by `Get-SlotFileInfo`. Renders `—` for unlabeled slots and for slots whose name equals the labeled email (dedup form). Long emails are middle-truncated with `…` at `$Script:AccountColumnMaxWidth = 32` characters; the full string is always retained in `sca usage <name>` verbose view and in `-json`. Replaces the previous `└─ email` continuation line — rows are now single-line.
 - **Status column** mixes HTTP health with plan usability. When the `/api/oauth/usage` call succeeded, `Get-PlanStatus` derives the label from the utilization values:
 
@@ -105,6 +105,43 @@ Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { u
   The thresholds are script-scope constants (`$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`) next to the usage endpoint constants. `100%` is the hard cap Anthropic enforces; `90%` is the heads-up tier. `Get-StatusColor` is the single source of truth for the color mapping so the summary table and verbose view stay in lockstep.
 
 A row flagged `limited 5h` / `limited 7d` / `limited` cannot serve new prompts until the named window resets. This was previously rendered as `ok` in the old HTTP-only Status column, which was misleading — the rewrite is the reason this section exists.
+
+### Aggregate progress bars
+
+Above the summary table, `sca usage` (no slot name) renders two pool-wide AVAILABLE-headroom progress bars — one for `Session` (5h), one for `Week` (7d) — emitted by `Format-AggregateBars` from inside `Format-UsageTable` when the `-IncludeAggregateBars` switch is set. The switch is set by `Format-UsageFrame` for the table view; it is intentionally NOT set by `Format-UsageVerbose`'s non-ok fallback (single-slot drill-down is off-topic for a pool summary).
+
+Layout: a blank line, the Session bar, a blank line, the Week bar, a blank line — then the existing column header. Visual:
+
+```
+[Usage] Plan usage per slot
+
+  Session [█████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  48%
+
+  Week    [█████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  64%
+
+     Slot    Account              Session         Week          Status
+     ...
+```
+
+**Aggregation formula**. For each bucket: `usedTotal = Σ min(util, 100)` over eligible rows (clamped to handle stray >100 utilization values from the API); `cap = N * 100`; `availPct = round((cap - usedTotal) / cap * 100)`. Buckets with `null` / missing utilization contribute `0` used (full headroom).
+
+**Slot-inclusion rule**:
+- Status `'ok'` only — HTTP-failure rows have no usable data.
+- Synth `<active>` matched (Name equals `$Script:ActiveSlotNameMatched`) is EXCLUDED to avoid double-counting against its hash-paired saved slot.
+- Synth `<active> (unsaved)` is INCLUDED — it represents a separate quota pool not yet captured by `sca save`.
+
+**Width**: bar fits to table edge. `barWidth = TotalLineWidth − 17`, floored at 8. The 17 is the per-line fixed overhead: 2 (indent) + 8 (label pad) + `[`+`]` + space + `"NNN%"` (4). `Format-UsageTable` computes `TotalLineWidth` after its column-width loop and passes it to `Format-AggregateBars`. The 8-char floor keeps narrow 1-slot tables visually meaningful — the bar line will be wider than `TotalLineWidth` in that degenerate case but never collapses to `[]`.
+
+**Color** via `Get-AggregateBarColor`:
+- `availPct ≥ $Script:AggregateGreenPct` (50) → Green
+- `availPct ≥ $Script:AggregateYellowPct` (10) → Yellow
+- otherwise → Red
+
+`Get-AggregateBarColor` is a pure helper extracted specifically so the threshold logic is unit-testable without mocking `Write-Host` (Pester's parameter-capture across mock scope boundaries was unreliable in practice).
+
+**Why `Write-Host`, not `Write-Progress`**: (1) `Write-Progress` lives on stream 4, which the suite's `6>&1 | Out-String` capture pattern would miss; (2) it is host-managed and transient — it would not sit inline above the table; (3) it does not compose with the `Clear-Host`-based watch redraw inside `Invoke-UsageWatch`. The bars use the same `Write-Host -ForegroundColor` machinery as every other rendering helper in the file.
+
+When no eligible rows exist (zero saved slots HTTP-ok), `Format-AggregateBars` emits nothing — the post-`[Usage]`-header blank line still separates the header from the column header so the table doesn't stick to the title.
 
 ### List table layout (`sca list`)
 
@@ -149,8 +186,8 @@ Slot identities are rendered via `Format-SlotIdentity`, the single source of tru
 [Usage] Slot 'slot-1'
   Account: ada@arpa.net
   Status:  limited 5h - no prompts until 5h window resets
-  Session (5h)         100%  Resets 7:50pm Europe/Berlin
-  Weekly (all models)   28%  Resets Apr 26, 9am Europe/Berlin
+  Session    100%  Resets 7:50pm Europe/Berlin
+  Week        28%  Resets Apr 26, 9am Europe/Berlin
 ```
 
 The `Status:` line sits between `Account:` and the bucket rows so the usability verdict is the first thing read. `Get-StatusRationale` supplies a short English tail for the non-obvious labels (`limited 5h`, `limited 7d`, `limited`, `near limit`, `ok (no plan data)`); plain `ok` renders without a tail.

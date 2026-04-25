@@ -13,6 +13,24 @@ A zero-dependency PowerShell script for switching between multiple Claude Code a
 
 > **Requires PowerShell 7.0+.** Stock Windows ships PowerShell 5.1, which is not supported. Install PS 7 via `winget install Microsoft.PowerShell`, then run from `pwsh`.
 
+### Download
+
+Grab `switch_claude_account.ps1` from the
+[repository on GitHub](https://github.com/countzero/windows_switch_claude_account)
+and place it anywhere on disk — it is a single self-contained file with no
+companion assets. From PowerShell:
+
+```powershell
+Invoke-WebRequest `
+    https://raw.githubusercontent.com/countzero/windows_switch_claude_account/main/switch_claude_account.ps1 `
+    -OutFile switch_claude_account.ps1
+```
+
+This pulls the latest version from the `main` branch. For a specific tagged
+release, replace `main` with the tag (e.g. `v1.1.0`) and see the
+[releases page](https://github.com/countzero/windows_switch_claude_account/releases)
+for the version list and changelog.
+
 ### Manual (run once)
 
 ```powershell
@@ -73,18 +91,25 @@ sca remove test-project
 sca usage
 ```
 
-Shows the 5-hour session limit ("Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit ("Current week (all models)") for every saved slot, as live percentages against each account's Claude.ai subscription:
+Shows the 5-hour session limit ("Current session" in Claude Code's `/usage`, rendered as the `Session` column) and the 7-day weekly all-models limit ("Current week (all models)", rendered as the `Week` column) for every saved slot, as live percentages against each account's Claude.ai subscription. Two pool-wide progress bars above the table show how much aggregate headroom remains across all slots:
 
 ```
 [Usage] Plan usage per slot
-    Slot         5h   5h reset      7d   7d reset     Status
-    --------   ----  -----------  ----  -----------  ------
-    work        18%  in 2h 11m     42%  in 103h      ok
-  * personal     3%  in 4h 02m      7%  in 146h      ok
-    api-key      —   —              —   —            no-oauth (api key or non-claude.ai slot)
+
+  Session [██████████████████████████████████████░░░░]  90%
+
+  Week    [████████████████████████████████░░░░░░░░░░]  76%
+
+     Slot      Account  Session         Week          Status
+     --------  -------  --------------  ------------  ------
+     work      —         18% in 2h 11m   42% in 103h  ok
+  *  personal  —          3% in 4h 02m    7% in 146h  ok
+     api-key   —          —               —           no-oauth (api key or non-claude.ai slot)
 ```
 
-Deltas under 24h keep minute precision (`in 2h 11m`); at 24h and above the column switches to an integer total-hours view (`in 103h`) to stay narrow. Drill into a single slot for absolute reset times in your local timezone:
+Each `Session` / `Week` cell merges utilization and reset delta into one string. Deltas under 24h keep minute precision (`in 2h 11m`); at 24h and above the column switches to an integer total-hours view (`in 103h`) to stay narrow. The aggregate bars sum the AVAILABLE headroom (100 − util) across HTTP-ok slots over `N × 100%`; `90%` above means roughly 10% of the pooled session budget has been used. Bar color is green when ≥50% headroom, yellow when ≥10%, red below.
+
+Drill into a single slot for absolute reset times in your local timezone:
 
 ```
 sca usage work
@@ -92,8 +117,8 @@ sca usage work
 
 ```
 [Usage] Slot 'work' (active)
-  Session (5h)           18%  Resets 7:50pm Europe/Berlin
-  Weekly (all models)    42%  Resets Apr 28, 9am Europe/Berlin
+  Session     18%  Resets 7:50pm Europe/Berlin
+  Week        42%  Resets Apr 28, 9am Europe/Berlin
 ```
 
 ### Who is each slot actually logged in as?
@@ -104,20 +129,24 @@ Slot names are user-assigned labels; nothing stops you from naming a slot `work`
 %USERPROFILE%\.claude\.credentials.work(ada.lovelace@arpa.net).json
 ```
 
-`sca usage` and `sca list` then surface the email on an indented second line whenever it adds information:
+`sca usage` and `sca list` then surface the email inline in an `Account` column whenever it adds information:
 
 ```
 [Usage] Plan usage per slot
-    Slot                        5h   5h reset      7d   7d reset     Status
-    -------------------------  ----  -----------  ----  -----------  ------
-    ada@arpa.net                31%  in 2h 14m    17%  in 42h        ok
-      └─ ada.lovelace@arpa.net
-    alice@example.com            5%  in 3h 00m     2%  in 120h       ok
+
+  Session [█████████████████████████████████████████████████████░░░░░░░░░░░░]  82%
+
+  Week    [██████████████████████████████████████████████████████████░░░░░░░]  90%
+
+     Slot               Account                Session         Week          Status
+     -----------------  ---------------------  --------------  ------------  ------
+     ada@arpa.net       ada.lovelace@arpa.net   31% in 2h 14m   17% in 42h   ok
+     alice@example.com  —                        5% in 3h 00m    2% in 120h  ok
 ```
 
 Reading it:
-- `ada@arpa.net` is the slot name you picked, but the tokens inside actually belong to `ada.lovelace@arpa.net`. The `└─` second line surfaces the mismatch so you can repair it (`sca save ada.lovelace@arpa.net` then `sca remove ada@arpa.net`).
-- `alice@example.com` has no second line because the slot name already equals the email — no new information to display. The filename is also deduplicated: `.credentials.alice@example.com.json` rather than `.credentials.alice@example.com(alice@example.com).json`.
+- `ada@arpa.net` is the slot name you picked, but the tokens inside actually belong to `ada.lovelace@arpa.net`. The `Account` column surfaces the mismatch so you can repair it (`sca save ada.lovelace@arpa.net` then `sca remove ada@arpa.net`).
+- `alice@example.com` shows `—` in the `Account` column because the slot name already equals the email — no new information to display. The filename is also deduplicated: `.credentials.alice@example.com.json` rather than `.credentials.alice@example.com(alice@example.com).json`.
 
 Because the email lives in the filename, it cannot drift from the OAuth tokens stored in the same file. The only way to update a slot's email label is to re-run `sca save`, which re-fetches the profile and renames the file. Subsequent `sca usage` / `sca list` calls are zero-network for labels — the email is parsed straight out of the filename.
 
@@ -131,10 +160,15 @@ When Claude Code rewrites `.credentials.json` via atomic rename during a token r
 
 ```
 [Usage] Plan usage per slot
-    Slot                        5h   5h reset      7d   7d reset     Status
-    -------------------------  ----  -----------  ----  -----------  ------
-    work                         5%  in 3h 00m     7%  in 120h      ok
-  * <active> (unsaved)          53%  in 2h 00m    19%  in 40h       ok
+
+  Session [█████████████████████████████████████░░░░░░░░░░░░░░░]  71%
+
+  Week    [█████████████████████████████████████████████░░░░░░░]  87%
+
+     Slot                Account  Session         Week          Status
+     ------------------  -------  --------------  ------------  ------
+     work                —          5% in 3h 00m    7% in 120h  ok
+  *  <active> (unsaved)  —         53% in 2h 00m   19% in 40h   ok
 [Usage] Warning: .credentials.json is not hardlinked to any saved slot. Run 'sca save <name>' to capture the active session, or 'sca switch <name>' to overwrite it with a saved slot.
 ```
 
