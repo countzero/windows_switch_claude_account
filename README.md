@@ -101,7 +101,7 @@ sca usage work
 Slot names are user-assigned labels; nothing stops you from naming a slot `work` and then later overwriting it with credentials for a completely different account. At `sca save` time the tool fetches the OAuth account email and embeds it in the slot filename itself, using the RFC 5322 parenthesized-comment form:
 
 ```
-%USERPROFILE%\.claude\.credentials.work(finn.kumkar@stadtwerk.org).json
+%USERPROFILE%\.claude\.credentials.work(ada.lovelace@arpa.net).json
 ```
 
 `sca usage` and `sca list` then surface the email on an indented second line whenever it adds information:
@@ -110,13 +110,13 @@ Slot names are user-assigned labels; nothing stops you from naming a slot `work`
 [Usage] Plan usage per slot
     Slot                        5h   5h reset      7d   7d reset     Status
     -------------------------  ----  -----------  ----  -----------  ------
-    kumkar@stadtwerk.org        31%  in 2h 14m    17%  in 42h        ok
-      └─ finn.kumkar@stadtwerk.org
+    ada@arpa.net                31%  in 2h 14m    17%  in 42h        ok
+      └─ ada.lovelace@arpa.net
     alice@example.com            5%  in 3h 00m     2%  in 120h       ok
 ```
 
 Reading it:
-- `kumkar@stadtwerk.org` is the slot name you picked, but the tokens inside actually belong to `finn.kumkar@stadtwerk.org`. The `└─` second line surfaces the mismatch so you can repair it (`sca save finn.kumkar@stadtwerk.org` then `sca remove kumkar@stadtwerk.org`).
+- `ada@arpa.net` is the slot name you picked, but the tokens inside actually belong to `ada.lovelace@arpa.net`. The `└─` second line surfaces the mismatch so you can repair it (`sca save ada.lovelace@arpa.net` then `sca remove ada@arpa.net`).
 - `alice@example.com` has no second line because the slot name already equals the email — no new information to display. The filename is also deduplicated: `.credentials.alice@example.com.json` rather than `.credentials.alice@example.com(alice@example.com).json`.
 
 Because the email lives in the filename, it cannot drift from the OAuth tokens stored in the same file. The only way to update a slot's email label is to re-run `sca save`, which re-fetches the profile and renames the file. Subsequent `sca usage` / `sca list` calls are zero-network for labels — the email is parsed straight out of the filename.

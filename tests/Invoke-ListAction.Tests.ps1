@@ -78,13 +78,13 @@ Describe 'switch_claude_account' {
         # inline in an Account column instead of the old `└─ <email>`
         # continuation line.
         It 'renders the email in the Account column when slot is labeled' {
-            $labeled = '.credentials.work(finn.kumkar@stadtwerk.org).json'
+            $labeled = '.credentials.work(ada.lovelace@arpa.net).json'
             Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value 'X' -NoNewline
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
             # Slot name and email on the same row; no '└─' continuation.
-            $out | Should -Match '(?m)^\s+work\s+finn\.kumkar@stadtwerk\.org\b'
+            $out | Should -Match '(?m)^\s+work\s+ada\.lovelace@arpa\.net\b'
             $out | Should -Not -Match '└─'
         }
 

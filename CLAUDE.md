@@ -119,12 +119,12 @@ The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as
 `Invoke-SwitchAction` emits a yellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line, so the user reads "what just happened" at a glance and immediately sees the new active slot in context (via the `*` marker on the just-activated row). The retired rotation banner is gone — the table beneath conveys the transition implicitly.
 
 ```
-[Switch] Switched to 'slot-1' (finn.kumkar@stadtwerk.org)
+[Switch] Switched to 'slot-1' (ada.lovelace@arpa.net)
 
     Slot    Account
-    ------  -------------------------
-  * slot-1  finn.kumkar@stadtwerk.org
-    slot-2  kumkar@stadtwerk.org
+    ------  ---------------------
+  * slot-1  ada.lovelace@arpa.net
+    slot-2  ada@arpa.net
 
 [Info] Close and restart Claude Code to apply.
 ```
@@ -147,7 +147,7 @@ Slot identities are rendered via `Format-SlotIdentity`, the single source of tru
 
 ```
 [Usage] Slot 'slot-1'
-  Account: kumkar@stadtwerk.org
+  Account: ada@arpa.net
   Status:  limited 5h - no prompts until 5h window resets
   Session (5h)         100%  Resets 7:50pm Europe/Berlin
   Weekly (all models)   28%  Resets Apr 26, 9am Europe/Berlin
@@ -165,7 +165,7 @@ Each per-slot entry carries the same fields as before plus a `plan_status` strin
     "status":      "ok",
     "is_active":   false,
     "plan_status": "limited 5h",          // absent for HTTP-failure rows
-    "account":     { "email": "kumkar@stadtwerk.org" },
+    "account":     { "email": "ada@arpa.net" },
     "data":        { /* raw /api/oauth/usage body */ }
   }
 }

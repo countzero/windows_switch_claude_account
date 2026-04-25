@@ -1118,7 +1118,7 @@ Describe 'switch_claude_account' {
                 }
             } | ConvertTo-Json -Compress
             # Labeled filename directly — no save-time fetch involved.
-            $labeled = '.credentials.work(finn.kumkar@stadtwerk.org).json'
+            $labeled = '.credentials.work(ada.lovelace@arpa.net).json'
             Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value $payload -NoNewline -Encoding utf8NoBOM
 
             $out = Invoke-UsageAction 6>&1 | Out-String
@@ -1126,7 +1126,7 @@ Describe 'switch_claude_account' {
             # Single-line row: slot name + email on the same line (the
             # Account column is the second column now). No more '└─'
             # continuation line anywhere.
-            $out | Should -Match '(?m)^\s+work\s+finn\.kumkar@stadtwerk\.org\b'
+            $out | Should -Match '(?m)^\s+work\s+ada\.lovelace@arpa\.net\b'
             $out | Should -Not -Match '└─'
             # Zero profile HTTP calls on the display path — email is from
             # the filename, not the endpoint.
