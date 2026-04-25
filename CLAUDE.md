@@ -256,3 +256,5 @@ pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pes
 The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode — findings are printed but never fail the run.
 
 Tests sandbox `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`, so the real profile and real `.claude` directory are never touched.
+
+Tests are split per action under `tests/Invoke-<Action>Action.Tests.ps1` (plus `Helpers.Tests.ps1` and `Profile-Install.Tests.ps1`), with shared per-test sandbox setup in `tests/Common.ps1` (dot-sourced from each file's `BeforeEach`). Each file's outer `Describe` is named `'switch_claude_account'` so the `-FullNameFilter` recipe above keeps working unchanged across files.
