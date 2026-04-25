@@ -90,7 +90,7 @@ Describe 'switch_claude_account' {
                     }
                     seven_day = [pscustomobject]@{
                         utilization = 17.0
-                        resets_at   = (Format-IsoReset ([TimeSpan]::FromHours(42)))     # ~1d 18h -> "in 42h"
+                        resets_at   = (Format-IsoReset ([TimeSpan]::FromHours(42)))     # ~1d 18h -> "(42h)"
                     }
                     seven_day_sonnet = [pscustomobject]@{
                         utilization = 0.0
@@ -107,10 +107,10 @@ Describe 'switch_claude_account' {
             $out | Should -Match '\b17%'
             # Variant C: hours+minutes under 24h; elapsed test time may shave
             # a minute off, so accept 13-14m.
-            $out | Should -Match 'in 2h 1[34]m'
+            $out | Should -Match '\(2h 1[34]m\)'
             # Variant C: integer total hours at/above 24h; elapsed test time
             # may drop 42h to 41h.
-            $out | Should -Match 'in 4[12]h(?!\d)'
+            $out | Should -Match '\(4[12]h\)(?!\d)'
             # 'ok' status (buckets were present, so not "no plan data").
             $out | Should -Match '(?m)\s+ok\s*$'
             # Unofficial-endpoint footer must not leak into output.
@@ -149,9 +149,9 @@ Describe 'switch_claude_account' {
             # no longer emitted when utilization is known; a cold bucket
             # is naturally represented by its raw percent without a tail.
             $out | Should -Match '\b0%'
-            # The 5h cell has no 'in ' tail; the 7d cell does (103h).
-            $out | Should -Not -Match '0%\s+in\s'
-            $out | Should -Match '9%\s+in 10[23]h'
+            # The 5h cell has no paren tail; the 7d cell does (103h).
+            $out | Should -Not -Match '0%\s+\('
+            $out | Should -Match '9%\s+\(10[23]h\)'
         }
 
         It '401 response: status is unauthorized' {
@@ -1150,30 +1150,30 @@ Describe 'switch_claude_account' {
 
         It 'returns "in <m>m" for sub-hour ISO deltas' {
             $future = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
-            Format-ResetDelta $future | Should -Match '^in (29|30)m$'
+            Format-ResetDelta $future | Should -Match '^\(29|30\)m$'
         }
 
         It 'returns "in <h>h <m>m" for 1-23 hour ISO deltas (minute precision kept)' {
             $future = [DateTimeOffset]::UtcNow.AddHours(2).AddMinutes(14).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
-            Format-ResetDelta $future | Should -Match '^in 2h 1[34]m$'
+            Format-ResetDelta $future | Should -Match '^\(2h 1[34]m\)$'
         }
 
         It 'returns "in <h>h" (integer total hours) for >=24h ISO deltas' {
             $future = [DateTimeOffset]::UtcNow.AddHours(42).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
-            Format-ResetDelta $future | Should -Match '^in 4[12]h$'
+            Format-ResetDelta $future | Should -Match '^\(4[12]h\)$'
         }
 
         It 'returns "in <h>h" for multi-day ISO deltas (no days unit)' {
             $future = [DateTimeOffset]::UtcNow.AddDays(4).AddHours(7).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
             # 4d 7h = 103h; test elapsed time may trim a minute so 102 or 103.
-            Format-ResetDelta $future | Should -Match '^in 10[23]h$'
+            Format-ResetDelta $future | Should -Match '^\(10[23]h\)$'
             # And definitely not the old "Xd Yh" format.
             Format-ResetDelta $future | Should -Not -Match 'd '
         }
 
         It 'accepts a pre-parsed DateTimeOffset value too (defensive)' {
             $future = [DateTimeOffset]::UtcNow.AddMinutes(45)
-            Format-ResetDelta $future | Should -Match '^in 4[45]m$'
+            Format-ResetDelta $future | Should -Match '^\(4[45]m\)$'
         }
     }
 

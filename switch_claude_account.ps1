@@ -1522,8 +1522,8 @@ function Get-SlotProfile {
 #   null / empty / parse fail        -> '—' (defensive: never throws)
 #   timestamp in the past            -> 'now'
 #   < 1 hour                         -> 'in 42m'
-#   >= 1 hour and < 24 hours         -> 'in 2h 14m'   (minute precision matters in the session window)
-#   >= 24 hours                      -> 'in 42h'      (integer total hours; minutes are noise at weekly scale)
+#   >= 1 hour and < 24 hours         -> '(2h 14m)'    (minute precision matters in the session window)
+#   >= 24 hours                      -> '(42h)'       (integer total hours; minutes are noise at weekly scale)
 function Format-ResetDelta {
     Param ($ResetsAt)
 
@@ -1551,13 +1551,13 @@ function Format-ResetDelta {
     if ($delta.TotalHours -ge 24) {
         # Total hours, floor — at this scale minutes would only add noise.
         $h = [int][math]::Floor($delta.TotalHours)
-        return "in ${h}h"
+        return "(${h}h)"
     }
 
     $h = [int]$delta.Hours
     $m = [int]$delta.Minutes
-    if ($h -gt 0) { return "in ${h}h ${m}m" }
-    return "in ${m}m"
+    if ($h -gt 0) { return "(${h}h ${m}m)" }
+    return "(${m}m)"
 }
 
 # Render an ISO-8601 reset timestamp as an absolute wall-clock time in the
@@ -1675,9 +1675,9 @@ function Format-SlotIdentity {
 # for the summary table. Layout rules:
 #   null utilization, any reset     -> '   —'                (no data at all)
 #   numeric utilization, null reset -> ' 34%'                (cold bucket, no active window)
-#   numeric utilization, reset      -> ' 34% in 2h 14m'      (normal row)
+#   numeric utilization, reset      -> ' 34% (2h 14m)'     (normal row)
 # Width is variable because reset deltas range from 'now' (3 chars) to
-# 'in 103h' (7 chars) to 'in 2h 14m' (9 chars); the table's column
+# '(103h)' (6 chars) to '(2h 14m)' (8 chars); the table's column
 # width is computed from the widest cell per invocation.
 function Format-BucketCell {
     Param (
@@ -1886,7 +1886,7 @@ function Format-AggregateBars {
 #   *  Slot    Account                      Session         Week         Status
 #
 # - `Session` / `Week` cells merge utilization and reset delta into one
-#   string ('100% in 2h 37m'); width auto-fits to the widest cell in the batch.
+#   string ('100% (2h 37m)'); width auto-fits to the widest cell in the batch.
 # - `Account` renders the slot's filename-encoded email, middle-truncated
 #   at $Script:AccountColumnMaxWidth. Slots with no email (offline save)
 #   or whose email equals the slot name (dedup form) render as '—'.
