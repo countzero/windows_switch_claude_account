@@ -1474,6 +1474,12 @@ function Format-ListTable {
             Write-Host ($fmt -f $entry.Marker, $entry.Name, $entry.Account)
         }
     }
+
+    # Trailing blank line so the table has breathing room before the
+    # next prompt (or before any advisory the caller emits below). Mirrors
+    # Format-UsageFrame's footer behavior — both `sca list` / `sca switch`
+    # / `sca usage` now end with a blank line so the views look consistent.
+    Write-Host ''
 }
 
 # Render the full response for a single slot in verbose form. Used when
