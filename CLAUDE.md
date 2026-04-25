@@ -212,6 +212,12 @@ Run the suite:
 pwsh -NoProfile -File tests/Invoke-Tests.ps1
 ```
 
+Run a single test or context by name (`-FullNameFilter` is a wildcard/regex against the full `Describe > Context > It` path):
+
+```powershell
+pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pester -Path tests/ -FullNameFilter '*Get-SafeName*' -Output Detailed"
+```
+
 The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode — findings are printed but never fail the run.
 
 Tests sandbox `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`, so the real profile and real `.claude` directory are never touched.
