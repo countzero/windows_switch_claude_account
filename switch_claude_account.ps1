@@ -716,13 +716,16 @@ function Invoke-SwitchAction {
     }
     New-Item -ItemType HardLink -Path $CredFile -Target $slot.Path | Out-Null
 
-    # Yellow header line — matches the `[List] Saved slots` / `[Usage]
-    # Plan usage per slot` convention so all three actions present a
-    # consistent table-header look. No trailing period: this is a
-    # header, not a complete sentence (matches `[List] Saved slots`
-    # and `[Usage] Plan usage per slot` style).
+    # DarkYellow header line — matches the `[List] Saved slots` /
+    # `[Usage] Plan usage per slot` convention so all three actions
+    # present a consistent table-header look. No trailing period: this
+    # is a header, not a complete sentence (matches `[List] Saved slots`
+    # and `[Usage] Plan usage per slot` style). DarkYellow is reserved
+    # for section titles; plain Yellow is reserved for advisories /
+    # warnings (the locked-active, no-active-match, and single-slot
+    # no-op branches above keep their Yellow on purpose).
     $toIdent = Format-SlotIdentity -Name $slot.Name -Email $slot.Email
-    Write-Host "[Switch] Switched to $toIdent" -ForegroundColor "Yellow"
+    Write-Host "[Switch] Switched to $toIdent" -ForegroundColor "DarkYellow"
 
     # Render the saved-slot table beneath the success line so the user
     # sees the new active slot in context (the `*` marker now points at
@@ -1554,7 +1557,7 @@ function Format-UsageTable {
     # + 2 + statusW.
     $totalLineWidth = 2 + 1 + 1 + $nameW + 2 + $acctW + 2 + $fiveW + 2 + $sevenW + 2 + $statusW
 
-    Write-Host "[Usage] Plan usage per slot" -ForegroundColor "Yellow"
+    Write-Host "[Usage] Plan usage per slot" -ForegroundColor "DarkYellow"
     Write-Host ''
     # Aggregate bars sit between the post-header blank and the column
     # header. Format-AggregateBars emits per bar: 'bar line' + blank,
@@ -1588,7 +1591,7 @@ function Format-ListTable {
         # When set, skip the `[List] Saved slots` header and the leading
         # blank line. Used by Invoke-SwitchAction so the table renders
         # cleanly under the switch's own success line without a redundant
-        # second yellow header.
+        # second DarkYellow header.
         [switch]   $SuppressHeader
     )
 
@@ -1618,7 +1621,7 @@ function Format-ListTable {
     $fmt = "  {0} {1,-$nameW}  {2}"
 
     if (-not $SuppressHeader) {
-        Write-Host "[List] Saved slots" -ForegroundColor "Yellow"
+        Write-Host "[List] Saved slots" -ForegroundColor "DarkYellow"
         Write-Host ''
     }
     Write-Host ($fmt -f ' ',  'Slot',         'Account')
@@ -1651,7 +1654,7 @@ function Format-UsageVerbose {
     Param ([object] $Result)
 
     $name = $Result.Name
-    Write-Host "[Usage] Slot '$name'$(if ($Result.IsActive) { ' (active)' })" -ForegroundColor "Yellow"
+    Write-Host "[Usage] Slot '$name'$(if ($Result.IsActive) { ' (active)' })" -ForegroundColor "DarkYellow"
 
     # Surface the OAuth account email whenever we could resolve it, so the
     # verbose drill-down answers the "which account is this?" question

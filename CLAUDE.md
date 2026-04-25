@@ -25,7 +25,7 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 | Action     | Requires name | What it does |
 |------------|---------------|--------------|
 | `save`     | Yes           | Copies `.credentials.json` → `.credentials.<name>.json`, then re-links `.credentials.json` as a hardlink to the new slot. Subsequent token refreshes flow into the saved slot. |
-| `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Output is a yellow header line `[Switch] Switched to '<slot>' (<email>)` (no trailing period — matches the `[List]` / `[Usage]` header style), followed by the saved-slot table (same shape as `sca list`, header suppressed), and a cyan `[Info] Close and restart Claude Code to apply.` hint as the last line. Yellow advisories appear above the success line for the locked-active and no-active-detected edge cases; the single-slot-already-active no-op prints its yellow advisory and skips the success line, the table, and the `[Info]` hint. |
+| `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Output is a DarkYellow header line `[Switch] Switched to '<slot>' (<email>)` (no trailing period — matches the `[List]` / `[Usage]` header style), followed by the saved-slot table (same shape as `sca list`, header suppressed), and a cyan `[Info] Close and restart Claude Code to apply.` hint as the last line. Yellow advisories appear above the success line for the locked-active and no-active-detected edge cases; the single-slot-already-active no-op prints its yellow advisory and skips the success line, the table, and the `[Info]` hint. |
 | `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape and reuses `Format-AccountCell`, so account dedup and middle-truncation are identical across the two views. Pure offline render — no network IO. |
 | `remove`   | Yes           | Deletes a named slot |
 | `usage`    | Optional      | Calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens in place (hardlink-preserving). Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block including opus / sonnet / overage buckets. |
@@ -38,6 +38,17 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 The profile install/uninstall uses marker comments (`# === Claude Account Switcher ===`) to isolate its block. When modifying `Add-To-Profile` or `Remove-From-Profile`, keep these markers intact.
 
 The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }` so tests can dot-source the script without triggering a live run. Each action body (`save`, `switch`, `list`, `remove`, `usage`) is extracted into an `Invoke-*Action` function so tests can call it directly. Keep this shape when adding new actions — put the body in `Invoke-<Action>Action` and add a one-line dispatch to `Invoke-Main`.
+
+### Color conventions
+
+- **DarkYellow** is reserved for **section-title headers**: `[Usage] Plan usage per slot`, `[Usage] Slot '<name>'`, `[List] Saved slots`, and `[Switch] Switched to <ident>`. These are the four lines that introduce a block of data (a table or a verbose detail view).
+- **Yellow** is reserved for **advisories / warnings**: rate-limit notices, hardlink-broken warnings, locked-active and no-active-match branches in `switch`, save-time profile-fetch failures, `-interval` clamping, etc. Anything yellow means "attention required", never "this is a header".
+- **Green** marks success on actions that just produced a useful side effect (`[Save] Saved …`, `[Install] Installed!`).
+- **Red** marks completion of destructive actions (`[Remove] Removed …`, `[Uninstall] Uninstalled.`).
+- **Cyan** marks information hints, currently just `[Info] Close and restart Claude Code to apply.` under the `switch` action's table.
+- **DarkGray** is for dimmed metadata (account row in the verbose view, "no plan-usage data" fallback, watch-mode footer).
+
+The DarkYellow choice tracks the warm amber `#ffcb6b` used for `warning` / `info` in OpenCode's material theme. PowerShell's `Write-Host -ForegroundColor` is restricted to the 16-value `ConsoleColor` enum and cannot hit truecolor; `DarkYellow` renders as warm amber/mustard in modern terminals (Windows Terminal Campbell ≈`#C19C00`, VS Code, Alacritty) and is the closest hue match within the palette. The split also restores a visual distinction between header and warning, which both used to be plain `Yellow`.
 
 ## Unofficial endpoints (`usage` action)
 
@@ -145,7 +156,7 @@ When no eligible rows exist (zero saved slots HTTP-ok), `Format-AggregateBars` e
 
 ### List table layout (`sca list`)
 
-`Format-ListTable` renders 2 data columns (plus the leading `*` active marker): `Slot | Account`. Mirrors `Format-UsageTable`'s shape so the two views look like siblings — same header style (`[List] Saved slots` in yellow), same active-marker conventions (`*` only, no trailing `(active)` text; the row is colored Green when active), same `Format-AccountCell` truncation (`—` for unlabeled / dedup-form slots, middle-truncated email otherwise).
+`Format-ListTable` renders 2 data columns (plus the leading `*` active marker): `Slot | Account`. Mirrors `Format-UsageTable`'s shape so the two views look like siblings — same header style (`[List] Saved slots` in DarkYellow), same active-marker conventions (`*` only, no trailing `(active)` text; the row is colored Green when active), same `Format-AccountCell` truncation (`—` for unlabeled / dedup-form slots, middle-truncated email otherwise).
 
 Pure offline render — no network calls. `Invoke-ListAction` only produces a network call indirectly if the user later re-runs `sca usage`. The hardlink-broken / `ActiveLocked` advisories are printed below the table (matching `Format-UsageFrame`'s ordering: data first, advisories below).
 
@@ -153,7 +164,7 @@ The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as
 
 ### Switch action output
 
-`Invoke-SwitchAction` emits a yellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line, so the user reads "what just happened" at a glance and immediately sees the new active slot in context (via the `*` marker on the just-activated row). The retired rotation banner is gone — the table beneath conveys the transition implicitly.
+`Invoke-SwitchAction` emits a DarkYellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line, so the user reads "what just happened" at a glance and immediately sees the new active slot in context (via the `*` marker on the just-activated row). The retired rotation banner is gone — the table beneath conveys the transition implicitly.
 
 ```
 [Switch] Switched to 'slot-1' (ada.lovelace@arpa.net)
@@ -166,8 +177,8 @@ The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as
 [Info] Close and restart Claude Code to apply.
 ```
 
-- **Success line**: yellow header, matches the `[List] Saved slots` / `[Usage] Plan usage per slot` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence (same style as `[List] Saved slots`).
-- **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-completed hardlink swap. `-SuppressHeader` skips the `[List] Saved slots` yellow header so the table sits cleanly under the `[Switch]` line. The hardlink-broken / `ActiveLocked` advisories that `Invoke-ListAction` emits cannot fire here (the hardlink was just established by `New-Item -ItemType HardLink`).
+- **Success line**: DarkYellow header, matches the `[List] Saved slots` / `[Usage] Plan usage per slot` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence (same style as `[List] Saved slots`).
+- **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-completed hardlink swap. `-SuppressHeader` skips the `[List] Saved slots` DarkYellow header so the table sits cleanly under the `[Switch]` line. The hardlink-broken / `ActiveLocked` advisories that `Invoke-ListAction` emits cannot fire here (the hardlink was just established by `New-Item -ItemType HardLink`).
 - **`[Info]` apply hint**: cyan, last line beneath the table. Carries the "Close and restart Claude Code to apply." reminder split out of the success line so the success line stays scannable as a header. Suppressed for the single-slot no-op (nothing changed, nothing to apply).
 - **Yellow advisory branches** (printed above the success line):
   - **Locked active credentials file** (rotation only): `[Switch] Active credentials file is locked; cannot identify current slot. Rotating to <ident>.` Rotation still proceeds; the success line, table, and `[Info]` hint follow as usual.
