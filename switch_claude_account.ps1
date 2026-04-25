@@ -145,18 +145,23 @@ $Script:UtilWarnPct            = 90
 $Script:UtilLimitPct           = 100
 
 # Color thresholds for the aggregate progress bars rendered above the
-# usage table. The bars show pool-wide AVAILABLE headroom (sum of
-# remaining capacity across HTTP-ok slots), so the thresholds are
-# inverse to the per-slot utilization thresholds above:
+# usage table. The bars show pool-wide USAGE (sum of utilization across
+# HTTP-ok slots divided by N*100, equivalently the mean utilization
+# across eligible rows), so the thresholds align with the per-slot
+# UtilWarn/UtilLimit semantics above (in spirit, not in value -- pool
+# aggregates flip to red sooner because one fully-burned slot in a
+# multi-slot pool barely moves the aggregate):
 #
-#   availPct >= AggregateGreenPct   -> Green  (plenty of headroom)
-#   availPct >= AggregateYellowPct  -> Yellow (running low)
-#   otherwise                       -> Red    (pool nearly exhausted)
+#   usedPct >= AggregateRedPct      -> Red     (pool nearly exhausted)
+#   usedPct >= AggregateYellowPct   -> Yellow  (half or more burned)
+#   otherwise                       -> Green
 #
-# Defaults chosen to match the per-slot palette's intent: 50% pool
-# headroom is comfortable, below 10% is alarming.
-$Script:AggregateGreenPct      = 50
-$Script:AggregateYellowPct     = 10
+# Red anchored to UtilWarnPct (90) so 'red' carries the same near-cap
+# meaning at per-slot and pool scale; pure 100% would be a knife-edge
+# transition that fires only after the pool is already exhausted.
+# Yellow at the half-burned mark.
+$Script:AggregateRedPct        = 90
+$Script:AggregateYellowPct     = 50
 
 # Middle-truncation target for the Account column in the usage table.
 # Emails longer than this get rendered as `aaa…zzz` with an ellipsis in
@@ -717,10 +722,10 @@ function Invoke-SwitchAction {
     New-Item -ItemType HardLink -Path $CredFile -Target $slot.Path | Out-Null
 
     # DarkYellow header line — matches the `[List] Saved slots` /
-    # `[Usage] Plan usage per slot` convention so all three actions
+    # `[Usage] Plan usage` convention so all three actions
     # present a consistent table-header look. No trailing period: this
     # is a header, not a complete sentence (matches `[List] Saved slots`
-    # and `[Usage] Plan usage per slot` style). DarkYellow is reserved
+    # and `[Usage] Plan usage` style). DarkYellow is reserved
     # for section titles; plain Yellow is reserved for advisories /
     # warnings (the locked-active, no-active-match, and single-slot
     # no-op branches above keep their Yellow on purpose).
@@ -1355,23 +1360,26 @@ function Get-StatusRationale {
     }
 }
 
-# Map a pool-wide AVAILABLE-headroom percentage (0..100) to the Write-Host
-# color used by the aggregate bars. Extracted as a pure helper rather
-# than inlined so it can be unit-tested without mocking Write-Host (whose
-# parameter capture across Pester scope boundaries is fragile).
+# Map a pool-wide USAGE percentage (0..100) to the Write-Host color used
+# by the aggregate bars. Extracted as a pure helper rather than inlined
+# so it can be unit-tested without mocking Write-Host (whose parameter
+# capture across Pester scope boundaries is fragile).
 function Get-AggregateBarColor {
-    Param ([int] $AvailablePct)
+    Param ([int] $UsedPct)
 
-    if ($AvailablePct -ge $Script:AggregateGreenPct)  { return 'Green'  }
-    if ($AvailablePct -ge $Script:AggregateYellowPct) { return 'Yellow' }
-    return 'Red'
+    if ($UsedPct -ge $Script:AggregateRedPct)    { return 'Red'    }
+    if ($UsedPct -ge $Script:AggregateYellowPct) { return 'Yellow' }
+    return 'Green'
 }
 
-# Render aggregate progress bars showing pool-wide AVAILABLE headroom
-# above the usage table. Two bars: 'Session' (five_hour) and 'Week'
-# (seven_day). For each bucket the function sums per-slot utilization
-# across HTTP-ok rows, computes pool-available % as (cap - used) / cap
-# where cap = N * 100, and draws a fit-to-table-width bar.
+# Render aggregate progress bars showing pool-wide USAGE above the
+# usage table. Two bars: 'Session' (five_hour) and 'Week' (seven_day).
+# For each bucket the function sums per-slot utilization across HTTP-ok
+# rows, computes pool-used % as used / cap where cap = N * 100
+# (equivalently the mean utilization across eligible rows), and draws a
+# fit-to-table-width bar. Filled portion = used; empty portion = remaining
+# headroom -- standard progress-bar convention, matching the per-slot
+# Session/Week table cells beneath.
 #
 # Width math: bar width = TotalLineWidth - 17, floored at 8. The 17 is
 # 2 (indent) + 8 (label pad) + 1 ('[') + 1 (']') + 1 (space) + 4
@@ -1382,10 +1390,9 @@ function Get-AggregateBarColor {
 #   * Synth <active> matched (Name == $Script:ActiveSlotNameMatched)
 #     EXCLUDED — would double-count its hash-paired saved slot.
 #   * Synth <active> (unsaved) INCLUDED — separate quota pool.
-#   * Buckets with null/missing utilization counted as 0% used (full
-#     headroom contribution to that bucket's aggregate).
+#   * Buckets with null/missing utilization counted as 0% used.
 #
-# Color thresholds via $Script:AggregateGreenPct / $Script:AggregateYellowPct.
+# Color thresholds via $Script:AggregateRedPct / $Script:AggregateYellowPct.
 #
 # Output: 5 Write-Host lines (blank, Session, blank, Week, blank). When
 # no qualifying rows exist, emits nothing — the table below renders
@@ -1439,22 +1446,22 @@ function Format-AggregateBars {
                 if ($u -gt 100) { $u = 100 }
                 $usedSum += $u
             }
-            # null / missing utilization -> 0 used (full headroom contribution).
+            # null / missing utilization -> 0 used.
         }
 
-        $availSum = $cap - $usedSum
-        if ($availSum -lt 0) { $availSum = 0 }
-        $availPct = [int][math]::Round(($availSum / $cap) * 100)
+        # usedSum is in [0, cap] by construction (each $u clamped to [0,100],
+        # summed N times with cap = N*100), so no outer clamp needed here.
+        $usedPct = [int][math]::Round(($usedSum / $cap) * 100)
 
-        $filled = [int][math]::Round(($availPct / 100.0) * $barWidth)
-        if ($filled -lt 0)         { $filled = 0 }
+        $filled = [int][math]::Round(($usedPct / 100.0) * $barWidth)
+        if ($filled -lt 0)         { $filled = 0 }    # defense-in-depth
         if ($filled -gt $barWidth) { $filled = $barWidth }
 
         $bar = ('█' * $filled) + ('░' * ($barWidth - $filled))
 
-        $color = Get-AggregateBarColor -AvailablePct $availPct
+        $color = Get-AggregateBarColor -UsedPct $usedPct
 
-        $line = '  {0,-8}[{1}] {2,3}%' -f $label, $bar, $availPct
+        $line = '  {0,-8}[{1}] {2,3}%' -f $label, $bar, $usedPct
         Write-Host $line -ForegroundColor $color
         Write-Host ''
     }
@@ -1557,7 +1564,7 @@ function Format-UsageTable {
     # + 2 + statusW.
     $totalLineWidth = 2 + 1 + 1 + $nameW + 2 + $acctW + 2 + $fiveW + 2 + $sevenW + 2 + $statusW
 
-    Write-Host "[Usage] Plan usage per slot" -ForegroundColor "DarkYellow"
+    Write-Host "[Usage] Plan usage" -ForegroundColor "DarkYellow"
     Write-Host ''
     # Aggregate bars sit between the post-header blank and the column
     # header. Format-AggregateBars emits per bar: 'bar line' + blank,

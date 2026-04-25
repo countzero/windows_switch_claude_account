@@ -91,14 +91,14 @@ sca remove test-project
 sca usage
 ```
 
-Shows the 5-hour session limit ("Current session" in Claude Code's `/usage`, rendered as the `Session` column) and the 7-day weekly all-models limit ("Current week (all models)", rendered as the `Week` column) for every saved slot, as live percentages against each account's Claude.ai subscription. Two pool-wide progress bars above the table show how much aggregate headroom remains across all slots:
+Shows the 5-hour session limit ("Current session" in Claude Code's `/usage`, rendered as the `Session` column) and the 7-day weekly all-models limit ("Current week (all models)", rendered as the `Week` column) for every saved slot, as live percentages against each account's Claude.ai subscription. Two pool-wide progress bars above the table show how much aggregate quota has been used across all slots:
 
 ```
-[Usage] Plan usage per slot
+[Usage] Plan usage
 
-  Session [██████████████████████████████████████░░░░]  90%
+  Session [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  10%
 
-  Week    [████████████████████████████████░░░░░░░░░░]  76%
+  Week    [██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  24%
 
      Slot      Account  Session         Week          Status
      --------  -------  --------------  ------------  ------
@@ -107,7 +107,7 @@ Shows the 5-hour session limit ("Current session" in Claude Code's `/usage`, ren
      api-key   —          —               —           no-oauth (api key or non-claude.ai slot)
 ```
 
-Each `Session` / `Week` cell merges utilization and reset delta into one string. Deltas under 24h keep minute precision (`in 2h 11m`); at 24h and above the column switches to an integer total-hours view (`in 103h`) to stay narrow. The aggregate bars sum the AVAILABLE headroom (100 − util) across HTTP-ok slots over `N × 100%`; `90%` above means roughly 10% of the pooled session budget has been used. Bar color is green when ≥50% headroom, yellow when ≥10%, red below.
+Each `Session` / `Week` cell merges utilization and reset delta into one string. Deltas under 24h keep minute precision (`in 2h 11m`); at 24h and above the column switches to an integer total-hours view (`in 103h`) to stay narrow. The aggregate bars sum utilization across HTTP-ok slots over `N × 100%`; `10%` above means roughly 10% of the pooled session budget has been used. Bar color is green below 50% used, yellow at 50–89%, red at 90% or above.
 
 Drill into a single slot for absolute reset times in your local timezone:
 
@@ -132,11 +132,11 @@ Slot names are user-assigned labels; nothing stops you from naming a slot `work`
 `sca usage` and `sca list` then surface the email inline in an `Account` column whenever it adds information:
 
 ```
-[Usage] Plan usage per slot
+[Usage] Plan usage
 
-  Session [█████████████████████████████████████████████████████░░░░░░░░░░░░]  82%
+  Session [████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  18%
 
-  Week    [██████████████████████████████████████████████████████████░░░░░░░]  90%
+  Week    [██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  10%
 
      Slot               Account                Session         Week          Status
      -----------------  ---------------------  --------------  ------------  ------
@@ -159,11 +159,11 @@ If `sca save` cannot reach the profile endpoint (offline, 401, timeout), the slo
 When Claude Code rewrites `.credentials.json` via atomic rename during a token refresh, the hardlink that `sca save` / `sca switch` sets up is broken. `sca usage` detects this and adds a synthetic row so you still see the usage Claude Code is actually reporting:
 
 ```
-[Usage] Plan usage per slot
+[Usage] Plan usage
 
-  Session [█████████████████████████████████████░░░░░░░░░░░░░░░]  71%
+  Session [███████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  29%
 
-  Week    [█████████████████████████████████████████████░░░░░░░]  87%
+  Week    [███████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  13%
 
      Slot                Account  Session         Week          Status
      ------------------  -------  --------------  ------------  ------

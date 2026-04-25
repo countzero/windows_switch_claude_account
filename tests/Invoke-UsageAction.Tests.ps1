@@ -925,69 +925,69 @@ Describe 'switch_claude_account' {
             $out.Trim() | Should -BeNullOrEmpty
         }
 
-        It 'single ok slot at 30% / 40% util renders 70% / 60% available' {
+        It 'single ok slot at 30% / 40% util renders 30% / 40% used' {
             $rows = @( New-OkRow -Name 'a' -FiveUtil 30 -SevenUtil 40 )
             $out  = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
-            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+70%\s*$'
-            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+60%\s*$'
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+30%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+40%\s*$'
         }
 
-        It 'two ok slots aggregate as Sigma-used over N*100 (Session 50%, Week 75% from the doc example)' {
-            # 5h: (10+90)/200 = 50% used -> 50% available.
-            # 7d: ( 0+50)/200 = 25% used -> 75% available.
+        It 'two ok slots aggregate as Sigma-used over N*100 (Session 50%, Week 25%)' {
+            # 5h: (10+90)/200 = 50% used.
+            # 7d: ( 0+50)/200 = 25% used.
             $rows = @(
                 (New-OkRow -Name 'a' -FiveUtil 10 -SevenUtil  0)
                 (New-OkRow -Name 'b' -FiveUtil 90 -SevenUtil 50)
             )
             $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
             $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+50%\s*$'
-            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+75%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+25%\s*$'
         }
 
-        It 'null/missing buckets count as 0% used (full headroom contribution)' {
-            # 5h: (10 + 0)/200 = 5% used  -> 95% available.
-            # 7d: ( 0 + 50)/200 = 25% used -> 75% available.
+        It 'null/missing buckets count as 0% used' {
+            # 5h: (10 + 0)/200 = 5% used.
+            # 7d: ( 0 + 50)/200 = 25% used.
             $rows = @(
                 (New-OkRow -Name 'a' -FiveUtil 10)              # SevenUtil missing -> 0 used
                 (New-OkRow -Name 'b' -SevenUtil 50)             # FiveUtil missing -> 0 used
             )
             $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
-            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+95%\s*$'
-            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+75%\s*$'
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+5%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+25%\s*$'
         }
 
         It 'HTTP-failure rows are excluded from the aggregate' {
-            # Only the ok row contributes to N. 1-slot pool, 5h=20% used -> 80%.
+            # Only the ok row contributes to N. 1-slot pool, 5h=20% used.
             $rows = @(
                 (New-OkRow -Name 'good' -FiveUtil 20 -SevenUtil 30)
                 [pscustomobject]@{ Name='bad'; IsActive=$false; Status='error'; Data=$null; Error='boom'; Email=$null }
             )
             $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
-            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+80%\s*$'
-            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+70%\s*$'
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+20%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+30%\s*$'
         }
 
         It 'synth <active> matched is excluded; <active> (unsaved) is included' {
             # eligible = saved + <active> (unsaved); <active> matched
             # is dropped to avoid double-counting its hash-paired saved
             # slot.  N=2.
-            #   5h: (50 + 100)/200 = 75% used -> 25% available.
-            #   7d: ( 0 + 100)/200 = 50% used -> 50% available.
+            #   5h: (50 + 100)/200 = 75% used.
+            #   7d: ( 0 + 100)/200 = 50% used.
             $rows = @(
                 (New-OkRow -Name 'saved'              -FiveUtil  50 -SevenUtil   0)
                 (New-OkRow -Name '<active>'           -FiveUtil  50 -SevenUtil   0)
                 (New-OkRow -Name '<active> (unsaved)' -FiveUtil 100 -SevenUtil 100)
             )
             $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
-            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+25%\s*$'
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+75%\s*$'
             $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+50%\s*$'
         }
 
         It 'utilization above 100 is clamped to 100' {
-            # 7d=150% gets clamped to 100% used -> 0% available.
+            # 7d=150% gets clamped to 100% used.
             $rows = @( (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 150) )
             $out  = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
-            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+0%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+100%\s*$'
         }
 
         It 'each rendered bar line equals TotalLineWidth (fits to table edge)' {
@@ -1025,21 +1025,21 @@ Describe 'switch_claude_account' {
     Context 'Get-AggregateBarColor' {
         # Pure-helper unit tests for the aggregate bar color thresholds.
         # Runs the threshold boundaries explicitly so a future tweak of
-        # $Script:AggregateGreenPct / $Script:AggregateYellowPct shows up
+        # $Script:AggregateRedPct / $Script:AggregateYellowPct shows up
         # here as a failing test rather than a silent visual change.
-        It 'returns Green at and above AggregateGreenPct (50% by default)' {
-            Get-AggregateBarColor -AvailablePct 100 | Should -Be 'Green'
-            Get-AggregateBarColor -AvailablePct  50 | Should -Be 'Green'
+        It 'returns Green below AggregateYellowPct (50%)' {
+            Get-AggregateBarColor -UsedPct  0 | Should -Be 'Green'
+            Get-AggregateBarColor -UsedPct 49 | Should -Be 'Green'
         }
 
-        It 'returns Yellow between AggregateYellowPct (10%) and AggregateGreenPct-1 (49%)' {
-            Get-AggregateBarColor -AvailablePct 49 | Should -Be 'Yellow'
-            Get-AggregateBarColor -AvailablePct 10 | Should -Be 'Yellow'
+        It 'returns Yellow between AggregateYellowPct (50%) and AggregateRedPct-1 (89%)' {
+            Get-AggregateBarColor -UsedPct 50 | Should -Be 'Yellow'
+            Get-AggregateBarColor -UsedPct 89 | Should -Be 'Yellow'
         }
 
-        It 'returns Red below AggregateYellowPct (under 10%)' {
-            Get-AggregateBarColor -AvailablePct 9 | Should -Be 'Red'
-            Get-AggregateBarColor -AvailablePct 0 | Should -Be 'Red'
+        It 'returns Red at and above AggregateRedPct (90%)' {
+            Get-AggregateBarColor -UsedPct  90 | Should -Be 'Red'
+            Get-AggregateBarColor -UsedPct 100 | Should -Be 'Red'
         }
     }
 
@@ -1073,12 +1073,12 @@ Describe 'switch_claude_account' {
             $rows = @( (New-OkRow -Name 'alpha') )
             $out  = Format-UsageTable -Results $rows -IncludeAggregateBars 6>&1 | Out-String
 
-            $out | Should -Match '\[Usage\] Plan usage per slot'
+            $out | Should -Match '\[Usage\] Plan usage'
             $out | Should -Match '(?m)^\s+Session\s*\['
             $out | Should -Match '(?m)^\s+Week\s*\['
 
             # Order: header < Session bar < Week bar < column header.
-            $iHeader  = $out.IndexOf('[Usage] Plan usage per slot')
+            $iHeader  = $out.IndexOf('[Usage] Plan usage')
             $iSession = $out.IndexOf('Session [')
             $iWeek    = $out.IndexOf('Week    [')
             $iSlotCol = ($out -split "`r?`n" | ForEach-Object { if ($_ -match '^\s+Slot\s+Account') { $_ } } | Select-Object -First 1)

@@ -41,7 +41,7 @@ The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvo
 
 ### Color conventions
 
-- **DarkYellow** is reserved for **section-title headers**: `[Usage] Plan usage per slot`, `[Usage] Slot '<name>'`, `[List] Saved slots`, and `[Switch] Switched to <ident>`. These are the four lines that introduce a block of data (a table or a verbose detail view).
+- **DarkYellow** is reserved for **section-title headers**: `[Usage] Plan usage`, `[Usage] Slot '<name>'`, `[List] Saved slots`, and `[Switch] Switched to <ident>`. These are the four lines that introduce a block of data (a table or a verbose detail view).
 - **Yellow** is reserved for **advisories / warnings**: rate-limit notices, hardlink-broken warnings, locked-active and no-active-match branches in `switch`, save-time profile-fetch failures, `-interval` clamping, etc. Anything yellow means "attention required", never "this is a header".
 - **Green** marks success on actions that just produced a useful side effect (`[Save] Saved …`, `[Install] Installed!`).
 - **Red** marks completion of destructive actions (`[Remove] Removed …`, `[Uninstall] Uninstalled.`).
@@ -119,22 +119,22 @@ A row flagged `limited 5h` / `limited 7d` / `limited` cannot serve new prompts u
 
 ### Aggregate progress bars
 
-Above the summary table, `sca usage` (no slot name) renders two pool-wide AVAILABLE-headroom progress bars — one for `Session` (5h), one for `Week` (7d) — emitted by `Format-AggregateBars` from inside `Format-UsageTable` when the `-IncludeAggregateBars` switch is set. The switch is set by `Format-UsageFrame` for the table view; it is intentionally NOT set by `Format-UsageVerbose`'s non-ok fallback (single-slot drill-down is off-topic for a pool summary).
+Above the summary table, `sca usage` (no slot name) renders two pool-wide USAGE progress bars — one for `Session` (5h), one for `Week` (7d) — emitted by `Format-AggregateBars` from inside `Format-UsageTable` when the `-IncludeAggregateBars` switch is set. The switch is set by `Format-UsageFrame` for the table view; it is intentionally NOT set by `Format-UsageVerbose`'s non-ok fallback (single-slot drill-down is off-topic for a pool summary).
 
-Layout: a blank line, the Session bar, a blank line, the Week bar, a blank line — then the existing column header. Visual:
+Layout: a blank line, the Session bar, a blank line, the Week bar, a blank line — then the existing column header. Filled portion = used; empty portion = remaining headroom. Standard progress-bar convention, matching the per-slot `Session` / `Week` table cells beneath which already display utilization. Visual:
 
 ```
-[Usage] Plan usage per slot
+[Usage] Plan usage
 
-  Session [█████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  48%
+  Session [█████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░]  52%
 
-  Week    [█████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  64%
+  Week    [████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  36%
 
      Slot    Account              Session         Week          Status
      ...
 ```
 
-**Aggregation formula**. For each bucket: `usedTotal = Σ min(util, 100)` over eligible rows (clamped to handle stray >100 utilization values from the API); `cap = N * 100`; `availPct = round((cap - usedTotal) / cap * 100)`. Buckets with `null` / missing utilization contribute `0` used (full headroom).
+**Aggregation formula**. For each bucket: `usedTotal = Σ min(util, 100)` over eligible rows (per-row clamp to handle stray >100 utilization values from the API); `cap = N * 100`; `usedPct = round(usedTotal / cap * 100)` (equivalently the mean utilization across eligible rows). Buckets with `null` / missing utilization contribute `0` used. `usedTotal` is in `[0, cap]` by construction, so no outer clamp is needed before the rounding step.
 
 **Slot-inclusion rule**:
 - Status `'ok'` only — HTTP-failure rows have no usable data.
@@ -144,9 +144,11 @@ Layout: a blank line, the Session bar, a blank line, the Week bar, a blank line 
 **Width**: bar fits to table edge. `barWidth = TotalLineWidth − 17`, floored at 8. The 17 is the per-line fixed overhead: 2 (indent) + 8 (label pad) + `[`+`]` + space + `"NNN%"` (4). `Format-UsageTable` computes `TotalLineWidth` after its column-width loop and passes it to `Format-AggregateBars`. The 8-char floor keeps narrow 1-slot tables visually meaningful — the bar line will be wider than `TotalLineWidth` in that degenerate case but never collapses to `[]`.
 
 **Color** via `Get-AggregateBarColor`:
-- `availPct ≥ $Script:AggregateGreenPct` (50) → Green
-- `availPct ≥ $Script:AggregateYellowPct` (10) → Yellow
-- otherwise → Red
+- `usedPct ≥ $Script:AggregateRedPct` (90) → Red
+- `usedPct ≥ $Script:AggregateYellowPct` (50) → Yellow
+- otherwise → Green
+
+`AggregateRedPct` is anchored to `UtilWarnPct` (90) so "red" carries the same near-cap meaning at per-slot and pool scale; pure `100` would be a knife-edge transition that fires only after the pool is already exhausted. `AggregateYellowPct = 50` is the half-burned mark. There is no `AggregateGreenPct` — the "else" branch is Green by definition; three constants for two thresholds would be one too many.
 
 `Get-AggregateBarColor` is a pure helper extracted specifically so the threshold logic is unit-testable without mocking `Write-Host` (Pester's parameter-capture across mock scope boundaries was unreliable in practice).
 
@@ -177,7 +179,7 @@ The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as
 [Info] Close and restart Claude Code to apply.
 ```
 
-- **Success line**: DarkYellow header, matches the `[List] Saved slots` / `[Usage] Plan usage per slot` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence (same style as `[List] Saved slots`).
+- **Success line**: DarkYellow header, matches the `[List] Saved slots` / `[Usage] Plan usage` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence (same style as `[List] Saved slots`).
 - **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-completed hardlink swap. `-SuppressHeader` skips the `[List] Saved slots` DarkYellow header so the table sits cleanly under the `[Switch]` line. The hardlink-broken / `ActiveLocked` advisories that `Invoke-ListAction` emits cannot fire here (the hardlink was just established by `New-Item -ItemType HardLink`).
 - **`[Info]` apply hint**: cyan, last line beneath the table. Carries the "Close and restart Claude Code to apply." reminder split out of the success line so the success line stays scannable as a header. Suppressed for the single-slot no-op (nothing changed, nothing to apply).
 - **Yellow advisory branches** (printed above the success line):
