@@ -28,7 +28,7 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 | `switch`   | Optional      | Replaces `.credentials.json` with a hardlink to `.credentials.<name>.json`. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). |
 | `list`     | No            | Lists saved slot names |
 | `remove`   | Yes           | Deletes a named slot |
-| `usage`    | Optional      | Calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens in place (hardlink-preserving). Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 30) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block including opus / sonnet / overage buckets. |
+| `usage`    | Optional      | Calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens in place (hardlink-preserving). Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block including opus / sonnet / overage buckets. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile |
 | `uninstall`| No            | Removes wrapper function + aliases from profile |
 | `help`     | No            | Shows detailed help |
@@ -140,25 +140,22 @@ Each per-slot entry carries the same fields as before plus a `plan_status` strin
 
 ### Watch mode (`sca usage -watch`)
 
-`Invoke-UsageWatch` provides a self-refreshing live view of the usage table or verbose view. It re-polls the endpoint every `-interval` seconds (default **30 s**, floor **30 s**) and redraws the frame once per second so reset deltas (`in 2h 37m`) and the countdown footer tick visibly between polls.
+`Invoke-UsageWatch` provides a self-refreshing live view of the usage table or verbose view. It re-polls the endpoint every `-interval` seconds (default **60 s**, floor **60 s**) and redraws the frame once per second so reset deltas (`in 2h 37m`) and the countdown footer tick visibly between polls.
 
 Design split driven by the watch loop:
 
 - **`Get-UsageSnapshot`** is the pure data-gathering function: enumerates slots, calls `Get-SlotUsage` (and `Get-SlotProfile` for the synth row), and returns `{ Results, HardlinkBroken, MatchedSlotName, NoSlots, HasSynthRow }`. Never renders. The one-shot path and the watch loop both call it.
 - **`Format-UsageFrame`** is the pure renderer: takes a snapshot plus an optional footer string and prints table-or-verbose + optional hardlink advisory + footer. Used identically from both entry points, so the frame shape is asserted by the suite and the watch loop automatically inherits every rendering guarantee.
-- **`Invoke-UsageWatch`** is the loop itself. Untested — its behavior is `Clear-Host` + `Format-UsageFrame` on a 1-second tick with 50 ms inner-loop key polling.
+- **`Invoke-UsageWatch`** is the loop itself. Untested — its behavior is `Clear-Host` + `Format-UsageFrame` on a 1-second `Start-Sleep` tick. No keyboard input handling: Ctrl-C terminates via the runtime's default handler, and the `finally` block restores `[Console]::CursorVisible`.
 
 Runtime guards (both throw, neither runs the loop):
 
 - `-watch -json` — mutually exclusive; `-watch` is interactive, `-json` is for scripting.
 - `[Console]::IsOutputRedirected` — `sca usage -watch > file.txt` is refused rather than silently filling the file with `Clear-Host`-shredded frames; the error message points at `-json`.
 
-Interval clamping: values below `$Script:UsageWatchMinInterval = 30` get clamped up to 30 with a one-line yellow advisory. The floor matches the default so `-interval` can only *slow* the poll — this is deliberate, the unofficial endpoint has no published rate limit and we prefer conservative cadence.
+Interval clamping: values below `$Script:UsageWatchMinInterval = 60` get clamped up to 60 with a one-line yellow advisory. The floor matches the default so `-interval` can only *slow* the poll — this is deliberate, the unofficial endpoint has no published rate limit and we prefer conservative cadence.
 
-Key bindings inside the loop:
-
-- `q`, `Esc`, or Ctrl-C → exit cleanly; the `finally` block restores `[Console]::CursorVisible` to its pre-loop value.
-- `r`, `Space` → force an immediate re-poll on the next tick (backdates the poll timestamp so the next iteration's `dueForPoll` check fires).
+Exit: Ctrl-C only. The loop installs no key listeners (no `[Console]::KeyAvailable` / `ReadKey`); the runtime's default Ctrl-C handler terminates the pipeline and PowerShell runs the `finally` block, which restores `[Console]::CursorVisible` to its pre-loop value. There is no interactive force-refresh — to bypass the poll interval, quit and re-run.
 
 Error handling: if an HTTP call fails mid-loop, the previous snapshot stays on screen and a second line appears under the footer reading `[Watch] Last poll failed: <msg> (keeping previous data; will retry on next tick)`. The hardlink-broken advisory is suppressed on redraws between polls (only shown on freshly-polled frames) so the warning does not flash every second.
 

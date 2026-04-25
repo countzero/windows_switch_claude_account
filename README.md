@@ -76,7 +76,7 @@ sca usage
 Shows the 5-hour session limit ("Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit ("Current week (all models)") for every saved slot, as live percentages against each account's Claude.ai subscription:
 
 ```
-[Usage] Plan usage per slot (live from /api/oauth/usage):
+[Usage] Plan usage per slot
     Slot         5h   5h reset      7d   7d reset     Status
     --------   ----  -----------  ----  -----------  ------
     work        18%  in 2h 11m     42%  in 103h      ok
@@ -107,7 +107,7 @@ Slot names are user-assigned labels; nothing stops you from naming a slot `work`
 `sca usage` and `sca list` then surface the email on an indented second line whenever it adds information:
 
 ```
-[Usage] Plan usage per slot (live from /api/oauth/usage):
+[Usage] Plan usage per slot
     Slot                        5h   5h reset      7d   7d reset     Status
     -------------------------  ----  -----------  ----  -----------  ------
     kumkar@stadtwerk.org        31%  in 2h 14m    17%  in 42h        ok
@@ -130,7 +130,7 @@ If `sca save` cannot reach the profile endpoint (offline, 401, timeout), the slo
 When Claude Code rewrites `.credentials.json` via atomic rename during a token refresh, the hardlink that `sca save` / `sca switch` sets up is broken. `sca usage` detects this and adds a synthetic row so you still see the usage Claude Code is actually reporting:
 
 ```
-[Usage] Plan usage per slot (live from /api/oauth/usage):
+[Usage] Plan usage per slot
     Slot                        5h   5h reset      7d   7d reset     Status
     -------------------------  ----  -----------  ----  -----------  ------
     work                         5%  in 3h 00m     7%  in 120h      ok

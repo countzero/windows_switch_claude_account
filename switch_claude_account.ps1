@@ -61,16 +61,16 @@ Param (
     # -watch: render a live, self-refreshing `usage` view that polls
     # /api/oauth/usage every -interval seconds and redraws every second
     # (so reset deltas and the countdown footer tick visibly). Interactive
-    # only — exits cleanly on q / Esc / Ctrl-C. Mutually exclusive with
+    # only — exits on Ctrl-C (runtime default). Mutually exclusive with
     # -json. Ignored by other actions.
     [switch]
     $watch,
 
     # -interval: seconds between HTTP polls when -watch is set. Floor is
-    # 30 to keep the unofficial endpoint politely polled; values below 30
-    # get clamped up with a one-line notice. Defaults to 30.
+    # 60 to keep the unofficial endpoint politely polled; values below 60
+    # get clamped up with a one-line notice. Defaults to 60.
     [int]
-    $interval = 30
+    $interval = 60
 )
 
 # We are resolving the script path to reference this file when
@@ -208,15 +208,15 @@ function Show-Help {
         "  help, -h         Show this help",
         "",
         "EXAMPLES",
-        "  $cmd save work           # save current login as 'work'",
-        "  $cmd switch personal     # activate the 'personal' slot",
-        "  $cmd switch              # rotate to the next saved slot",
-        "  $cmd list                # show all slots",
-        "  $cmd remove old-acct     # delete a slot",
-        "  $cmd usage                      # show 5h + weekly usage for every slot",
-        "  $cmd usage -watch               # live refresh; 30s polls; q or Ctrl-C to quit",
-        "  $cmd usage -watch -interval 60  # slower refresh (floor is 30s)",
-        "  $cmd usage -json                # emit usage as JSON for scripting",
+        "  $cmd save slot-1          # save current login as 'slot-1'",
+        "  $cmd switch slot-2        # activate the 'slot-2' slot",
+        "  $cmd switch               # rotate to the next saved slot",
+        "  $cmd list                 # show all slots",
+        "  $cmd remove slot-1        # delete a slot",
+        "  $cmd usage                       # show 5h + weekly usage for every slot",
+        "  $cmd usage -watch                # live refresh; 60s polls; Ctrl-C to quit",
+        "  $cmd usage -watch -interval 300  # slower refresh (floor is 60s)",
+        "  $cmd usage -json                 # emit usage as JSON for scripting",
         "",
         "FILES",
         "  Active login : $CredFile",
@@ -1373,7 +1373,7 @@ function Format-UsageTable {
 
     $fmt = "  {0} {1,-$nameW}  {2,-$acctW}  {3,-$fiveW}  {4,-$sevenW}  {5}"
 
-    Write-Host "[Usage] Plan usage per slot (live from /api/oauth/usage):" -ForegroundColor "Yellow"
+    Write-Host "[Usage] Plan usage per slot" -ForegroundColor "Yellow"
     Write-Host ''
     Write-Host ($fmt -f ' ',  'Slot',         'Account',       '5h',           '7d',            'Status')
     Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW),  ('-' * $fiveW), ('-' * $sevenW), '------')
@@ -1736,15 +1736,16 @@ $Script:UsageWatchMinInterval = 60
 # Live `sca usage -watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. Interactive only — throws when output
 # is redirected because Clear-Host would poison a captured log. Exits
-# cleanly on q / Esc / Ctrl-C; r / Space forces an immediate re-poll on
-# the next tick. On HTTP failure the previous snapshot stays visible and
-# an advisory is appended to the footer so the display never blanks.
+# on Ctrl-C via the runtime's default handler; the `finally` block
+# restores [Console]::CursorVisible. On HTTP failure the previous
+# snapshot stays visible and an advisory is appended to the footer so
+# the display never blanks.
 #
 # The loop is deliberately simple: blocking Invoke-RestMethod (via
-# Get-UsageSnapshot) inside the poll step, 50 ms key-poll granularity
-# during the 1 s inter-frame sleep. A runspace-based async poll would
-# feel snappier during the HTTP call but adds substantial complexity
-# that is not worth v1's budget.
+# Get-UsageSnapshot) inside the poll step, then a plain 1 s sleep
+# between frames. A runspace-based async poll would feel snappier
+# during the HTTP call but adds substantial complexity that is not
+# worth v1's budget.
 function Invoke-UsageWatch {
     Param (
         [String] $Name,
@@ -1789,7 +1790,7 @@ function Invoke-UsageWatch {
 
             $secsToNext = [math]::Max(0, [int][math]::Ceiling($Interval - ($now - $lastPoll).TotalSeconds))
             $footerLines = @(
-                "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))  |  next in ${secsToNext}s  |  Space: refresh"
+                "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))  |  next in ${secsToNext}s"
             )
             if ($lastPollError) {
                 $footerLines += "[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next tick)"
@@ -1811,24 +1812,10 @@ function Invoke-UsageWatch {
                 Format-UsageFooter $footer
             }
 
-            # 1-second inter-frame wait, but wake every 50 ms to check for
-            # key input. 50 ms is the compromise between key-responsiveness
-            # (<100 ms feels instant) and wasted wakeups.
-            $tickEnd = [DateTime]::Now.AddSeconds(1)
-            while ([DateTime]::Now -lt $tickEnd) {
-                if ([Console]::KeyAvailable) {
-                    $k = [Console]::ReadKey($true)
-                    switch ($k.Key) {
-                        'Q'        { return }
-                        'Escape'   { return }
-                        # Force-refresh: backdate the poll timestamp so
-                        # the next iteration's `$dueForPoll` test fires.
-                        'R'        { $lastPoll = [DateTime]::MinValue }
-                        'Spacebar' { $lastPoll = [DateTime]::MinValue }
-                    }
-                }
-                Start-Sleep -Milliseconds 50
-            }
+            # 1-second inter-frame wait. Ctrl-C terminates the loop via
+            # the runtime's default handler; the surrounding `finally`
+            # block restores [Console]::CursorVisible on exit.
+            Start-Sleep -Seconds 1
         }
     }
     finally {
