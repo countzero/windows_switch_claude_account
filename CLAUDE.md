@@ -1,5 +1,12 @@
 # CLAUDE.md
 
+## Editing this file
+
+- Hard ceiling: 200 lines (Anthropic guideline; longer files reduce adherence).
+- Describe the **current** shape only. Rationale, design history, and "why not the alternative" prose belong in commit messages.
+- When you remove a design from the code, remove its references here too.
+- Per-script-only details live in `.claude/rules/script-internals.md`; test-writing conventions in `.claude/rules/tests.md`. Both are path-scoped — they auto-load only when Claude reads matching files.
+
 ## Repo structure
 
 Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`. Tests live in `tests/` and use Pester 5.
@@ -7,288 +14,61 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 ## Key facts
 
 - **Credential directory**: `%USERPROFILE%\.claude\`
-- **Active credentials**: `.credentials.json` — written by Claude Code via atomic rename on every OAuth refresh. `sca` writes it via the same atomic-rename primitive (`Set-CredentialFileAtomic`) so the file is byte-equal to the tracked slot file after every `sca save` / `sca switch` / reconcile pass. **No hardlinks are involved** (the previous design's hardlink approach was structurally broken by Claude Code's atomic-rename refreshes; replaced in v2.0.0 with state-file tracking).
-- **Claude Code config**: `%USERPROFILE%\.claude.json` (note: top-level, NOT inside `.claude\`) — Claude Code's persistent config. Its top-level `oauthAccount` block is what `/status` displays as "Email:". `sca` reads this block at save time (primary identity source — cannot drift from Claude Code's view) and writes the destination slot's captured `oauthAccount` back to it on `sca switch` (so `/status` follows the active slot). See "`~/.claude.json` ownership" below for the ownership / lock contract.
+- **Active credentials**: `.credentials.json` — written by Claude Code via atomic rename on every OAuth refresh. `sca` writes it via the same atomic-rename primitive (`Set-CredentialFileAtomic`) so the file is byte-equal to the tracked slot file after every `sca save` / `sca switch` / reconcile pass.
+- **Claude Code config**: `%USERPROFILE%\.claude.json` (top-level, NOT inside `.claude\`) — Claude Code's persistent config. Its top-level `oauthAccount` block is what `/status` displays as "Email:". `sca` reads this block at save time (primary identity source) and writes the destination slot's captured `oauthAccount` back to it on `sca switch`. See "`~/.claude.json` ownership" below.
 - **State file**: `%USERPROFILE%\.claude\.sca-state.json` — schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." Read with `Read-ScaState` (auto-migrates from a 1.x install on first read by hashing `.credentials.json` against existing slot files); written via `Update-ScaState`.
-- **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled, used only for the dedup case where slot name equals email).
-- **Identity sidecars** (v2.1.0+): `.credentials.<name>(<email>).account.json` alongside each slot file. JSON snapshot of the slot's `oauthAccount` (whitelisted: accountUuid, emailAddress, organizationUuid, displayName, organizationName) captured at save time. Restored to `~/.claude.json` on `sca switch` so Claude Code's `/status` follows the active slot. **Slots without a valid sidecar are HIDDEN from `list` / `usage` / rotation and refused by `switch`** — re-running `sca save <name>` while that slot is active recaptures the sidecar. There is no automated migration from pre-v2.1.0 installs; legacy slots become invisible until re-saved.
-- **PS version**: Requires PowerShell 7.2+ (`#Requires -Version 7.2`). Uses `$PROFILE.CurrentUserAllHosts` for the install target. The 7.2 floor (up from the original 7.0) is the version that introduced `$PSStyle.OutputRendering`, which is how no-color mode is implemented (combined with the `Write-Color` helper that emits inline ANSI SGR codes — see "Color conventions" below for the full mechanism). PS 7.0 / 7.1 are EOL; users on those versions need to upgrade.
-- **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block
+- **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled, only for the dedup case where slot name equals email).
+- **Identity sidecars**: `.credentials.<name>(<email>).account.json` alongside each slot file. JSON snapshot of the slot's `oauthAccount` (whitelisted: accountUuid, emailAddress, organizationUuid, displayName, organizationName) captured at save time. Restored to `~/.claude.json` on `sca switch`. **Slots without a valid sidecar are HIDDEN from `list` / `usage` / rotation and refused by `switch`** — re-running `sca save <name>` while that slot is active recaptures the sidecar.
+- **PS version**: Requires PowerShell 7.2+ (`#Requires -Version 7.2`). Uses `$PROFILE.CurrentUserAllHosts` for the install target. The 7.2 floor is the version that introduced `$PSStyle.OutputRendering`, used by no-color mode.
+- **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block (`# === Claude Account Switcher ===`).
 
 ## Windows-specific gotchas
 
-- **Atomic-rename writes survive an open Claude Code (for `.credentials.json` only)**. `Set-CredentialFileAtomic` calls `[System.IO.File]::Replace` / `::Move`, both of which invoke `MoveFileEx` and succeed against the FILE_SHARE_DELETE handle Claude Code keeps on `.credentials.json` while running. The retry policy is 3 attempts with 50 ms backoff to absorb transient sharing violations from antivirus / indexer scanners. **`sca save` / `sca switch` still refuse to operate while Claude Code is running** — but for a different reason: they read/write `~/.claude.json`'s `oauthAccount` block, which Claude Code keeps in an in-memory cache that may flush back and clobber our update mid-run. See "`~/.claude.json` ownership" below.
+- **Atomic-rename writes survive an open Claude Code (for `.credentials.json` only)**. `Set-CredentialFileAtomic` calls `[System.IO.File]::Replace` / `::Move`, both of which invoke `MoveFileEx` and succeed against the FILE_SHARE_DELETE handle Claude Code keeps on `.credentials.json`. Retry policy: 3 attempts with 50 ms backoff to absorb transient sharing violations from antivirus / indexer scanners. **`sca save` / `sca switch` still refuse to operate while Claude Code is running** — but for a different reason: they read/write `~/.claude.json`'s `oauthAccount` block, which Claude Code keeps in an in-memory cache that may flush back and clobber our update.
 - **Execution policy**: May need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
-- **Token expiry**: OAuth tokens refresh / expire after ~1 hour of inactivity. Without daemon the slot file is at most one Claude-Code-refresh behind the active file at any moment; the next `sca usage` or `sca switch` invocation captures the refresh into the slot via `Invoke-Reconcile`. "One refresh behind" is harmless in OAuth terms — the slot's previous refresh_token is still valid until rotated again, which Claude Code will do on its next API call. `Update-SlotTokens` (called by `sca usage` when the active slot's access token is expired) explicitly propagates the new tokens to BOTH the slot file AND `.credentials.json` so Claude Code's next call sees the latest refresh_token.
-- **Reconcile fires on usage and switch only** — not on `list` (kept as a pure offline render) or `remove`. The auto-migration path inside `Read-ScaState` handles upgrades from 1.x silently; users who have not yet reconciled see a stale `last_sync_hash` until their first `sca usage`.
-- **Cross-account swap detection**: when reconcile sees `.credentials.json` bytes differ from `state.last_sync_hash`, it identifies the live email by reading `~/.claude.json`'s `oauthAccount.emailAddress` (offline; same source Claude Code uses for `/status`). If the email matches the tracked slot's sidecar email, mirror through; if it differs, auto-save under `auto-<UTC-timestamp>(<new-email>)` instead. When `~/.claude.json` has no `oauthAccount` (rare), reconcile falls back to a `/api/oauth/profile` HTTP call. Both probes failing (offline + missing cache) is treated as "unknown new identity" and falls into the same-identity mirror branch — preserving continuity over paranoia.
-- **Name sanitization**: Invalid Windows filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and spaces are replaced with `_`. Brackets are sanitized because PowerShell's `-Path` parameter treats them as character-class wildcards; without sanitization, `sca remove foo[bar]` would silently wildcard-match unrelated slot files. Paired with `-LiteralPath` on every credential-file op as defense-in-depth.
+- **Token expiry**: OAuth tokens refresh / expire after ~1 hour of inactivity. Without a daemon, the slot file is at most one Claude-Code-refresh behind the active file at any moment; the next `sca usage` or `sca switch` invocation captures the refresh into the slot via `Invoke-Reconcile`. "One refresh behind" is harmless — the slot's previous refresh_token is still valid until rotated again. `Update-SlotTokens` (called by `sca usage` when the active slot's access token is expired) propagates new tokens to BOTH the slot file AND `.credentials.json`.
+- **Reconcile fires on usage and switch only** — not on `list` (pure offline render) or `remove`. Auto-migration from 1.x is silent inside `Read-ScaState`; users who haven't reconciled yet see a stale `last_sync_hash` until their first `sca usage`.
+- **Cross-account swap detection**: when reconcile sees `.credentials.json` bytes differ from `state.last_sync_hash`, it identifies the live email by reading `~/.claude.json`'s `oauthAccount.emailAddress`. If the email matches the tracked slot's sidecar email, mirror through; if it differs, auto-save under `auto-<UTC-timestamp>(<new-email>)`. When `~/.claude.json` has no `oauthAccount`, falls back to a `/api/oauth/profile` HTTP call. Both probes failing falls into the same-identity mirror branch.
+- **Name sanitization**: invalid Windows filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and spaces are replaced with `_`. Brackets are sanitized because PowerShell's `-Path` parameter treats them as character-class wildcards; without sanitization, `sca remove foo[bar]` would silently wildcard-match unrelated slot files. Paired with `-LiteralPath` on every credential-file op as defense-in-depth.
 
 ## Script actions
 
 | Action     | Requires name | What it does |
 |------------|---------------|--------------|
-| `save`     | Yes           | Refuses if Claude Code is running. Resolves identity from `~/.claude.json`'s `oauthAccount` (primary; offline; same source as `/status`); falls back to `/api/oauth/profile` only when the cache is empty. Both failing → refuses to save (no unlabeled-with-no-identity slots). Atomic-writes `.credentials.json` bytes into `.credentials.<name>(<email>).json` AND a paired `.credentials.<name>(<email>).account.json` sidecar with the captured `oauthAccount`. Updates `state.active_slot` and `state.last_sync_hash`. No reconcile prelude — explicit save IS the capture. |
-| `switch`   | Optional      | Refuses if Claude Code is running. Reconciles first (so a pending Claude Code refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json`, then atomic-writes the destination slot's captured `oauthAccount` (whitelisted fields only) into `~/.claude.json` so Claude Code's `/status` follows the swap. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Refuses to activate a slot that has no sidecar. Output is a DarkYellow header line `[Switch] Switched to '<slot>' (<email>)`, the saved-slot table beneath, and a cyan `[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped).` Yellow advisory above the success line for the no-active-slot rotation edge case; single-slot-already-active no-op prints its advisory and skips the success line, table, and `[Info]` hint. |
-| `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape. Pure offline render — no network IO, no reconcile, no hashing. `*` marker comes from `state.active_slot`. Slots without a valid sidecar are silently filtered out (they cannot be activated; user must re-save while active to make them visible). |
-| `remove`   | Yes           | Deletes a named slot AND its sidecar. Walks the raw filesystem (not `Get-Slots`) so sidecar-less legacy slots can be cleaned up by name. Refuses to remove the slot tracked as active in state — user must `sca switch <other>` first. |
-| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens via `Update-SlotTokens`, which propagates the new tokens to `.credentials.json` when the slot is the tracked active. Accepts `-Json` for scripted output, or `-Watch` (optional `-Interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block. |
-| `install`  | No            | Adds wrapper function + aliases to PowerShell profile |
-| `uninstall`| No            | Removes wrapper function + aliases from profile |
-| `help`     | No            | Shows detailed help |
+| `save`     | Yes           | Refuses if Claude Code is running. Resolves identity from `~/.claude.json`'s `oauthAccount` (primary, offline); falls back to `/api/oauth/profile` only when the cache is empty. Both failing → refuses. Atomic-writes `.credentials.json` bytes into `.credentials.<name>(<email>).json` AND a paired `.account.json` sidecar. Updates `state.active_slot` and `state.last_sync_hash`. No reconcile prelude — explicit save IS the capture. |
+| `switch`   | Optional      | Refuses if Claude Code is running. Reconciles first (so a pending refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json`, then atomic-writes the destination slot's captured `oauthAccount` (whitelisted fields) into `~/.claude.json`. If `<name>` omitted, rotates to the next saved slot in alphabetical order (wraps). Refuses to activate a slot with no sidecar. |
+| `list`     | No            | Renders saved slots as `Slot \| Account` table with leading active-marker column. Pure offline render — no network IO, no reconcile, no hashing. `*` marker comes from `state.active_slot`. Sidecar-less slots silently filtered out. |
+| `remove`   | Yes           | Deletes a named slot AND its sidecar. Walks the raw filesystem (not `Get-Slots`) so sidecar-less legacy slots can be cleaned by name. Refuses to remove the slot tracked as active in state. |
+| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot for 5h / 7d plan-usage percentages. Auto-refreshes expired tokens via `Update-SlotTokens`. Accepts `-Json` for scripted output, or `-Watch` (optional `-Interval <seconds>`, floor 60) for live view. With `<name>`, renders verbose single-slot block. |
+| `install`  | No            | Adds wrapper function + aliases to PowerShell profile. |
+| `uninstall`| No            | Removes wrapper function + aliases from profile. |
+| `help`     | No            | Shows detailed help. |
 
 ## Editing the script
 
 The profile install/uninstall uses marker comments (`# === Claude Account Switcher ===`) to isolate its block. When modifying `Add-To-Profile` or `Remove-From-Profile`, keep these markers intact.
 
-The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }` so tests can dot-source the script without triggering a live run. Each action body (`save`, `switch`, `list`, `remove`, `usage`) is extracted into an `Invoke-*Action` function so tests can call it directly. Keep this shape when adding new actions — put the body in `Invoke-<Action>Action` and add a one-line dispatch to `Invoke-Main`.
+The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }` so tests can dot-source the script without triggering a live run. Each action body is extracted into an `Invoke-*Action` function so tests can call it directly. New actions: put the body in `Invoke-<Action>Action`, add a one-line dispatch to `Invoke-Main`.
 
-The two credentials-touching actions that need a fresh slot file (`switch`, `usage`) call `Invoke-Reconcile` first; `save` skips reconcile (the explicit save IS the capture); `list` and `remove` skip reconcile too (`list` is a pure offline render; `remove` doesn't read slot bytes). New actions should follow the same rule: reconcile only when the slot file's bytes feed downstream logic.
+The two credentials-touching actions that need a fresh slot file (`switch`, `usage`) call `Invoke-Reconcile` first; `save` skips reconcile (the explicit save IS the capture); `list` and `remove` skip reconcile too. New actions follow the same rule: reconcile only when the slot file's bytes feed downstream logic.
 
-### Color conventions
-
-- **DarkYellow** is reserved for **section-title headers**: `[Usage] Plan usage`, `[Usage] Slot '<name>'`, `[List] Saved slots`, and `[Switch] Switched to <ident>`. These are the four lines that introduce a block of data (a table or a verbose detail view).
-- **Yellow** is reserved for **advisories / warnings**: rate-limit notices, reconcile auto-save / identity-change advisories, no-active-slot rotation branch, save-time profile-fetch failures, `-Interval` clamping, etc. Anything yellow means "attention required", never "this is a header".
-- **Green** marks success on actions that just produced a useful side effect (`[Save] Saved …`, `[Install] Installed!`).
-- **Red** marks completion of destructive actions (`[Remove] Removed …`, `[Uninstall] Uninstalled.`).
-- **Cyan** marks information hints, currently just the `[Info] Restart Claude Code …` line under the `switch` action's table.
-- **DarkGray** is for dimmed metadata (account row in the verbose view, "no plan-usage data" fallback, watch-mode footer).
-
-The DarkYellow choice tracks the warm amber `#ffcb6b` used for `warning` / `info` in OpenCode's material theme. PowerShell's `Write-Host -ForegroundColor` is restricted to the 16-value `ConsoleColor` enum and cannot hit truecolor; `DarkYellow` renders as warm amber/mustard in modern terminals (Windows Terminal Campbell ≈`#C19C00`, VS Code, Alacritty) and is the closest hue match within the palette. The split also restores a visual distinction between header and warning, which both used to be plain `Yellow`.
-
-#### No-color mode
-
-`-NoColor` (CLI switch) and `$env:NO_COLOR` (the [no-color.org](https://no-color.org) de facto industry standard) suppress every color in the table above. Both surfaces degrade gracefully: structural text, the `*` active marker, table layout, table header underlines, and bar glyphs (`█`/`░`) are preserved unchanged — only the SGR codes that would tint them are skipped.
-
-Precedence (most → least specific):
-
-1. `-NoColor` switch on the CLI
-2. `$env:NO_COLOR` set to any non-empty value
-3. otherwise: colored (default)
-
-**Mechanism (two cooperating pieces, both required):**
-
-1. **`Write-Color` helper** — single chokepoint for all colored output, defined just above `Get-SafeName` in the script. Maps our existing color names (`Yellow`, `DarkYellow`, `Green`, `Red`, `Cyan`, `Gray`, `DarkGray`) to `$PSStyle.Foreground.*` properties and wraps the message string with the corresponding ANSI SGR codes plus `$PSStyle.Reset`. Calls `Write-Host` (with optional `-NoNewline`) to emit the wrapped string. **Every colored call site in the script goes through this helper** — there is no remaining `Write-Host -ForegroundColor` in production code paths. Color name translation: PowerShell legacy `ConsoleColor` and PS7's `$PSStyle.Foreground` use opposite naming conventions (legacy "Dark*" = ANSI 30-37; legacy un-prefixed = ANSI bright 90-97), so our `DarkYellow` headers map to `$PSStyle.Foreground.Yellow`, our `Yellow` advisories map to `$PSStyle.Foreground.BrightYellow`, etc. Visually equivalent to the pre-refactor rendering on every modern terminal palette.
-
-2. **`$PSStyle.OutputRendering = 'PlainText'` toggle in `Invoke-Main`** — gated by the precedence above and wrapped in a `try/finally` that restores the prior value on exit. With the helper emitting **inline** SGR codes (in the message string, not via `Write-Host -ForegroundColor`), PowerShell's `WriteImpl(string)` routes them through `GetOutputString(value, supportsVT)`, which strips ANSI SGR sequences from the bytes when `OutputRendering = 'PlainText'`. Result: the terminal sees plain text.
-
-**Why the helper exists at all (the load-bearing detail).** On Windows, `Write-Host -ForegroundColor` does NOT emit ANSI SGR. It calls the legacy Win32 `SetConsoleTextAttribute` API — an out-of-band kernel RPC into conhost that is invisible to `$PSStyle.OutputRendering`. Verified against PS 7.6 source: `ConsoleHostUserInterface.Write(fg, bg, value, newLine)` is `RawUI.ForegroundColor = X` → `WriteImpl` → restore, with no ANSI emission anywhere. So a naive `$PSStyle.OutputRendering = 'PlainText'` toggle has zero effect on `Write-Host -ForegroundColor` calls — they keep emitting Win32 attribute changes that conhost still renders as colored cells. The helper inserts SGR codes INTO the message string so that (a) `OutputRendering = 'PlainText'` actually strips them, AND (b) the colors flow through the byte stream rather than the out-of-band Win32 channel — which is what unblocks watch-mode color rendering inside the alt screen buffer (see "Watch mode" below).
-
-The `try/finally` scope is per-`Invoke-Main` call, NOT global, so dot-sourcing the script (notably from the test suite, which calls `Invoke-*Action` directly and bypasses `Invoke-Main`) does not mutate the test runner's `$PSStyle`. `tests/Common.ps1` sets `$PSStyle.OutputRendering = 'PlainText'` once per `BeforeEach` so existing string-match assertions in the suite see ANSI-stripped output without per-test changes. The Helpers.Tests.ps1 'No-color mode' Context overrides this to 'Host' in its It bodies (with `try/finally` restore) so the toggle's gate logic can be tested meaningfully.
-
-**Watch mode is unaffected by no-color.** `Invoke-UsageWatch`'s alt-buffer / sync-mode / clear-screen / cursor-home / cursor-hide VT sequences are emitted as message bytes via `Write-Host -NoNewline`, not as SGR attributes — `$PSStyle.OutputRendering` only suppresses SGR codes. Watch mode remains fully functional in B&W; only the body's color tinting is suppressed.
-
-`FORCE_COLOR` (Node.js convention to force colors when piped) is intentionally NOT supported. PowerShell's `Write-Host` writes to the information stream (6), not stdout (1), so piping `sca` does not capture color-bearing output by default — the auto-disable-on-pipe scenario `FORCE_COLOR` exists to override doesn't apply.
+For color/output, table layout, watch-mode, and `/api/oauth/usage` schema details, see `.claude/rules/script-internals.md` (auto-loads when reading the script).
 
 ## Unofficial endpoints (`usage` action)
 
-The `usage` action depends on four pinned constants extracted from `claude.exe` 2.1.119 (a Bun-compiled binary). They live at the top of `switch_claude_account.ps1` under the `# --- Unofficial /api/oauth/usage constants ---` comment:
+The `usage` action depends on five pinned constants extracted from `claude.exe` 2.1.119 (a Bun-compiled binary). They live at the top of `switch_claude_account.ps1` under the `# --- Unofficial /api/oauth/usage constants ---` comment:
 
 - `$Script:UsageEndpoint`  — `https://api.anthropic.com/api/oauth/usage`
 - `$Script:TokenEndpoint`  — `https://platform.claude.com/v1/oauth/token`
-- `$Script:OAuthClientId`  — `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude.ai subscription flow; the other client id in the binary is for the Console API-key flow and does not accept our refresh tokens)
+- `$Script:OAuthClientId`  — `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude.ai subscription flow)
 - `$Script:AnthropicBeta`  — `oauth-2025-04-20`
 - `$Script:UsageUserAgent` — `claude-code/2.1.119`
 
-These are **undocumented and unsupported by Anthropic** — accepted tradeoff in exchange for live server-authoritative usage data. When the call starts returning 4xx after a Claude Code upgrade, re-extract from `$(Get-Command claude).Source` using the grep recipe in the script header comment, bump the constants, and re-run `tests/Invoke-Tests.ps1`. The tests mock `Invoke-RestMethod` by `$Uri` so they verify the action's *shape contract* and will not catch the constants drifting out of date — only a live call can.
+**Undocumented and unsupported by Anthropic.** When the call starts returning 4xx after a Claude Code upgrade, re-extract from `$(Get-Command claude).Source` using the grep recipe in the script header comment, bump the constants, and re-run `tests/Invoke-Tests.ps1`. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only — they will not catch the constants drifting out of date.
 
-Response schema (verified against a live Team-plan call on 2026-04-24):
+Response schema summary: `five_hour` and `seven_day` (rendered as *Session* / *Week*) carry `{ utilization: 0..100, resets_at: ISO-8601|null }`. Plus `seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal buckets that round-trip via `-Json` but are not rendered. Full schema: `.claude/rules/script-internals.md`.
 
-```jsonc
-// GET /api/oauth/usage → body
-{
-  "five_hour":            { "utilization": 0..100, "resets_at": "<ISO-8601>"|null },
-  "seven_day":            { "utilization": 0..100, "resets_at": "<ISO-8601>"|null },
-  "seven_day_opus":       null | { "utilization": ..., "resets_at": ... },
-  "seven_day_sonnet":     null | { "utilization": ..., "resets_at": ... },
-  "extra_usage": {
-    "is_enabled":    <bool>,
-    "monthly_limit": <number|null>,
-    "used_credits":  <number|null>,
-    "utilization":   <number|null>,
-    "currency":      <string|null>
-  }
-  // Plus internal/unreleased buckets that the endpoint exposes but that
-  // are null for external subscriptions: seven_day_oauth_apps,
-  // seven_day_cowork, seven_day_omelette, iguana_necktie,
-  // omelette_promotional. Format-UsageVerbose iterates $Data.PSObject.Properties
-  // so any future non-null bucket surfaces with a '? <key>' prefix without
-  // code changes.
-}
-```
-
-All branches are optional; free-tier / API-key accounts receive `{}`. The `-Json` switch emits the raw response under `data` per slot so scripts can pull any field the script itself does not format.
-
-By design the script only **renders** two buckets in both the summary table and the verbose view: `five_hour` (labelled *Session*) and `seven_day` (labelled *Week*) — matching Claude Code's own `/usage` screen's first two bars. Every other bucket the endpoint returns (`seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal codenames) still round-trips through `-Json`; it just does not have a human-readable row in the normal view. The labels were originally `Session (5h)` / `Weekly (all models)`; they were shortened to match the table column headers and the aggregate-bar labels (single visual cadence across all three surfaces).
-
-Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { used_percentage, resets_at } } }` before handing it to its status-line hook — that is the schema you will find by grepping `used_percentage` in `claude.exe`. **Do not** trust the hook-input schema for parsing the raw endpoint response; use the shape above.
-
-`Format-ResetDelta` renders the ISO string as a relative delta in the summary table (variant C: hours+minutes under 24h, integer total hours at/above 24h — e.g. `(2h 14m)`, `(103h)`). `Format-ResetAbsolute` renders it as local-tz wall-clock in the `sca usage <name>` verbose view (`Resets 7:50pm Europe/Berlin`, `Resets Apr 26, 9am Europe/Berlin`), matching Claude Code's own `/usage` display.
-
-### Summary-table layout + Status column semantics
-
-`Format-UsageTable` renders 5 data columns (plus the leading `*` active marker): `Slot | Account | Session | Week | Status`.
-
-- **Merged bucket cells**. `Session` and `Week` each combine utilization and reset delta in a single cell: `100% (2h 37m)`. A cold bucket (`utilization = 0`, `resets_at = null`) renders as just ` 0%` — the em-dash reset sentinel is only emitted when the bucket itself has no data at all. Column widths auto-fit to the widest cell in the batch. Headers were renamed from `5h` / `7d` to match the aggregate-bar labels above the table; status text such as `limited 5h` keeps the time-window shorthand because that string is also a `-Json plan_status` contract value.
-- **Account column**. Pulls the email parsed from the slot filename by `Get-SlotFileInfo`. Renders `—` for unlabeled slots and for slots whose name equals the labeled email (dedup form). Long emails are middle-truncated with `…` at `$Script:AccountColumnMaxWidth = 32` characters; the full string is always retained in `sca usage <name>` verbose view and in `-Json`. Replaces the previous `└─ email` continuation line — rows are now single-line.
-- **Status column** mixes HTTP health with plan usability. When the `/api/oauth/usage` call succeeded, `Get-PlanStatus` derives the label from the utilization values:
-
-  | State                                       | Label               | Color |
-  |---------------------------------------------|---------------------|-------|
-  | Both buckets below `$Script:UtilWarnPct`    | `ok`                | Green if active, Gray otherwise |
-  | HTTP ok but response carried no buckets     | `ok (no plan data)` | same as `ok` |
-  | Any bucket ≥ `UtilWarnPct` and all < `UtilLimitPct` | `near limit` | Yellow |
-  | 5h bucket ≥ `UtilLimitPct`                  | `limited 5h`        | Red |
-  | 7d bucket ≥ `UtilLimitPct`                  | `limited 7d`        | Red |
-  | Both buckets ≥ `UtilLimitPct`               | `limited`           | Red |
-  | HTTP 429 (token refresh OR usage endpoint), no fresh cache | `rate-limited` | Yellow |
-  | HTTP failure states                         | `expired` / `unauthorized` / `error: …` / `no-oauth (api key or non-claude.ai slot)` | Yellow / Red / Red / DarkGray |
-
-  The thresholds are script-scope constants (`$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`) next to the usage endpoint constants. `100%` is the hard cap Anthropic enforces; `90%` is the heads-up tier. `Get-StatusColor` is the single source of truth for the color mapping so the summary table and verbose view stay in lockstep.
-
-A row flagged `limited 5h` / `limited 7d` / `limited` cannot serve new prompts until the named window resets. This was previously rendered as `ok` in the old HTTP-only Status column, which was misleading — the rewrite is the reason this section exists.
-
-**429 / `rate-limited` handling**: a 429 from either `/api/oauth/usage` or `/v1/oauth/token` (the latter triggered by `Get-SlotUsage`'s pre-call refresh of an expired token) is detected by the `Test-Is429` helper and routed through the same fallback policy: serve fresh cached usage data when `$Script:SlotUsageCache` has a `<UsageCacheTTL = 10`-minute entry for the slot, otherwise return `Status='rate-limited'`. The advisory text under the table reads `Anthropic API rate limited — displaying cached data.` — endpoint-agnostic, since either call may have triggered it. Long error messages on the `'expired'` and `'error'` arms are normalized through `Format-StatusErrorTail` (whitespace collapse + 60-char cap) so a verbose underlying exception cannot wrap the row. Without this normalization, a 429 from the token endpoint used to render as a multi-line `expired: Response status code does not indicate success: 429 (Too Many Requests).` and break the table layout.
-
-### Aggregate progress bars
-
-Above the summary table, `sca usage` (no slot name) renders two pool-wide USAGE progress bars — one for `Session` (5h), one for `Week` (7d) — emitted by `Format-AggregateBars` from inside `Format-UsageTable` when the `-IncludeAggregateBars` switch is set. The switch is set by `Format-UsageFrame` for the table view; it is intentionally NOT set by `Format-UsageVerbose`'s non-ok fallback (single-slot drill-down is off-topic for a pool summary).
-
-Layout: a blank line, the Session bar, a blank line, the Week bar, a blank line — then the existing column header. Filled portion = used; empty portion = remaining headroom. Standard progress-bar convention, matching the per-slot `Session` / `Week` table cells beneath which already display utilization. Visual:
-
-```
-[Usage] Plan usage
-
-  Session [█████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░]  52%
-
-  Week    [████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  36%
-
-     Slot    Account              Session         Week          Status
-     ...
-```
-
-**Aggregation formula**. For each bucket: `usedTotal = Σ min(util, 100)` over eligible rows (per-row clamp to handle stray >100 utilization values from the API); `cap = N * 100`; `usedPct = round(usedTotal / cap * 100)` (equivalently the mean utilization across eligible rows). Buckets with `null` / missing utilization contribute `0` used. `usedTotal` is in `[0, cap]` by construction, so no outer clamp is needed before the rounding step.
-
-**Slot-inclusion rule**:
-- Status `'ok'` only — HTTP-failure rows have no usable data.
-- Buckets with `null` / missing utilization counted as 0% used.
-
-After the v2.0.0 redesign there are no synth rows in the data model, so no slot-name special cases are needed.
-
-**Width**: bar fits to table edge. `barWidth = TotalLineWidth − 17`, floored at 8. The 17 is the per-line fixed overhead: 2 (indent) + 8 (label pad) + `[`+`]` + space + `"NNN%"` (4). `Format-UsageTable` computes `TotalLineWidth` after its column-width loop and passes it to `Format-AggregateBars`. The 8-char floor keeps narrow 1-slot tables visually meaningful — the bar line will be wider than `TotalLineWidth` in that degenerate case but never collapses to `[]`.
-
-**Color** via `Get-AggregateBarColor`:
-- `usedPct ≥ $Script:AggregateRedPct` (90) → Red
-- `usedPct ≥ $Script:AggregateYellowPct` (50) → Yellow
-- otherwise → Green
-
-`AggregateRedPct` is anchored to `UtilWarnPct` (90) so "red" carries the same near-cap meaning at per-slot and pool scale; pure `100` would be a knife-edge transition that fires only after the pool is already exhausted. `AggregateYellowPct = 50` is the half-burned mark. There is no `AggregateGreenPct` — the "else" branch is Green by definition; three constants for two thresholds would be one too many.
-
-`Get-AggregateBarColor` is a pure helper extracted specifically so the threshold logic is unit-testable without mocking `Write-Host` (Pester's parameter-capture across mock scope boundaries was unreliable in practice).
-
-**Why `Write-Host`, not `Write-Progress`**: (1) `Write-Progress` lives on stream 4, which the suite's `6>&1 | Out-String` capture pattern would miss; (2) it is host-managed and transient — it would not sit inline above the table; (3) it does not compose with the synchronized-output watch redraw inside `Invoke-UsageWatch` (the loop wraps each frame in DEC mode 2026 + `ESC[2J` so every `Write-Host` line lands inside one atomic frame; `Write-Progress` writes outside that envelope and would tear). The bars use the same `Write-Host -ForegroundColor` machinery as every other rendering helper in the file.
-
-When no eligible rows exist (zero saved slots HTTP-ok), `Format-AggregateBars` emits nothing — the post-`[Usage]`-header blank line still separates the header from the column header so the table doesn't stick to the title.
-
-### List table layout (`sca list`)
-
-`Format-ListTable` renders 2 data columns (plus the leading `*` active marker): `Slot | Account`. Mirrors `Format-UsageTable`'s shape so the two views look like siblings — same header style (`[List] Saved slots` in DarkYellow), same active-marker conventions (`*` only, no trailing `(active)` text; the row is colored Green when active), same `Format-AccountCell` truncation (`—` for unlabeled / dedup-form slots, middle-truncated email otherwise).
-
-Pure offline render — no network calls, no reconcile, no hashing. `Invoke-ListAction` reads `state.active_slot` (via `Get-Slots` -> `Read-ScaState`) for the `*` marker and renders. The hardlink-broken / `ActiveLocked` advisories were deleted with the rest of the hardlink mechanism in v2.0.0; pending-state cases the old advisories warned about are now handled silently by reconcile next time the user runs `sca usage` or `sca switch`.
-
-The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as siblings rather than factored into a generic helper. With only two callers and different per-cell rules (Status / merged-bucket cells live only on the usage table, the list table has neither), an abstraction would cost more than it saves.
-
-### Switch action output
-
-`Invoke-SwitchAction` refuses if Claude Code is running, then runs `Invoke-Reconcile` first (so a pending Claude Code refresh on the outgoing active slot is captured into its slot file before we overwrite `.credentials.json`), then atomic-writes the destination slot's bytes to `.credentials.json`, then writes the destination slot's captured `oauthAccount` (whitelisted fields) into `~/.claude.json` so Claude Code's `/status` follows the swap. Output is a DarkYellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line.
-
-```
-[Switch] Switched to 'slot-1' (ada.lovelace@arpa.net)
-
-    Slot    Account
-    ------  ---------------------
-  * slot-1  ada.lovelace@arpa.net
-    slot-2  ada@arpa.net
-
-[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped).
-```
-
-- **Success line**: DarkYellow header, matches the `[List] Saved slots` / `[Usage] Plan usage` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence.
-- **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-updated `state.active_slot`. `-SuppressHeader` skips the `[List] Saved slots` DarkYellow header so the table sits cleanly under the `[Switch]` line.
-- **`[Info]` apply hint**: cyan, last line beneath the table. New wording reflects the post-v2.1.0 design: switch atomically updates BOTH `.credentials.json` (tokens) AND `~/.claude.json`'s `oauthAccount` (Email shown by `/status`), so on the next Claude Code start `/status` immediately reflects the active slot. The previous "running sessions may continue using the previous credentials" warning is retired — the refuse-while-running guard means there is no running session to worry about. Suppressed for the single-slot no-op (nothing changed, nothing to apply).
-- **`~/.claude.json` write failure** (rare: file disappeared mid-run, malformed, locked by another tool): yellow advisory `[Switch] Tokens swapped to '<name>' but ~/.claude.json oauthAccount update failed: <reason>` followed by `Claude Code's /status email may not reflect the new slot until you fix and re-run.` The credentials swap has already happened; only the email-display update failed. The user can re-run `sca switch <name>` after fixing the underlying issue.
-- **Yellow advisory branches** (printed above the success line):
-  - **Reconcile advisories** (auto-save or identity-change): emitted by `Invoke-Reconcile` itself before the switch's own output. The user sees the unusual state explained before the success line.
-  - **No active slot detected** (rotation only): `[Switch] No currently active slot detected. Rotating to <ident>.` Fires when `state.active_slot` is null or points at a missing slot file. Rotation still proceeds; the success line, table, and `[Info]` hint follow as usual.
-  - **Single-slot-already-active no-op** (rotation only): `[Switch] Only one slot (<ident>) and it is already active. Nothing to do.` Skips the success line, the table, AND the `[Info]` hint — nothing changed, no point re-rendering the unchanged state and no apply needed. Emitted by `Get-NextSlotName` itself, which then returns `$null` so the caller exits early.
-
-Slot identities are rendered via `Format-SlotIdentity`, the single source of truth for the dedup logic: returns `'<slot>' (<email>)` for labeled slots whose email differs from the slot name, and `'<slot>'` (no parens) for unlabeled or dedup-form slots. Same dedup rules as `Format-AccountCell` so the inline prose form and the table cell form stay consistent.
-
-`Get-NextSlotName`'s return shape: `{ To = { Name; Email }; HasActiveSlot = <bool> }` (or `$null` for the single-slot no-op). `HasActiveSlot` differentiates the happy path (no advisory) from the no-active-slot advisory branch. The `Locked` field was deleted with the rest of the hardlink mechanism — `Get-Slots` no longer hashes the active file, so there's no lock to detect.
-
-### Verbose view (`sca usage <slot>`)
-
-`Format-UsageVerbose` renders a single slot as a 4-line block:
-
-```
-[Usage] Slot 'slot-1'
-  Account: ada@arpa.net
-  Status:  limited 5h - no prompts until 5h window resets
-  Session    100%  Resets 7:50pm Europe/Berlin
-  Week        28%  Resets Apr 26, 9am Europe/Berlin
-```
-
-The `Status:` line sits between `Account:` and the bucket rows so the usability verdict is the first thing read. `Get-StatusRationale` supplies a short English tail for the non-obvious labels (`limited 5h`, `limited 7d`, `limited`, `near limit`, `ok (no plan data)`); plain `ok` renders without a tail.
-
-### `-Json` output
-
-Each per-slot entry carries the same fields as before plus a `plan_status` string when the HTTP call succeeded:
-
-```jsonc
-{
-  "slot-1": {
-    "status":             "ok",
-    "is_active":          false,
-    "plan_status":        "limited 5h",   // absent for HTTP-failure rows
-    "is_cached_fallback": true,           // present (and true) only when the row was served from $Script:SlotUsageCache after a 429; absent otherwise
-    "account":            { "email": "ada@arpa.net" },
-    "data":               { /* raw /api/oauth/usage body */ }
-  }
-}
-```
-
-`plan_status` values match the Status column labels verbatim so scripts can branch on usability without re-deriving the thresholds. The full untruncated email always lives in `account.email`, regardless of the summary table's truncation width. `is_cached_fallback` is the JSON-side signal of the same condition the `Anthropic API rate limited — displaying cached data.` advisory surfaces in the human view; absence means the data was fetched live for this run.
-
-### Watch mode (`sca usage -Watch`)
-
-`Invoke-UsageWatch` provides a self-refreshing live view of the usage table or verbose view. It re-polls the endpoint every `-Interval` seconds (default **60 s**, floor **60 s**) and redraws the frame once per second so reset deltas (`(2h 37m)`) and the countdown footer tick visibly between polls.
-
-**Flicker-free rendering.** The loop enters the alternate screen buffer (`ESC[?1049h`) and hides the cursor (`ESC[?25l`) on entry; the `finally` block restores both on Ctrl-C. Each frame is wrapped in DEC mode 2026 (synchronized output: `ESC[?2026h` … `ESC[?2026l`) with `ESC[2J` + cursor-home (`ESC[H`) at the start, then the existing `Format-UsageFrame` renderer is called unchanged. Inside the sync envelope the terminal buffers the clear-and-redraw and presents one atomic frame, so the user never sees the intermediate "blank screen" frame that the prior `Clear-Host` produced. Terminals that support DEC 2026 (Windows Terminal ≥ v1.13, VS Code, iTerm2 ≥ 3.4.13, kitty, alacritty, WezTerm, foot, gnome-terminal/vte, mintty, modern ConHost) render flicker-free; older terminals silently ignore the unknown DEC private mode and exhibit the previous `Clear-Host`-style flicker (no regression). Renderer functions (`Format-UsageFrame`, `Format-UsageTable`, `Format-AggregateBars`, `Format-UsageVerbose`, `Format-UsageFooter`) are untouched — only `Invoke-UsageWatch` emits the wrapper sequences, so the one-shot `sca usage` / `sca list` / `sca switch` paths are unaffected.
-
-**Unified write path.** Every VT control sequence in the watch lifecycle (alt-buffer enter/leave, cursor hide/show, sync-mode start/end, clear screen, cursor home) is emitted via `Write-Host -NoNewline`, NOT via `[Console]::Out.Write`. Both ultimately reach the same underlying `Console.Out` writer, so this is NOT a flush-ordering fix — `Write-Host` just additionally takes the host's `_instanceLock`, providing a small serialization improvement against any concurrent host-driven writes (prompt rendering, debug output). The actual watch-mode B&W bug was elsewhere — see "What actually broke watch-mode colors" below.
-
-**What actually broke watch-mode colors.** `Write-Host -ForegroundColor` on Windows uses the legacy Win32 `SetConsoleTextAttribute` API (a kernel-level RPC into conhost), which is **out-of-band** from the stdout byte stream. The text bytes go through `Console.Out.Write`; the attribute set/restore happens on a separate channel. Inside the DEC 2026 sync envelope plus the alternate screen buffer, conhost's per-cell attribute state and the buffered byte stream don't align — the cells get written under "default" attributes because the `SetConsoleTextAttribute` calls don't land inside the sync envelope. Result: B&W body text inside watch mode while the alt-buffer and clear-screen sequences themselves work fine.
-
-The fix lives entirely in the `Write-Color` helper (see "Color conventions" above): it emits SGR codes **inside the message string** rather than through `-ForegroundColor`. The SGR bytes flow through `Console.Out.Write` like any other text and sit inside the sync envelope correctly. The fix is identical to the no-color mechanism — both reduce to "put SGR codes in the byte stream and let PowerShell's existing `GetOutputString` / terminal pipeline handle them." Renderer functions (`Format-UsageFrame`, `Format-UsageTable`, `Format-AggregateBars`, `Format-UsageVerbose`, `Format-UsageFooter`) are untouched at the rendering level — `Write-Color` is a drop-in replacement for `Write-Host -ForegroundColor` and the call sites within them changed mechanically. So one-shot `sca usage` / `sca list` / `sca switch` paths inherit the same color-emission strategy as watch mode, which is the desired uniformity.
-
-Design split driven by the watch loop:
-
-- **`Get-UsageSnapshot`** is the pure data-gathering function: enumerates slots, calls `Get-SlotUsage` per slot, and returns `{ Results, NoSlots, HasCacheFallback }`. Never renders. The one-shot path and the watch loop both call it. Reconcile runs once per poll boundary (in `Invoke-UsageAction` for the one-shot path, inside the watch loop's `$dueForPoll` branch) so by the time `Get-UsageSnapshot` reads slot files they are byte-equal to whatever Claude Code last wrote into `.credentials.json`.
-- **`Format-UsageFrame`** is the pure renderer: takes a snapshot plus an optional footer string and prints table-or-verbose + optional cache-fallback advisory + footer. Used identically from both entry points, so the frame shape is asserted by the suite and the watch loop automatically inherits every rendering guarantee.
-- **`Invoke-UsageWatch`** is the loop itself. Untested — its behavior is the alt-buffer + sync-mode wrapper described above around a `Format-UsageFrame` call on a 1-second `Start-Sleep` tick. No keyboard input handling: Ctrl-C terminates via the runtime's default handler, and the `finally` block emits `ESC[?25h` + `ESC[?1049l` (show cursor + leave alt buffer) and restores `[Console]::CursorVisible` to its pre-loop value.
-
-Runtime guards (both throw, neither runs the loop):
-
-- `-Watch -Json` — mutually exclusive; `-Watch` is interactive, `-Json` is for scripting. Enforced both by the top-level Param block's parameter sets (binder-level rejection with `Parameter set cannot be resolved`) and by a runtime guard inside `Invoke-UsageAction` for direct callers (notably the test suite) that bypass `Invoke-Main`.
-- `[Console]::IsOutputRedirected` — `sca usage -Watch > file.txt` is refused rather than silently filling the file with alt-buffer / cursor-control / sync-mode escape sequences; the error message points at `-Json`.
-
-Interval clamping: values below `$Script:UsageWatchMinInterval = 60` get clamped up to 60 with a one-line yellow advisory. The floor matches the default so `-Interval` can only *slow* the poll — this is deliberate, the unofficial endpoint has no published rate limit and we prefer conservative cadence.
-
-Exit: Ctrl-C only. The loop installs no key listeners (no `[Console]::KeyAvailable` / `ReadKey`); the runtime's default Ctrl-C handler terminates the pipeline and PowerShell runs the `finally` block, which leaves the alternate screen buffer (so the user's pre-watch terminal scrollback is restored, mirroring `top` / `htop` / `vim`) and restores cursor visibility. There is no interactive force-refresh — to bypass the poll interval, quit and re-run.
-
-Error handling: if an HTTP call fails mid-loop, the previous snapshot stays on screen and a second line appears under the footer reading `[Watch] Last poll failed: <msg> (keeping previous data; will retry on next tick)`.
-
-### Identity capture: filename + sidecar (post-v2.1.0)
+## Identity capture: filename + sidecar
 
 A slot's identity is captured ONCE at save time and frozen in two paired files:
 
@@ -297,94 +77,46 @@ A slot's identity is captured ONCE at save time and frozen in two paired files:
 .credentials.<name>(<email>).account.json  ← identity sidecar (sca-only; whitelisted oauthAccount)
 ```
 
-Sidecar shape:
-
-```jsonc
-{
-  "schema": 1,
-  "captured_at": "2026-04-26T08:30:00.000Z",
-  "source": "claude_json" | "api_profile",   // where Invoke-SaveAction got the data
-  "oauthAccount": {
-    "accountUuid":      "...",
-    "emailAddress":     "...",
-    "organizationUuid": "...",
-    "displayName":      "...",
-    "organizationName": "..."
-  }
-}
-```
-
-Whitelist rationale: only the five identity fields are round-tripped. Volatile metadata Claude Code maintains itself (`billingType`, `accountCreatedAt`, `subscriptionCreatedAt`, `ccOnboardingFlags`, `claudeCodeTrialEndsAt`, `claudeCodeTrialDurationDays`, `hasExtraUsageEnabled`) is intentionally excluded — restoring stale values for those would diverge from Claude Code's own picture.
-
 **Identity resolution at save time** (`Invoke-SaveAction`, priority order):
 
-1. `~/.claude.json`'s `oauthAccount` (read by `Get-OAuthAccountFromClaudeJson`) — preferred. Same source Claude Code uses for `/status`, so the slot's labeled email cannot drift from Claude Code's display by construction. Offline (no HTTP).
-2. `/api/oauth/profile` (via `Get-SlotProfile`) — fallback for fresh installs where Claude Code hasn't populated `oauthAccount` yet. Yields only `emailAddress`; the other four whitelisted fields default to `null` in the sidecar.
-3. Both failing → save is **refused**. There are no unlabeled-no-identity slots — a slot must have an email or it doesn't exist.
+1. `~/.claude.json`'s `oauthAccount` (read by `Get-OAuthAccountFromClaudeJson`) — preferred. Same source Claude Code uses for `/status`, so the slot's labeled email cannot drift from Claude Code's display by construction. Offline.
+2. `/api/oauth/profile` (via `Get-SlotProfile`) — fallback for fresh installs where `oauthAccount` is empty. Yields only `emailAddress`; the other four whitelisted fields default to `null` in the sidecar.
+3. Both failing → save is **refused**. There are no unlabeled-no-identity slots.
 
-The atomic-pair invariant: tokens file is written first, then the sidecar. If the sidecar write fails, the tokens file is rolled back so a half-saved slot can never appear invisible-but-present (sidecar-less slot files are filtered out of `list` / `usage` / rotation; without rollback the user would see a slot disappear on the next `sca list`).
+**Atomic-pair invariant**: tokens file is written first, then the sidecar. If the sidecar write fails, the tokens file is rolled back so a half-saved slot can never appear invisible-but-present.
 
-**Filename parsing** (`Get-SlotFileInfo`, regex):
-```
-^\.credentials\.(.+?)(?:\(([^()]*@[^()]*)\))?\.json$
-    group 1 = slot name (lazy)
-    group 2 = email       (optional; only captured when the parens contain '@')
-```
-The `@`-in-parens requirement keeps a slot named e.g. `work(v2)` parsing as *slot = `work(v2)`, email = none*. `Get-SafeName` sanitizes `(` and `)` in user-provided slot names to `_`, so user input cannot inject parens and fool the parser.
+**On-disk cleanup from v1**: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` cache sidecars from the cache-based v1 implementation on each enumeration (different filename pattern from the current `.account.json` sidecar; cleanup is cheap and idempotent).
 
-**Filename-email vs sidecar-email**: by save-time construction, `.credentials.<name>(<email>).json`'s `<email>` always equals the sidecar's `oauthAccount.emailAddress`. `Format-AccountCell` (the cell renderer) reads the filename email; reconcile and switch use the sidecar block.
+## `~/.claude.json` ownership
 
-**`sca list` / `sca usage` display**: emails render inline in the `Account` column on the same row as the slot name — no `└─ <email>` continuation. `Format-AccountCell` returns `—` when the slot name (case-insensitive) equals its embedded email (dedup form), and the middle-truncated email otherwise. The full untruncated email always lives in `sca usage <name>` verbose output and in `sca usage -Json`.
+`~/.claude.json` is Claude Code's persistent config — `oauthAccount` at the top level alongside ~50 other fields (project history, mcp configs, statsig gates, settings). `sca` interacts with it minimally and surgically:
 
-**On-disk cleanup from v1**: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` cache sidecars from the cache-based v1 implementation on each enumeration (different filename pattern from the post-v2.1.0 `.account.json` sidecar; the v1 cleanup is cheap and idempotent once complete).
+- **Read** (`Get-OAuthAccountFromClaudeJson`): full JSON parse via `ConvertFrom-Json`, extract whitelisted fields. Failure modes (missing, parse error, no oauthAccount, empty emailAddress) all return `$null` so callers fall through to `/api/oauth/profile` or refuse. Used by `Invoke-SaveAction` (primary identity source) and `Invoke-Reconcile` (identity probe).
+- **Write** (`Set-OAuthAccountInClaudeJson`): targeted regex substitution within the `"oauthAccount": { ... }` block, NOT a full JSON round-trip. Whitelisted fields substituted via `[regex]::Replace` with a `MatchEvaluator`. Every other byte preserved. Tests assert byte-equal preservation of unrelated top-level fields. Implementation details in `.claude/rules/script-internals.md`. Used only by `Invoke-SwitchAction`.
+- **Lock contract**: there is **no** lockfile. Claude Code uses `proper-lockfile` to serialize its own writes via `~/.claude.json.lock`; `sca` deliberately does NOT participate. Instead, `sca save` and `sca switch` refuse to operate when Claude Code is running (`Test-ClaudeRunning`). Stronger guarantee than locking: zero possibility of a stale in-memory cache, because Claude Code is not running to hold one.
+- **Backup recovery**: Claude Code maintains rolling timestamped backups at `~/.claude.json.backup.<unix-ms>` (last 5, throttled to ≥1 minute apart). If a `sca` write ever corrupts `~/.claude.json`, restore from the latest backup. `sca` itself does NOT create backups.
+- **Failure mode**: if `Set-OAuthAccountInClaudeJson` throws, `Invoke-SwitchAction` catches, prints a yellow advisory, and proceeds. The credentials swap has already happened; only the email-display update fails. Re-run the switch once the issue is fixed.
 
-### `~/.claude.json` ownership
+## Reconcile semantics
 
-`~/.claude.json` is Claude Code's persistent config. It contains `oauthAccount` at the top level alongside ~50 other fields (project history, mcp configs, statsig gates, settings, etc.). `sca` interacts with it minimally and surgically:
+`Invoke-Reconcile` fires on `usage` and `switch` only (not `list`, not `remove`). Identity probe priority:
 
-- **Read** (`Get-OAuthAccountFromClaudeJson`): full JSON parse via `ConvertFrom-Json`, extract whitelisted fields. Failure modes (file missing, parse error, no oauthAccount, empty emailAddress) all return `$null` so callers fall through to the `/api/oauth/profile` fallback or refuse the operation. Used by `Invoke-SaveAction` (primary identity source) and `Invoke-Reconcile` (identity probe).
+1. `Get-OAuthAccountFromClaudeJson` — preferred; offline; returns full `oauthAccount` for the auto-save sidecar.
+2. `Get-SlotProfile` against `.credentials.json` — fallback. Yields only `emailAddress`.
+3. Both failing → falls into the same-identity mirror branch (no auto-save).
 
-- **Write** (`Set-OAuthAccountInClaudeJson`): targeted regex substitution within the `"oauthAccount": { ... }` block, NOT a full JSON round-trip. The block's opening `{` is located by regex; brace-counting finds the matching close; whitelisted fields inside are substituted via `[regex]::Replace` with a `MatchEvaluator` (avoids `$1` / `$&` replacement-token surprises). Every other byte of the file is left untouched. Verified by tests asserting byte-equal preservation of unrelated top-level fields (`projects`, `mcpServers`, custom keys) through a full save → switch round trip.
-
-  Why not parse-and-reserialize: `~/.claude.json` is large (~18 KB), structurally complex (nested objects with unknown future fields), and PowerShell's `ConvertTo-Json -Depth 12` round-trip can introduce subtle differences (key ordering, trailing whitespace, integer vs decimal, `True`/`False` casing) that would silently rewrite the user's config. Targeted substitution is the safer minimum.
-
-  Used only by `Invoke-SwitchAction`, after the credentials swap, with the destination slot's sidecar `oauthAccount` as input.
-
-- **Lock contract**: there is **no** lockfile. Claude Code uses `proper-lockfile` to serialize its own writes via `~/.claude.json.lock`; `sca` deliberately does NOT participate in that lock. Instead, `sca save` and `sca switch` refuse to operate when Claude Code is running (`Test-ClaudeRunning`). This is simpler than locking and provides a stronger guarantee: zero possibility of Claude Code's in-memory `Un.config` cache being stale relative to our write, because Claude Code is not running to hold a stale cache.
-
-  **Pre-flight verification** (CLAUDE.md planning history, 2026-04-26): editing `oauthAccount.emailAddress` in `~/.claude.json` while Claude Code is closed and then starting Claude Code makes `claude auth status` (and `/status`) report the new value. Confirmed empirically. The write strategy is sound.
-
-- **Backup recovery**: Claude Code itself maintains rolling timestamped backups at `~/.claude.json.backup.<unix-ms>` (last 5 retained, throttled to ≥1 minute apart) on every config write. If a `sca` write ever corrupts `~/.claude.json` (e.g., a brace-counting bug we haven't anticipated), the user can restore from `~/.claude.json.backup.<latest>`. `sca` itself does NOT create backups — relying on Claude Code's existing mechanism.
-
-- **Failure mode**: if `Set-OAuthAccountInClaudeJson` throws (file missing, malformed JSON, unbalanced braces in the oauthAccount block), `Invoke-SwitchAction` catches the exception, prints a yellow advisory, and proceeds. The credentials swap has already happened; only the email-display update fails. The user can re-run the switch once the underlying issue is fixed.
-
-### Reconcile identity probe (post-v2.1.0)
-
-`Invoke-Reconcile` uses `~/.claude.json`'s `oauthAccount.emailAddress` as the primary identity probe (same source Claude Code uses for `/status`). The probe is offline — no HTTP call on the noop / mirror / identity-change paths, only on the rare auto-save fallback when both `~/.claude.json` and the slot are missing.
-
-Probe priority:
-1. `Get-OAuthAccountFromClaudeJson` — preferred; returns full `oauthAccount` for the auto-save sidecar.
-2. `Get-SlotProfile` against `.credentials.json` — fallback when (1) returns `$null`. Yields only `emailAddress`.
-3. Both failing → `$newEmail = $null`, falls into the same-identity mirror branch (continuity over paranoia).
-
-Identity comparison: live `~/.claude.json` email vs. the tracked slot's **sidecar** `oauthAccount.emailAddress` (NOT the filename email — sidecar is the source of truth). Auto-save branches always write a sidecar from the resolved identity (when available); auto-save without identity yields a sidecar-less slot file that `Get-Slots` will hide on the next enumeration.
+Identity comparison: live `~/.claude.json` email vs. the tracked slot's **sidecar** `oauthAccount.emailAddress` (NOT the filename email — sidecar is the source of truth). Mismatch → auto-save under `auto-<UTC-timestamp>(<new-email>)` and update `state.active_slot`. Auto-save without identity yields a sidecar-less slot file that `Get-Slots` will hide on the next enumeration.
 
 ## Testing
-
-Run the suite:
 
 ```powershell
 pwsh -NoProfile -File tests/Invoke-Tests.ps1
 ```
 
-Run a single test or context by name (`-FullNameFilter` is a wildcard/regex against the full `Describe > Context > It` path):
+Run a single test or context (`-FullNameFilter` is wildcard/regex against full `Describe > Context > It` path):
 
 ```powershell
 pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pester -Path tests/ -FullNameFilter '*Get-SafeName*' -Output Detailed"
 ```
 
-The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode — findings are printed but never fail the run.
-
-Tests sandbox `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`, so the real profile and real `.claude` directory are never touched.
-
-Tests are split per action under `tests/Invoke-<Action>Action.Tests.ps1` (plus `Helpers.Tests.ps1` and `Profile-Install.Tests.ps1`), with shared per-test sandbox setup in `tests/Common.ps1` (dot-sourced from each file's `BeforeEach`). Each file's outer `Describe` is named `'switch_claude_account'` so the `-FullNameFilter` recipe above keeps working unchanged across files.
+The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode. Tests sandbox `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`. Test-writing conventions: `.claude/rules/tests.md`.
