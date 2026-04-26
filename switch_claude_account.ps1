@@ -2926,23 +2926,37 @@ function Format-UsageFooter {
 $Script:WatchTitleSuffix = 'Switch Claude Account'
 
 # Build the OSC 0 terminal-title string for `sca usage -Watch`. The
-# title format is deliberately minimal — two utilization numbers + brand
-# suffix — because the watch body already carries every richer signal
-# (status colors, reset countdowns, cache-fallback advisory). The title
-# only needs to answer "which tab is this and roughly where am I?" when
-# the watch window is in the background.
+# title carries the active slot's two utilization numbers + brand suffix,
+# optionally prefixed with an alarm marker when usage crosses the
+# warn / limit thresholds:
 #
-#   34% | 42% | Switch Claude Account     # both buckets present
-#   — | 42% | Switch Claude Account       # five_hour null
-#   Switch Claude Account                  # no usable data (no slots / all errors)
+#   34% | 42% | Switch Claude Account            # both below UtilWarnPct
+#   [~] 92% | 80% | Switch Claude Account        # any bucket >= UtilWarnPct, all < UtilLimitPct
+#   [!] 100% | 80% | Switch Claude Account       # any bucket >= UtilLimitPct
+#   — | 42% | Switch Claude Account              # active row has null five_hour
+#   Switch Claude Account                         # no usable active row
 #
-# Single-slot mode (`-Name` set, snapshot has 1 ok result) renders that
-# slot's bucket values directly; null buckets render as the em-dash
-# sentinel matching Format-UtilCell. Multi-slot mode renders the pool
-# mean of HTTP-ok rows using the same formula as Format-AggregateBars
-# (sum of clamped utilizations / N*100 * 100). When zero HTTP-ok rows
-# exist the title collapses to the bare brand suffix — there are no
-# numbers to report.
+# Source row priority (the snapshot may carry many rows):
+#   1. -Name <slot> set      -> the row whose Name matches (explicit user
+#                               filter wins; mirrors Get-UsageSnapshot's
+#                               upstream filter).
+#   2. else                  -> the row where IsActive = $true.
+#   3. else / row not 'ok'   -> bare suffix. Numbers from a failed poll
+#                               would be stale or absent; the body table
+#                               already carries the error-tier signal in
+#                               the Status column.
+#
+# Threshold reuse: $Script:UtilWarnPct (90) / $Script:UtilLimitPct (100)
+# match Get-PlanStatus, so the title prefix and the body's Status column
+# stay in lockstep — '[!]' here corresponds to 'limited 5h' / 'limited 7d'
+# / 'limited' there; '[~]' corresponds to 'near limit'. Limit wins over
+# warn when buckets straddle the two tiers.
+#
+# Active-slot-only (vs. the previous pool-mean) is a deliberate
+# simplification: a multi-slot pool mean averages a burned slot down to
+# noise (1 of 5 slots at 100% reads as ~20% mean), defeating the
+# alarm-glance value of the title. The active slot is the one currently
+# serving prompts — its numbers are what the user actually cares about.
 #
 # Control bytes (\x00-\x1F, \x7F) are stripped from the assembled string
 # as defense-in-depth: slot names already pass Get-SafeName so user
@@ -2959,55 +2973,53 @@ function Format-WatchTitle {
 
     if (-not $Snapshot -or $Snapshot.NoSlots) { return $suffix }
 
-    $okResults = @($Snapshot.Results | Where-Object { $_.Status -eq 'ok' })
-    if ($okResults.Count -eq 0) { return $suffix }
+    $results = @($Snapshot.Results)
+    if ($results.Count -eq 0) { return $suffix }
 
-    # Render one bucket value to either ' NN%' (rounded percent) or '—'
-    # for null. Local helper so the single-slot and pool branches stay
-    # symmetrical at the call site.
+    # Source row: explicit -Name wins; otherwise the active slot. We do
+    # NOT fall back to "first row" or "pool mean" — the active slot is
+    # the right answer for an alarm-style display, and -Name is the
+    # only reason to override it. Strict Name match (defense-in-depth
+    # against an upstream caller that did not pre-filter the snapshot).
+    $row = if ($Name) {
+        $results | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    } else {
+        $results | Where-Object { $_.IsActive } | Select-Object -First 1
+    }
+    if (-not $row -or $row.Status -ne 'ok') { return $suffix }
+
+    $five  = if ($row.Data -and $row.Data.five_hour) { $row.Data.five_hour.utilization } else { $null }
+    $seven = if ($row.Data -and $row.Data.seven_day) { $row.Data.seven_day.utilization } else { $null }
+
+    # Render one bucket value to either 'NN%' (rounded percent) or '—'
+    # for null. Local closure so the prefix branch and the format string
+    # share one rendering rule.
     $renderPct = {
         Param ($v)
         if ($null -eq $v) { return '—' }
         return ('{0}%' -f [int][math]::Round([double]$v))
     }
 
-    if ($Name -and $okResults.Count -eq 1) {
-        # Single-slot: the snapshot was filtered by name upstream. Read
-        # the row's bucket utilizations directly; null buckets render as
-        # em-dash so cold accounts produce '— | — | <suffix>' rather
-        # than misleading 0%.
-        $r     = $okResults[0]
-        $five  = if ($r.Data -and $r.Data.five_hour) { $r.Data.five_hour.utilization } else { $null }
-        $seven = if ($r.Data -and $r.Data.seven_day) { $r.Data.seven_day.utilization } else { $null }
+    # Alarm prefix: tiered to mirror Get-PlanStatus. '[!]' wins over
+    # '[~]' (a bucket at limit is more actionable than another bucket
+    # only near limit). Null buckets contribute nothing to the alarm —
+    # they cannot be at or above any threshold by definition.
+    $hasLimit = (
+        ($null -ne $five  -and [double]$five  -ge $Script:UtilLimitPct) -or
+        ($null -ne $seven -and [double]$seven -ge $Script:UtilLimitPct)
+    )
+    $prefix = ''
+    if ($hasLimit) {
+        $prefix = '[!] '
     } else {
-        # Multi-slot pool mean: same formula as Format-AggregateBars
-        # (sum of clamped utilizations / (N * 100) * 100, equivalently
-        # the mean across eligible rows). Null bucket values count as 0
-        # used — matches the bars above the table so title and bars
-        # never disagree.
-        $n        = $okResults.Count
-        $cap      = $n * 100
-        $sumFive  = 0.0
-        $sumSeven = 0.0
-        foreach ($r in $okResults) {
-            if ($r.Data -and $r.Data.five_hour -and $null -ne $r.Data.five_hour.utilization) {
-                $u = [double]$r.Data.five_hour.utilization
-                if ($u -lt 0)   { $u = 0 }
-                if ($u -gt 100) { $u = 100 }
-                $sumFive += $u
-            }
-            if ($r.Data -and $r.Data.seven_day -and $null -ne $r.Data.seven_day.utilization) {
-                $u = [double]$r.Data.seven_day.utilization
-                if ($u -lt 0)   { $u = 0 }
-                if ($u -gt 100) { $u = 100 }
-                $sumSeven += $u
-            }
-        }
-        $five  = [int][math]::Round(($sumFive  / $cap) * 100)
-        $seven = [int][math]::Round(($sumSeven / $cap) * 100)
+        $hasWarn = (
+            ($null -ne $five  -and [double]$five  -ge $Script:UtilWarnPct) -or
+            ($null -ne $seven -and [double]$seven -ge $Script:UtilWarnPct)
+        )
+        if ($hasWarn) { $prefix = '[~] ' }
     }
 
-    $title = '{0} | {1} | {2}' -f (& $renderPct $five), (& $renderPct $seven), $suffix
+    $title = '{0}{1} | {2} | {3}' -f $prefix, (& $renderPct $five), (& $renderPct $seven), $suffix
 
     # Strip control bytes (C0 + DEL). Defense-in-depth against an OSC
     # envelope breakout via a malformed slot name, sidecar email, or

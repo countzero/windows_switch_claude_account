@@ -259,24 +259,28 @@ Describe 'switch_claude_account' {
 
     Context 'Format-WatchTitle' {
         # Pure string-builder for the OSC 0 watch-mode terminal title.
-        # The title carries only "two numbers + brand suffix" by design
-        # (KISS) — every richer signal already lives in the watch body.
-        # These tests pin the format string and the pool-mean formula so
-        # a future refactor cannot silently start emitting status words,
-        # slot names, or reset countdowns into the title.
+        # The title carries the active slot's two utilization numbers +
+        # brand suffix, optionally prefixed with '[!]' (any bucket >=
+        # UtilLimitPct) or '[~]' (any bucket >= UtilWarnPct). Source
+        # row is the active slot (IsActive=true) by default, or the
+        # -Name match when -Name is set. These tests pin the format
+        # string, the active-slot selection rule, and the prefix tier
+        # thresholds so a future refactor cannot silently re-introduce
+        # pool-mean averaging or drop the alarm prefix.
 
         # Build a minimal Get-UsageSnapshot-shaped object for a list of
-        # rows. Each row hashtable accepts: Status, FiveUtil, SevenUtil
-        # (any field omitted defaults to ok / null).
+        # rows. Each row hashtable accepts: Name, Status, IsActive,
+        # FiveUtil, SevenUtil (any field omitted defaults to slot-x /
+        # ok / $false / null / null).
         function script:New-FakeSnapshot {
             Param ([object[]] $Rows)
             $results = foreach ($r in $Rows) {
                 $five  = if ($r.ContainsKey('FiveUtil'))  { $r.FiveUtil }  else { $null }
                 $seven = if ($r.ContainsKey('SevenUtil')) { $r.SevenUtil } else { $null }
                 [pscustomobject]@{
-                    Name     = if ($r.ContainsKey('Name')) { $r.Name } else { 'slot-x' }
-                    Status   = if ($r.ContainsKey('Status')) { $r.Status } else { 'ok' }
-                    IsActive = $false
+                    Name     = if ($r.ContainsKey('Name'))     { $r.Name }              else { 'slot-x' }
+                    Status   = if ($r.ContainsKey('Status'))   { $r.Status }            else { 'ok' }
+                    IsActive = if ($r.ContainsKey('IsActive')) { [bool]$r.IsActive }    else { $false }
                     Email    = $null
                     Data     = if ($null -eq $five -and $null -eq $seven) {
                                    $null
@@ -297,32 +301,73 @@ Describe 'switch_claude_account' {
             }
         }
 
-        It 'renders both buckets present (single-slot)' {
-            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 34; SevenUtil = 42 })
-            Format-WatchTitle -Name 'slot-1' -Snapshot $snap |
+        # --- Source row selection -------------------------------------
+
+        It 'renders the active slot in multi-slot watch (no -Name)' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 10; SevenUtil = 20 }
+                @{ Name = 'b'; FiveUtil = 50; SevenUtil = 60; IsActive = $true }
+                @{ Name = 'c'; FiveUtil = 80; SevenUtil = 70 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '50% | 60% | Switch Claude Account'
+        }
+
+        It '-Name overrides IsActive (renders named slot regardless of which is active)' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 10; SevenUtil = 20; IsActive = $true }
+                @{ Name = 'b'; FiveUtil = 70; SevenUtil = 80 }
+            )
+            Format-WatchTitle -Name 'b' -Snapshot $snap |
+                Should -Be '70% | 80% | Switch Claude Account'
+        }
+
+        It 'falls back to bare suffix when no row is active and -Name unset' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 10; SevenUtil = 20 }
+                @{ Name = 'b'; FiveUtil = 30; SevenUtil = 40 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be 'Switch Claude Account'
+        }
+
+        It 'falls back to bare suffix when -Name does not match any row' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 10; SevenUtil = 20; IsActive = $true }
+            )
+            Format-WatchTitle -Name 'nonexistent' -Snapshot $snap |
+                Should -Be 'Switch Claude Account'
+        }
+
+        # --- Number rendering -----------------------------------------
+
+        It 'renders both buckets present' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 34; SevenUtil = 42; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be '34% | 42% | Switch Claude Account'
         }
 
         It 'rounds fractional utilization to nearest integer' {
-            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 33.6; SevenUtil = 41.4 })
-            Format-WatchTitle -Name 'slot-1' -Snapshot $snap |
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 33.6; SevenUtil = 41.4; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be '34% | 41% | Switch Claude Account'
         }
 
-        It 'renders em-dash for null buckets (single-slot, mixed null)' {
-            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = $null; SevenUtil = 42 })
-            Format-WatchTitle -Name 'slot-1' -Snapshot $snap |
+        It 'renders em-dash for null buckets (mixed null)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = $null; SevenUtil = 42; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be '— | 42% | Switch Claude Account'
         }
 
-        It 'renders bare suffix when both buckets null (single-slot)' {
-            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = $null; SevenUtil = $null })
-            # Single-slot null/null still renders the em-dashes; bare
-            # suffix is reserved for "no usable rows at all" (no slots /
-            # all-error). Documents the intended distinction.
-            Format-WatchTitle -Name 'slot-1' -Snapshot $snap |
+        It 'renders em-dashes when both buckets null (active row, no usable utilization)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = $null; SevenUtil = $null; IsActive = $true })
+            # Distinguishes "active row exists but cold" from "no usable
+            # row at all" (the latter collapses to bare suffix).
+            Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be '— | — | Switch Claude Account'
         }
+
+        # --- Bare-suffix fallbacks ------------------------------------
 
         It 'returns bare suffix for empty snapshot (no slots saved)' {
             $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
@@ -330,55 +375,121 @@ Describe 'switch_claude_account' {
                 Should -Be 'Switch Claude Account'
         }
 
-        It 'returns bare suffix when all rows are HTTP-failure (multi-slot)' {
+        It 'returns bare suffix when all rows are HTTP-failure (active row included)' {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Status = 'expired'; FiveUtil = 10; SevenUtil = 10 }
-                @{ Status = 'error';   FiveUtil = 20; SevenUtil = 20 }
+                @{ Name = 'a'; Status = 'expired'; FiveUtil = 10; SevenUtil = 10; IsActive = $true }
+                @{ Name = 'b'; Status = 'error';   FiveUtil = 20; SevenUtil = 20 }
             )
             Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be 'Switch Claude Account'
         }
 
-        It 'computes pool mean across HTTP-ok rows (multi-slot)' {
-            # 50 + 100 over N=2 → mean 75% Session, 0 + 40 → mean 20% Week
+        It 'returns bare suffix when active row Status is <Status>' -ForEach @(
+            @{ Status = 'expired'      }
+            @{ Status = 'unauthorized' }
+            @{ Status = 'error'        }
+            @{ Status = 'no-oauth'     }
+            @{ Status = 'rate-limited' }
+        ) {
             $snap = New-FakeSnapshot -Rows @(
-                @{ FiveUtil = 50;  SevenUtil = 0 }
-                @{ FiveUtil = 100; SevenUtil = 40 }
+                @{ Name = 'a'; Status = $Status; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
             )
             Format-WatchTitle -Name '' -Snapshot $snap |
-                Should -Be '75% | 20% | Switch Claude Account'
+                Should -Be 'Switch Claude Account'
         }
 
-        It 'pool mean ignores non-ok rows but counts null buckets as 0' {
-            # Two ok rows (one with null Week → 0 used in pool), one
-            # error row excluded entirely. Five: (60 + 90) / 200 = 75%.
-            # Week: (40 + 0) / 200 = 20%.
+        It 'returns bare suffix when -Name matches but row is not ok' {
             $snap = New-FakeSnapshot -Rows @(
-                @{ FiveUtil = 60;  SevenUtil = 40 }
-                @{ FiveUtil = 90;  SevenUtil = $null }
-                @{ Status = 'expired'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'a'; Status = 'expired'; FiveUtil = 50; SevenUtil = 50 }
             )
-            Format-WatchTitle -Name '' -Snapshot $snap |
-                Should -Be '75% | 20% | Switch Claude Account'
+            Format-WatchTitle -Name 'a' -Snapshot $snap |
+                Should -Be 'Switch Claude Account'
         }
 
-        It 'pool mean clamps per-slot utilization to [0, 100]' {
-            # Anomalous 150% from the API is clamped to 100 before pool
-            # averaging — mirrors Format-AggregateBars semantics.
+        It 'ignores non-active rows (does not pool-mean across slots)' {
+            # Regression guard: a previous version pool-meaned across all
+            # HTTP-ok rows, which averaged a burned slot's 100% down to
+            # noise in multi-slot watches. The new contract reads the
+            # active slot's numbers directly.
             $snap = New-FakeSnapshot -Rows @(
-                @{ FiveUtil = 150; SevenUtil = -10 }
-                @{ FiveUtil = 50;  SevenUtil = 50 }
+                @{ Name = 'a'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'b'; FiveUtil = 10;  SevenUtil = 10; IsActive = $true }
+                @{ Name = 'c'; FiveUtil = 100; SevenUtil = 100 }
             )
             Format-WatchTitle -Name '' -Snapshot $snap |
-                Should -Be '75% | 25% | Switch Claude Account'
+                Should -Be '10% | 10% | Switch Claude Account'
         }
+
+        # --- [!] / [~] alarm prefix tiers -----------------------------
+
+        It 'prepends [!] when 5h bucket is at UtilLimitPct (100)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 100; SevenUtil = 50; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[!] 100% | 50% | Switch Claude Account'
+        }
+
+        It 'prepends [!] when 7d bucket is at UtilLimitPct (100)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 50; SevenUtil = 100; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[!] 50% | 100% | Switch Claude Account'
+        }
+
+        It 'prepends [!] when both buckets are at UtilLimitPct' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 100; SevenUtil = 100; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[!] 100% | 100% | Switch Claude Account'
+        }
+
+        It '[!] wins over [~] when one bucket is at limit and the other near' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 100; SevenUtil = 95; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[!] 100% | 95% | Switch Claude Account'
+        }
+
+        It 'prepends [~] when 5h bucket is at exactly UtilWarnPct (90)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 90; SevenUtil = 50; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[~] 90% | 50% | Switch Claude Account'
+        }
+
+        It 'prepends [~] when 7d bucket is at UtilWarnPct (above default)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 50; SevenUtil = 92; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[~] 50% | 92% | Switch Claude Account'
+        }
+
+        It 'no prefix when both buckets are just below UtilWarnPct (89)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 89; SevenUtil = 89; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '89% | 89% | Switch Claude Account'
+        }
+
+        It 'no prefix when both buckets are well below UtilWarnPct' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 30; SevenUtil = 40; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '30% | 40% | Switch Claude Account'
+        }
+
+        It 'null buckets do not trigger any prefix' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = $null; SevenUtil = $null; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '— | — | Switch Claude Account'
+        }
+
+        It 'one bucket null + the other at limit still fires [!]' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = $null; SevenUtil = 100; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[!] — | 100% | Switch Claude Account'
+        }
+
+        # --- Defense-in-depth -----------------------------------------
 
         It 'strips control bytes from the assembled title' {
             # Slot names already pass Get-SafeName, but the strip is
             # defense-in-depth against an OSC envelope breakout via a
             # tampered sidecar email or future caller path.
             $rows  = @([pscustomobject]@{
-                Name = "x`e]0;EVIL`a"; Status = 'ok'; IsActive = $false; Email = $null
+                Name = "x`e]0;EVIL`a"; Status = 'ok'; IsActive = $true; Email = $null
                 Data = [pscustomobject]@{
                     five_hour = [pscustomobject]@{ utilization = 10 }
                     seven_day = [pscustomobject]@{ utilization = 20 }
