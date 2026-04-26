@@ -257,6 +257,85 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Watch-mode VT control rendering' {
+        # Regression guard for `sca usage -Watch -NoColor` flicker.
+        #
+        # Background: -NoColor sets $PSStyle.OutputRendering='PlainText',
+        # which routes every Write-Host string through PowerShell's
+        # StringDecorated.AnsiRegex filter. That regex matches DEC private
+        # modes (\x1b\[\?\d+[hl]) and strips them -- so when watch-mode
+        # VT controls (DEC 2026 sync envelope, alt-buffer toggle, cursor
+        # hide/show) go through Write-Host, the entire flicker-free
+        # rendering envelope vanishes and -Watch -NoColor flickers.
+        #
+        # Fix: Write-VTSequence uses [Console]::Out.Write which bypasses
+        # StringDecorated entirely. Two assertions pin the contract:
+        # one static (no Write-Host VT escapes in Invoke-UsageWatch),
+        # one behavioral (Write-VTSequence preserves DEC modes verbatim).
+
+        It 'Invoke-UsageWatch routes all VT control sequences through Write-VTSequence (no Write-Host VT escapes)' {
+            # AST-based static check: pin the call sites without a brittle
+            # line-range. A future accidental `Write-Host "`e[?...h"`
+            # reintroduction in the watch loop fails this test.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-UsageWatch'
+            }, $true) | Select-Object -First 1
+
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+
+            $bodyLines = $func.Extent.Text -split "`r?`n"
+            $offending = @($bodyLines | Where-Object {
+                $_ -match '\bWrite-Host\b' -and $_ -match '`e\['
+            })
+            $offending.Count | Should -Be 0 -Because (
+                'VT control sequences in the watch lifecycle must go through ' +
+                'Write-VTSequence (which uses [Console]::Out.Write to bypass ' +
+                'StringDecorated.AnsiRegex). Routing them through Write-Host ' +
+                're-enables PSStyle.OutputRendering=PlainText stripping of DEC ' +
+                'private modes, which causes -Watch -NoColor to flicker.')
+        }
+
+        It 'Write-VTSequence preserves DEC 2026 envelope verbatim under OutputRendering=PlainText' {
+            # Two-part contract check, scoped to the exact sequence the
+            # fix depends on (DEC 2026 sync-envelope opener). Broader
+            # assertions across all DEC modes would over-couple to
+            # PowerShell's internal StringDecorated regex.
+
+            # Part 1: confirm StringDecorated DOES strip the envelope
+            # under PlainText (the regression hazard). Common.ps1 already
+            # sets OutputRendering=PlainText for the test session.
+            # The class lives in System.Management.Automation.Internal
+            # (public class, internal-namespaced) and is the same filter
+            # PowerShell's host UI applies to every Write-Host string.
+            $sd = [System.Management.Automation.Internal.StringDecorated]::new("`e[?2026h")
+            $sd.ToString() | Should -BeNullOrEmpty -Because (
+                'StringDecorated.AnsiRegex strips DEC private modes under ' +
+                'PlainText; this is why VT control sequences must NOT go ' +
+                'through Write-Host in -Watch -NoColor mode.')
+
+            # Part 2: confirm Write-VTSequence does NOT go through that
+            # filter. Capture by swapping Console.Out for a StringWriter.
+            # The finally restores Console.Out BEFORE Pester's assertion
+            # output, so the test harness is unaffected.
+            $origOut = [Console]::Out
+            $sw      = [System.IO.StringWriter]::new()
+            try {
+                [Console]::SetOut($sw)
+                Write-VTSequence "`e[?2026h"
+            } finally {
+                [Console]::SetOut($origOut)
+            }
+            $sw.ToString() | Should -Be "`e[?2026h" -Because (
+                'Write-VTSequence must preserve DEC private modes verbatim ' +
+                'regardless of OutputRendering; otherwise -Watch -NoColor ' +
+                'loses its DEC 2026 sync envelope and flickers.')
+        }
+    }
+
     Context 'No-color mode' {
         # Verifies the $PSStyle.OutputRendering toggle wired into Invoke-Main.
         # The toggle is the production no-color mechanism: every colored

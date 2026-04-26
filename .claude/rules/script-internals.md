@@ -186,7 +186,7 @@ Self-refreshing live view. Re-polls every `-Interval` seconds (default + floor *
 - Enter alt buffer (`ESC[?1049h`) + hide cursor (`ESC[?25l`) on entry; `finally` block restores on Ctrl-C.
 - Each frame wrapped in DEC mode 2026 (synchronized output: `ESC[?2026h` … `ESC[?2026l`) with `ESC[2J` + cursor-home (`ESC[H`).
 - Terminals that support DEC 2026 (Windows Terminal ≥ 1.13, VS Code, iTerm2 ≥ 3.4.13, kitty, alacritty, WezTerm, foot, gnome-terminal/vte, mintty, modern ConHost) render flicker-free; older terminals ignore the unknown DEC private mode (no regression).
-- VT control sequences emitted via `Write-Host -NoNewline` (takes the host's `_instanceLock`).
+- VT control sequences emitted via `Write-VTSequence` (which calls `[Console]::Out.Write` + `Flush`) so they bypass the `Write-Host` -> `StringDecorated.AnsiRegex` filter that `OutputRendering = 'PlainText'` (set by `-NoColor` / `NO_COLOR`) applies. The filter strips DEC private modes (`ESC[?...h/l`) including the DEC 2026 envelope and the `ESC[?1049h` alt-buffer toggle, which would re-introduce the pre-`36e5e27` flicker. Verified against PowerShell `StringDecorated.cs`.
 
 **Design split**:
 - `Get-UsageSnapshot` — pure data-gathering: enumerates slots, calls `Get-SlotUsage`, returns `{ Results, NoSlots, HasCacheFallback }`. Never renders. Used by both one-shot and watch paths. Reconcile runs once per poll boundary.

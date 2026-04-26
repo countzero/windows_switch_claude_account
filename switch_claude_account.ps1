@@ -839,6 +839,41 @@ function Write-Color {
     }
 }
 
+# Single chokepoint for ALL non-color VT control sequences in the watch
+# lifecycle (alt screen buffer, cursor hide/show, DEC 2026 synchronized
+# output, clear screen, cursor home).
+#
+# Why this exists: PowerShell's `OutputRendering = 'PlainText'` (set by
+# `-NoColor` / `$env:NO_COLOR` in `Invoke-Main`) routes every `Write-Host`
+# string through `StringDecorated.AnsiRegex`, which is the union of
+#   GraphicsRegex  : \x1b\[\d*(;\d+)*m       SGR (color/style)
+#   CsiRegex       : \x1b\[\?\d+[hl]         DEC private modes
+#   HyperlinkRegex : \x1b\]8;;.*?\x1b\\      OSC 8 hyperlinks
+# (verified against PowerShell `StringDecorated.cs`). The DEC 2026 sync
+# envelope (`ESC[?2026h`/`l`), alt buffer (`ESC[?1049h`/`l`), and cursor
+# hide/show (`ESC[?25l`/`h`) all match `CsiRegex` and are stripped through
+# Write-Host -- which silently disables flicker-free rendering in NoColor
+# watch mode. `[Console]::Out.Write` bypasses `StringDecorated` entirely,
+# so DEC private modes survive regardless of `OutputRendering`.
+#
+# Body color SGR continues to flow through `Write-Color` -> `Write-Host`
+# so `PlainText` still strips body color in `-NoColor` mode (correct).
+# `ESC[2J` (clear) and `ESC[H` (cursor home) survive both paths because
+# their terminators (J, H) match neither regex; they could go through
+# Write-Host without harm, but routing them through this helper keeps
+# the watch lifecycle's VT writes consistent.
+#
+# `[Console]::Out.Flush()` is belt-and-suspenders -- on an interactive
+# console handle .NET's TextWriter wrapper writes through immediately,
+# but the explicit flush guarantees ordering vs. subsequent Write-Host
+# body emission and costs nothing on a 1Hz loop.
+function Write-VTSequence {
+    Param ([Parameter(Mandatory)] [String] $Sequence)
+
+    [Console]::Out.Write($Sequence)
+    [Console]::Out.Flush()
+}
+
 # We are sanitizing names to ensure compatibility with the
 # Windows filesystem by replacing invalid characters with underscores,
 # trimming trailing dots (also invalid on Windows), and rejecting
@@ -2907,22 +2942,16 @@ $Script:UsageWatchMinInterval = 60
 # — no regression. Renderer functions are reused unchanged; only this
 # loop emits the wrapper sequences.
 #
-# Unified write path. Every VT control sequence in the watch lifecycle
-# (alt-buffer enter/leave, cursor hide/show, sync-mode start/end, clear
-# screen, cursor home) is emitted via `Write-Host -NoNewline`, NOT via
-# [Console]::Out.Write. This is the bug fix for the "watch mode is
-# B&W" issue: when raw VT sequences are emitted via [Console]::Out.Write
-# while body content goes through Write-Host -ForegroundColor (which
-# routes via $Host.UI), the two write paths use independent flush
-# queues. The host's ANSI SGR codes can land outside the sync envelope
-# (or after the ESC[2J that just cleared them), making the body render
-# in default attributes. Routing every byte through Write-Host forces a
-# single flush queue and a deterministic byte order. The non-color VT
-# sequences (alt buffer / sync mode / clear / home / cursor hide) are
-# message bytes -- not SGR attributes -- so they remain unaffected by
-# $PSStyle.OutputRendering = 'PlainText'. That means watch mode keeps
-# working in no-color mode; only the body's color SGR codes are
-# suppressed.
+# VT control sequences (alt buffer, sync mode, cursor hide/show, clear,
+# home) are emitted via `Write-VTSequence` so they bypass the
+# `Write-Host` -> `StringDecorated.AnsiRegex` filter that
+# `OutputRendering = 'PlainText'` (set by `-NoColor` / `NO_COLOR`)
+# applies. The filter strips DEC private modes (`ESC[?...h/l`) including
+# the DEC 2026 envelope and the `ESC[?1049h` alt-buffer toggle, which
+# would re-introduce the pre-36e5e27 flicker. Body color SGR keeps
+# flowing through `Write-Color` -> `Write-Host` so `PlainText` correctly
+# strips body color in `-NoColor` mode. See `Write-VTSequence` docblock
+# for the verified mechanism.
 #
 # The loop is deliberately simple: blocking Invoke-RestMethod (via
 # Get-UsageSnapshot) inside the poll step, then a plain 1 s sleep
@@ -2951,11 +2980,7 @@ function Invoke-UsageWatch {
         # buffer gives a clean canvas and ensures the user's pre-watch
         # scrollback is restored on exit. Cursor-hide stops the caret
         # from blinking inside the table during the (atomic) repaint.
-        # Routed through Write-Host -NoNewline so every byte in the
-        # watch lifecycle shares the same flush queue as the body's
-        # Write-Host -ForegroundColor calls (see "Unified write path"
-        # in the function-level comment).
-        Write-Host "`e[?1049h`e[?25l" -NoNewline
+        Write-VTSequence "`e[?1049h`e[?25l"
         $enteredAlt = $true
         [Console]::CursorVisible = $false
 
@@ -3006,12 +3031,8 @@ function Invoke-UsageWatch {
             # iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal,
             # mintty, modern ConHost). Older terminals ignore the
             # unknown DEC mode markers and exhibit the prior
-            # Clear-Host-style flicker — no regression. Sync-envelope
-            # markers travel through Write-Host -NoNewline so they
-            # share a flush queue with the body's Write-Host calls;
-            # otherwise the host's ANSI SGR codes land outside the
-            # envelope and the body renders in default attributes.
-            Write-Host "`e[?2026h`e[2J`e[H" -NoNewline
+            # Clear-Host-style flicker — no regression.
+            Write-VTSequence "`e[?2026h`e[2J`e[H"
             if ($null -ne $snapshot) {
                 Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer
             } else {
@@ -3019,7 +3040,7 @@ function Invoke-UsageWatch {
                 Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Yellow'
                 Format-UsageFooter $footer
             }
-            Write-Host "`e[?2026l" -NoNewline
+            Write-VTSequence "`e[?2026l"
 
             # 1-second inter-frame wait. Ctrl-C terminates the loop via
             # the runtime's default handler; the surrounding `finally`
@@ -3031,12 +3052,10 @@ function Invoke-UsageWatch {
     finally {
         # Order matters: show cursor + leave alt buffer in one write so
         # the user's pre-watch terminal state is restored atomically.
-        # Same Write-Host -NoNewline routing as the entry write -- one
-        # uniform flush queue across the whole watch lifecycle. The
-        # CursorVisible API restore is belt-and-suspenders for the
+        # The CursorVisible API restore is belt-and-suspenders for the
         # .NET-side state.
         if ($enteredAlt) {
-            Write-Host "`e[?25h`e[?1049l" -NoNewline
+            Write-VTSequence "`e[?25h`e[?1049l"
         }
         [Console]::CursorVisible = $origCursor
     }
