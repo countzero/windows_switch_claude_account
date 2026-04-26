@@ -32,7 +32,7 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 | `switch`   | Optional      | Refuses if Claude Code is running. Reconciles first (so a pending Claude Code refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json`, then atomic-writes the destination slot's captured `oauthAccount` (whitelisted fields only) into `~/.claude.json` so Claude Code's `/status` follows the swap. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Refuses to activate a slot that has no sidecar. Output is a DarkYellow header line `[Switch] Switched to '<slot>' (<email>)`, the saved-slot table beneath, and a cyan `[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped).` Yellow advisory above the success line for the no-active-slot rotation edge case; single-slot-already-active no-op prints its advisory and skips the success line, table, and `[Info]` hint. |
 | `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape. Pure offline render — no network IO, no reconcile, no hashing. `*` marker comes from `state.active_slot`. Slots without a valid sidecar are silently filtered out (they cannot be activated; user must re-save while active to make them visible). |
 | `remove`   | Yes           | Deletes a named slot AND its sidecar. Walks the raw filesystem (not `Get-Slots`) so sidecar-less legacy slots can be cleaned up by name. Refuses to remove the slot tracked as active in state — user must `sca switch <other>` first. |
-| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens via `Update-SlotTokens`, which propagates the new tokens to `.credentials.json` when the slot is the tracked active. Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block. |
+| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens via `Update-SlotTokens`, which propagates the new tokens to `.credentials.json` when the slot is the tracked active. Accepts `-Json` for scripted output, or `-Watch` (optional `-Interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile |
 | `uninstall`| No            | Removes wrapper function + aliases from profile |
 | `help`     | No            | Shows detailed help |
@@ -48,7 +48,7 @@ The two credentials-touching actions that need a fresh slot file (`switch`, `usa
 ### Color conventions
 
 - **DarkYellow** is reserved for **section-title headers**: `[Usage] Plan usage`, `[Usage] Slot '<name>'`, `[List] Saved slots`, and `[Switch] Switched to <ident>`. These are the four lines that introduce a block of data (a table or a verbose detail view).
-- **Yellow** is reserved for **advisories / warnings**: rate-limit notices, reconcile auto-save / identity-change advisories, no-active-slot rotation branch, save-time profile-fetch failures, `-interval` clamping, etc. Anything yellow means "attention required", never "this is a header".
+- **Yellow** is reserved for **advisories / warnings**: rate-limit notices, reconcile auto-save / identity-change advisories, no-active-slot rotation branch, save-time profile-fetch failures, `-Interval` clamping, etc. Anything yellow means "attention required", never "this is a header".
 - **Green** marks success on actions that just produced a useful side effect (`[Save] Saved …`, `[Install] Installed!`).
 - **Red** marks completion of destructive actions (`[Remove] Removed …`, `[Uninstall] Uninstalled.`).
 - **Cyan** marks information hints, currently just the `[Info] Restart Claude Code …` line under the `switch` action's table.
@@ -58,11 +58,11 @@ The DarkYellow choice tracks the warm amber `#ffcb6b` used for `warning` / `info
 
 #### No-color mode
 
-`-nocolor` (CLI switch) and `$env:NO_COLOR` (the [no-color.org](https://no-color.org) de facto industry standard) suppress every color in the table above. Both surfaces degrade gracefully: structural text, the `*` active marker, table layout, table header underlines, and bar glyphs (`█`/`░`) are preserved unchanged — only the SGR codes that would tint them are skipped.
+`-NoColor` (CLI switch) and `$env:NO_COLOR` (the [no-color.org](https://no-color.org) de facto industry standard) suppress every color in the table above. Both surfaces degrade gracefully: structural text, the `*` active marker, table layout, table header underlines, and bar glyphs (`█`/`░`) are preserved unchanged — only the SGR codes that would tint them are skipped.
 
 Precedence (most → least specific):
 
-1. `-nocolor` switch on the CLI
+1. `-NoColor` switch on the CLI
 2. `$env:NO_COLOR` set to any non-empty value
 3. otherwise: colored (default)
 
@@ -117,9 +117,9 @@ Response schema (verified against a live Team-plan call on 2026-04-24):
 }
 ```
 
-All branches are optional; free-tier / API-key accounts receive `{}`. The `-json` switch emits the raw response under `data` per slot so scripts can pull any field the script itself does not format.
+All branches are optional; free-tier / API-key accounts receive `{}`. The `-Json` switch emits the raw response under `data` per slot so scripts can pull any field the script itself does not format.
 
-By design the script only **renders** two buckets in both the summary table and the verbose view: `five_hour` (labelled *Session*) and `seven_day` (labelled *Week*) — matching Claude Code's own `/usage` screen's first two bars. Every other bucket the endpoint returns (`seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal codenames) still round-trips through `-json`; it just does not have a human-readable row in the normal view. The labels were originally `Session (5h)` / `Weekly (all models)`; they were shortened to match the table column headers and the aggregate-bar labels (single visual cadence across all three surfaces).
+By design the script only **renders** two buckets in both the summary table and the verbose view: `five_hour` (labelled *Session*) and `seven_day` (labelled *Week*) — matching Claude Code's own `/usage` screen's first two bars. Every other bucket the endpoint returns (`seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal codenames) still round-trips through `-Json`; it just does not have a human-readable row in the normal view. The labels were originally `Session (5h)` / `Weekly (all models)`; they were shortened to match the table column headers and the aggregate-bar labels (single visual cadence across all three surfaces).
 
 Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { used_percentage, resets_at } } }` before handing it to its status-line hook — that is the schema you will find by grepping `used_percentage` in `claude.exe`. **Do not** trust the hook-input schema for parsing the raw endpoint response; use the shape above.
 
@@ -129,8 +129,8 @@ Claude Code separately re-shapes this body into `{ rate_limits: { five_hour: { u
 
 `Format-UsageTable` renders 5 data columns (plus the leading `*` active marker): `Slot | Account | Session | Week | Status`.
 
-- **Merged bucket cells**. `Session` and `Week` each combine utilization and reset delta in a single cell: `100% (2h 37m)`. A cold bucket (`utilization = 0`, `resets_at = null`) renders as just ` 0%` — the em-dash reset sentinel is only emitted when the bucket itself has no data at all. Column widths auto-fit to the widest cell in the batch. Headers were renamed from `5h` / `7d` to match the aggregate-bar labels above the table; status text such as `limited 5h` keeps the time-window shorthand because that string is also a `-json plan_status` contract value.
-- **Account column**. Pulls the email parsed from the slot filename by `Get-SlotFileInfo`. Renders `—` for unlabeled slots and for slots whose name equals the labeled email (dedup form). Long emails are middle-truncated with `…` at `$Script:AccountColumnMaxWidth = 32` characters; the full string is always retained in `sca usage <name>` verbose view and in `-json`. Replaces the previous `└─ email` continuation line — rows are now single-line.
+- **Merged bucket cells**. `Session` and `Week` each combine utilization and reset delta in a single cell: `100% (2h 37m)`. A cold bucket (`utilization = 0`, `resets_at = null`) renders as just ` 0%` — the em-dash reset sentinel is only emitted when the bucket itself has no data at all. Column widths auto-fit to the widest cell in the batch. Headers were renamed from `5h` / `7d` to match the aggregate-bar labels above the table; status text such as `limited 5h` keeps the time-window shorthand because that string is also a `-Json plan_status` contract value.
+- **Account column**. Pulls the email parsed from the slot filename by `Get-SlotFileInfo`. Renders `—` for unlabeled slots and for slots whose name equals the labeled email (dedup form). Long emails are middle-truncated with `…` at `$Script:AccountColumnMaxWidth = 32` characters; the full string is always retained in `sca usage <name>` verbose view and in `-Json`. Replaces the previous `└─ email` continuation line — rows are now single-line.
 - **Status column** mixes HTTP health with plan usability. When the `/api/oauth/usage` call succeeded, `Get-PlanStatus` derives the label from the utilization values:
 
   | State                                       | Label               | Color |
@@ -240,7 +240,7 @@ Slot identities are rendered via `Format-SlotIdentity`, the single source of tru
 
 The `Status:` line sits between `Account:` and the bucket rows so the usability verdict is the first thing read. `Get-StatusRationale` supplies a short English tail for the non-obvious labels (`limited 5h`, `limited 7d`, `limited`, `near limit`, `ok (no plan data)`); plain `ok` renders without a tail.
 
-### `-json` output
+### `-Json` output
 
 Each per-slot entry carries the same fields as before plus a `plan_status` string when the HTTP call succeeded:
 
@@ -259,9 +259,9 @@ Each per-slot entry carries the same fields as before plus a `plan_status` strin
 
 `plan_status` values match the Status column labels verbatim so scripts can branch on usability without re-deriving the thresholds. The full untruncated email always lives in `account.email`, regardless of the summary table's truncation width. `is_cached_fallback` is the JSON-side signal of the same condition the `Anthropic API rate limited — displaying cached data.` advisory surfaces in the human view; absence means the data was fetched live for this run.
 
-### Watch mode (`sca usage -watch`)
+### Watch mode (`sca usage -Watch`)
 
-`Invoke-UsageWatch` provides a self-refreshing live view of the usage table or verbose view. It re-polls the endpoint every `-interval` seconds (default **60 s**, floor **60 s**) and redraws the frame once per second so reset deltas (`(2h 37m)`) and the countdown footer tick visibly between polls.
+`Invoke-UsageWatch` provides a self-refreshing live view of the usage table or verbose view. It re-polls the endpoint every `-Interval` seconds (default **60 s**, floor **60 s**) and redraws the frame once per second so reset deltas (`(2h 37m)`) and the countdown footer tick visibly between polls.
 
 **Flicker-free rendering.** The loop enters the alternate screen buffer (`ESC[?1049h`) and hides the cursor (`ESC[?25l`) on entry; the `finally` block restores both on Ctrl-C. Each frame is wrapped in DEC mode 2026 (synchronized output: `ESC[?2026h` … `ESC[?2026l`) with `ESC[2J` + cursor-home (`ESC[H`) at the start, then the existing `Format-UsageFrame` renderer is called unchanged. Inside the sync envelope the terminal buffers the clear-and-redraw and presents one atomic frame, so the user never sees the intermediate "blank screen" frame that the prior `Clear-Host` produced. Terminals that support DEC 2026 (Windows Terminal ≥ v1.13, VS Code, iTerm2 ≥ 3.4.13, kitty, alacritty, WezTerm, foot, gnome-terminal/vte, mintty, modern ConHost) render flicker-free; older terminals silently ignore the unknown DEC private mode and exhibit the previous `Clear-Host`-style flicker (no regression). Renderer functions (`Format-UsageFrame`, `Format-UsageTable`, `Format-AggregateBars`, `Format-UsageVerbose`, `Format-UsageFooter`) are untouched — only `Invoke-UsageWatch` emits the wrapper sequences, so the one-shot `sca usage` / `sca list` / `sca switch` paths are unaffected.
 
@@ -279,10 +279,10 @@ Design split driven by the watch loop:
 
 Runtime guards (both throw, neither runs the loop):
 
-- `-watch -json` — mutually exclusive; `-watch` is interactive, `-json` is for scripting.
-- `[Console]::IsOutputRedirected` — `sca usage -watch > file.txt` is refused rather than silently filling the file with alt-buffer / cursor-control / sync-mode escape sequences; the error message points at `-json`.
+- `-Watch -Json` — mutually exclusive; `-Watch` is interactive, `-Json` is for scripting. Enforced both by the top-level Param block's parameter sets (binder-level rejection with `Parameter set cannot be resolved`) and by a runtime guard inside `Invoke-UsageAction` for direct callers (notably the test suite) that bypass `Invoke-Main`.
+- `[Console]::IsOutputRedirected` — `sca usage -Watch > file.txt` is refused rather than silently filling the file with alt-buffer / cursor-control / sync-mode escape sequences; the error message points at `-Json`.
 
-Interval clamping: values below `$Script:UsageWatchMinInterval = 60` get clamped up to 60 with a one-line yellow advisory. The floor matches the default so `-interval` can only *slow* the poll — this is deliberate, the unofficial endpoint has no published rate limit and we prefer conservative cadence.
+Interval clamping: values below `$Script:UsageWatchMinInterval = 60` get clamped up to 60 with a one-line yellow advisory. The floor matches the default so `-Interval` can only *slow* the poll — this is deliberate, the unofficial endpoint has no published rate limit and we prefer conservative cadence.
 
 Exit: Ctrl-C only. The loop installs no key listeners (no `[Console]::KeyAvailable` / `ReadKey`); the runtime's default Ctrl-C handler terminates the pipeline and PowerShell runs the `finally` block, which leaves the alternate screen buffer (so the user's pre-watch terminal scrollback is restored, mirroring `top` / `htop` / `vim`) and restores cursor visibility. There is no interactive force-refresh — to bypass the poll interval, quit and re-run.
 
@@ -334,7 +334,7 @@ The `@`-in-parens requirement keeps a slot named e.g. `work(v2)` parsing as *slo
 
 **Filename-email vs sidecar-email**: by save-time construction, `.credentials.<name>(<email>).json`'s `<email>` always equals the sidecar's `oauthAccount.emailAddress`. `Format-AccountCell` (the cell renderer) reads the filename email; reconcile and switch use the sidecar block.
 
-**`sca list` / `sca usage` display**: emails render inline in the `Account` column on the same row as the slot name — no `└─ <email>` continuation. `Format-AccountCell` returns `—` when the slot name (case-insensitive) equals its embedded email (dedup form), and the middle-truncated email otherwise. The full untruncated email always lives in `sca usage <name>` verbose output and in `sca usage -json`.
+**`sca list` / `sca usage` display**: emails render inline in the `Account` column on the same row as the slot name — no `└─ <email>` continuation. `Format-AccountCell` returns `—` when the slot name (case-insensitive) equals its embedded email (dedup form), and the middle-truncated email otherwise. The full untruncated email always lives in `sca usage <name>` verbose output and in `sca usage -Json`.
 
 **On-disk cleanup from v1**: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` cache sidecars from the cache-based v1 implementation on each enumeration (different filename pattern from the post-v2.1.0 `.account.json` sidecar; the v1 cleanup is cheap and idempotent once complete).
 

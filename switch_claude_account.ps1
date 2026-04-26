@@ -40,39 +40,49 @@ characters are automatically sanitized to underscores.
 .\switch_claude_account.ps1 install
 #>
 
+[CmdletBinding(DefaultParameterSetName = 'Default')]
 Param (
-    [Parameter(Mandatory = $false)]
-    [ValidateSet("save", "switch", "list", "remove", "usage", "install", "uninstall", "help")]
-    [String]
-    $Action,
+    [Parameter(Position = 0)]
+    [ValidateSet('save', 'switch', 'list', 'remove', 'usage', 'install', 'uninstall', 'help')]
+    [string] $Action,
 
-    [Parameter(Mandatory = $false)]
-    [String]
-    $Name = "",
+    [Parameter(Position = 1)]
+    [string] $Name,
 
-    [switch]
-    $help,
+    [switch] $Help,
 
-    # -json: emit the `usage` action's output as a machine-parseable JSON
-    # object keyed by slot name. Ignored by other actions.
-    [switch]
-    $json,
+    # -Json: emit the `usage` action's output as a machine-parseable JSON
+    # object keyed by slot name. Ignored by other actions. Lives in its
+    # own parameter set so the binder rejects -Json -Watch combinations
+    # before any function body runs (Get-Help shows them as separate
+    # syntax forms).
+    [Parameter(ParameterSetName = 'Json')]
+    [switch] $Json,
 
-    # -watch: render a live, self-refreshing `usage` view that polls
-    # /api/oauth/usage every -interval seconds and redraws every second
+    # -Watch: render a live, self-refreshing `usage` view that polls
+    # /api/oauth/usage every -Interval seconds and redraws every second
     # (so reset deltas and the countdown footer tick visibly). Interactive
     # only — exits on Ctrl-C (runtime default). Mutually exclusive with
-    # -json. Ignored by other actions.
-    [switch]
-    $watch,
+    # -Json (enforced by parameter sets). Ignored by other actions.
+    # Mandatory in the 'Watch' set so it anchors the set: passing -Interval
+    # alone resolves the binder to the 'Watch' set and then fails with
+    # "Cannot process command because of one or more missing mandatory
+    # parameters: Watch", giving an immediate diagnosis instead of silently
+    # falling through to a non-watch usage call.
+    [Parameter(ParameterSetName = 'Watch', Mandatory = $true)]
+    [switch] $Watch,
 
-    # -interval: seconds between HTTP polls when -watch is set. Floor is
-    # 60 to keep the unofficial endpoint politely polled; values below 60
-    # get clamped up with a one-line notice. Defaults to 60.
-    [int]
-    $interval = 60,
+    # -Interval: seconds between HTTP polls when -Watch is set. Bound to
+    # the 'Watch' parameter set so the binder rejects -Interval without
+    # -Watch (-Watch is the set's mandatory anchor; see above).
+    # [ValidateRange] rejects zero / negatives at bind time. The
+    # 60-second floor is enforced as a runtime clamp-with-advisory inside
+    # Invoke-UsageWatch (deliberate — see CLAUDE.md "Watch mode").
+    [Parameter(ParameterSetName = 'Watch')]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int] $Interval = 60,
 
-    # -nocolor: suppress all ANSI color output for this invocation. We
+    # -NoColor: suppress all ANSI color output for this invocation. We
     # implement no-color via two cooperating pieces:
     #   1. The `Write-Color` helper wraps every colored message string
     #      with inline ANSI SGR codes (NOT the legacy -ForegroundColor
@@ -83,14 +93,13 @@ Param (
     #      Invoke-Main: PowerShell's `WriteImpl` -> `GetOutputString`
     #      then strips inline SGR codes from every Write-Host message
     #      before they reach stdout, so the terminal sees plain text.
-    # Precedence: -nocolor flag > $env:NO_COLOR non-empty > default colored.
+    # Precedence: -NoColor flag > $env:NO_COLOR non-empty > default colored.
     # NO_COLOR (https://no-color.org) is honored as the de facto industry
     # standard for opting out of colors without per-invocation flags.
     # Watch mode's alt-buffer / sync-mode / clear-screen / cursor-home VT
     # sequences are message bytes (not SGR), so they remain unaffected --
     # watch mode keeps working in B&W; only color tinting is suppressed.
-    [switch]
-    $nocolor
+    [switch] $NoColor
 )
 
 # We are resolving the script path to reference this file when
@@ -193,7 +202,7 @@ $Script:AggregateYellowPct     = 50
 # Emails longer than this get rendered as `aaa…zzz` with an ellipsis in
 # the middle so the domain (which disambiguates accounts under the same
 # local-part) stays visible. The verbose `sca usage <name>` view and
-# `-json` output always carry the full email.
+# `-Json` output always carry the full email.
 $Script:AccountColumnMaxWidth  = 32
 
 # --- State file + atomic credential-file write primitives -----------------
@@ -719,7 +728,7 @@ function Show-Help {
         "  help, -h         Show this help",
         "",
         "OPTIONS",
-        "  -nocolor         Suppress all ANSI color output (also: set NO_COLOR env var)",
+        "  -NoColor         Suppress all ANSI color output (also: set NO_COLOR env var)",
         "",
         "EXAMPLES",
         "  $cmd save slot-1                 # save current login as 'slot-1'",
@@ -728,10 +737,10 @@ function Show-Help {
         "  $cmd list                        # show all slots",
         "  $cmd remove slot-1               # delete a slot",
         "  $cmd usage                       # show Session + Week usage for every slot",
-        "  $cmd usage -watch                # live refresh; 60s polls; Ctrl-C to quit",
-        "  $cmd usage -watch -interval 300  # slower refresh (floor is 60s)",
-        "  $cmd usage -json                 # emit usage as JSON for scripting",
-        "  $cmd usage -nocolor              # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
+        "  $cmd usage -Watch                # live refresh; 60s polls; Ctrl-C to quit",
+        "  $cmd usage -Watch -Interval 300  # slower refresh (floor is 60s)",
+        "  $cmd usage -Json                 # emit usage as JSON for scripting",
+        "  $cmd usage -NoColor              # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
         "",
         "FILES",
         "  Active login : %USERPROFILE%\.claude\.credentials.json",
@@ -757,7 +766,7 @@ function Show-Help {
 # bytes via `Console.Out.Write`, then restores the attribute. The two
 # channels (byte stream + Win32 attribute API) are not synchronized
 # with each other -- inside DEC 2026 sync mode + the alternate screen
-# buffer (`sca usage -watch`) the per-cell attributes don't align with
+# buffer (`sca usage -Watch`) the per-cell attributes don't align with
 # the buffered cell writes, and the body renders in default colors.
 # Verified against PS 7.6 source: ConsoleHostUserInterface.cs's
 # `Write(fg, bg, value, newLine)` is `RawUI.ForegroundColor = X` ->
@@ -770,7 +779,7 @@ function Show-Help {
 #      renders in color.
 #   2. Flows through PowerShell's `WriteImpl(string)` -> `GetOutputString
 #      (value, supportsVT)` filter, which strips SGR when
-#      `$PSStyle.OutputRendering = 'PlainText'` -> -nocolor mode works.
+#      `$PSStyle.OutputRendering = 'PlainText'` -> -NoColor mode works.
 #
 # The previous `$PSStyle.OutputRendering = 'PlainText'` toggle (in
 # `Invoke-Main`) was structurally broken on Windows for the legacy
@@ -2570,7 +2579,7 @@ function Format-ListTable {
 # ("Current session") and seven_day ("Current week (all models)"). Other
 # buckets returned by the endpoint are intentionally not rendered here
 # because they are not the limits the user is tracking; they remain
-# accessible via `sca usage <name> -json`.
+# accessible via `sca usage <name> -Json`.
 function Format-UsageVerbose {
     Param ([object] $Result)
 
@@ -2639,7 +2648,7 @@ function Format-UsageVerbose {
 #
 # Invoke-UsageAction was originally a single function that both gathered
 # per-slot usage data and wrote the output. Splitting the two makes
-# `sca usage -watch` possible: the watch loop re-gathers a fresh snapshot
+# `sca usage -Watch` possible: the watch loop re-gathers a fresh snapshot
 # each poll, keeps the previous snapshot visible during HTTP failures,
 # and calls the same frame renderer that the one-shot path uses. The
 # split also keeps the test matrix clean — unit tests mock the data
@@ -2779,18 +2788,21 @@ function Format-UsageFooter {
 
 function Invoke-UsageAction {
     Param (
-        [String] $Name,
-        [switch] $json,
-        [switch] $watch,
-        [int]    $interval = $Script:UsageWatchMinInterval
+        [string] $Name,
+        [switch] $Json,
+        [switch] $Watch,
+        [int]    $Interval = $Script:UsageWatchMinInterval
     )
 
-    if ($json -and $watch) {
-        throw "-watch and -json cannot be combined; -watch is interactive, -json is for scripting."
+    # The top-level Param block enforces -Json/-Watch mutual exclusion via
+    # parameter sets; this runtime guard is belt-and-suspenders for direct
+    # callers (notably the test suite) that bypass Invoke-Main.
+    if ($Json -and $Watch) {
+        throw "-Watch and -Json cannot be combined; -Watch is interactive, -Json is for scripting."
     }
 
-    if ($watch) {
-        Invoke-UsageWatch -Name $Name -Interval $interval
+    if ($Watch) {
+        Invoke-UsageWatch -Name $Name -Interval $Interval
         return
     }
 
@@ -2798,9 +2810,9 @@ function Invoke-UsageAction {
     # have written into .credentials.json since the last sca call. The
     # subsequent Get-SlotUsage calls then read fresh tokens and the table
     # marker is correct without relying on a synthetic <active> row.
-    # Suppress any reconcile advisory in -json mode so the JSON output
+    # Suppress any reconcile advisory in -Json mode so the JSON output
     # stays parseable.
-    if ($json) {
+    if ($Json) {
         Invoke-Reconcile 6>$null | Out-Null
     } else {
         Invoke-Reconcile | Out-Null
@@ -2808,7 +2820,7 @@ function Invoke-UsageAction {
 
     $snapshot = Get-UsageSnapshot -Name $Name
 
-    if ($json) {
+    if ($Json) {
         # Per-slot dictionary. Each entry carries the raw response under
         # .data so scripts can pull any field Anthropic returns, including
         # buckets this script does not render in the table or verbose view.
@@ -2848,14 +2860,14 @@ function Invoke-UsageAction {
     Format-UsageFrame -Name $Name -Snapshot $snapshot
 }
 
-# Minimum poll interval for -watch. Matches the default so users can only
+# Minimum poll interval for -Watch. Matches the default so users can only
 # adjust the interval upward; the floor is the "polite" setting for the
 # unofficial endpoint and we refuse to go faster. Clamping up (rather
 # than throwing) keeps the call ergonomic for users who just typed a
 # round number.
 $Script:UsageWatchMinInterval = 60
 
-# Live `sca usage -watch` loop: redraws once per second and re-polls the
+# Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. Interactive only — throws when output
 # is redirected because the alt-screen + cursor-control sequences would
 # poison a captured log. Exits on Ctrl-C via the runtime's default
@@ -2906,11 +2918,11 @@ function Invoke-UsageWatch {
     )
 
     if ([Console]::IsOutputRedirected) {
-        throw "-watch requires an interactive terminal; for scripted output use 'sca usage -json'."
+        throw "-Watch requires an interactive terminal; for scripted output use 'sca usage -Json'."
     }
 
     if ($Interval -lt $Script:UsageWatchMinInterval) {
-        Write-Color "[Usage] -interval below minimum; clamping to $($Script:UsageWatchMinInterval)s (polite to the unofficial endpoint)." 'Yellow'
+        Write-Color "[Usage] -Interval below minimum; clamping to $($Script:UsageWatchMinInterval)s (polite to the unofficial endpoint)." 'Yellow'
         $Interval = $Script:UsageWatchMinInterval
     }
 
@@ -3023,7 +3035,7 @@ function Invoke-UsageWatch {
 # the chokepoint of every Write-Host -ForegroundColor call (and every
 # other ANSI-emitting cmdlet), so no per-call-site refactor is needed.
 # Precedence (most -> least specific):
-#   1. -nocolor switch (CLI flag)
+#   1. -NoColor switch (CLI flag)
 #   2. $env:NO_COLOR non-empty (https://no-color.org de facto standard)
 #   3. default colored
 # The previous $PSStyle.OutputRendering value is captured up-front and
@@ -3032,7 +3044,7 @@ function Invoke-UsageWatch {
 # suite, which calls Invoke-*Action directly and bypasses Invoke-Main)
 # are unaffected.
 function Invoke-Main {
-    if ($help -or $Action -eq "help" -or $Action -eq "") {
+    if ($Help -or $Action -eq "help" -or $Action -eq "") {
         Show-Help
         return
     }
@@ -3045,7 +3057,7 @@ function Invoke-Main {
 
     $previousRendering = $PSStyle.OutputRendering
     try {
-        if ($nocolor -or -not [string]::IsNullOrEmpty($env:NO_COLOR)) {
+        if ($NoColor -or -not [string]::IsNullOrEmpty($env:NO_COLOR)) {
             $PSStyle.OutputRendering = 'PlainText'
         }
 
@@ -3056,7 +3068,7 @@ function Invoke-Main {
             "switch"    { Invoke-SwitchAction -Name $Name }
             "list"      { Invoke-ListAction }
             "remove"    { Invoke-RemoveAction -Name $Name }
-            "usage"     { Invoke-UsageAction  -Name $Name -json:$json -watch:$watch -interval $interval }
+            "usage"     { Invoke-UsageAction  -Name $Name -Json:$Json -Watch:$Watch -Interval $Interval }
         }
     }
     finally {

@@ -249,10 +249,10 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'help, -h'
         }
 
-        It 'documents the -nocolor option and the NO_COLOR env var' {
+        It 'documents the -NoColor option and the NO_COLOR env var' {
             $out = Show-Help 6>&1 | Out-String
             $out | Should -Match 'OPTIONS'
-            $out | Should -Match '-nocolor'
+            $out | Should -Match '-NoColor'
             $out | Should -Match 'NO_COLOR'
         }
     }
@@ -275,7 +275,7 @@ Describe 'switch_claude_account' {
         #
         # We mock Invoke-ListAction so the action body becomes a single
         # capture line that records $PSStyle.OutputRendering DURING
-        # dispatch. Pester 5's dynamic scoping makes the in-It $nocolor
+        # dispatch. Pester 5's dynamic scoping makes the in-It $NoColor
         # / $Action assignments visible to Invoke-Main (which is defined
         # at the dot-sourced script scope and reads its parameters via
         # the parent scope chain).
@@ -288,10 +288,10 @@ Describe 'switch_claude_account' {
             if (Test-Path Env:\NO_COLOR) { Remove-Item Env:\NO_COLOR }
         }
 
-        It 'sets OutputRendering=PlainText during dispatch when -nocolor is bound, and restores on exit' {
+        It 'sets OutputRendering=PlainText during dispatch when -NoColor is bound, and restores on exit' {
             $PSStyle.OutputRendering = 'Host'
             try {
-                $nocolor = $true
+                $NoColor = $true
                 $Action  = 'list'
 
                 Invoke-Main
@@ -320,7 +320,7 @@ Describe 'switch_claude_account' {
             }
         }
 
-        It 'leaves OutputRendering untouched when neither -nocolor nor $env:NO_COLOR is set' {
+        It 'leaves OutputRendering untouched when neither -NoColor nor $env:NO_COLOR is set' {
             $PSStyle.OutputRendering = 'Host'
             try {
                 $Action = 'list'

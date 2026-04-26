@@ -365,7 +365,7 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match ('X' * 100)
         }
 
-        It '-json emits is_cached_fallback when cache served the row' {
+        It '-Json emits is_cached_fallback when cache served the row' {
             $slotPath = New-Slot -Name 'slot-1' -ExpiresAt $script:PastMs
 
             $Script:SlotUsageCache[$slotPath] = @{
@@ -381,13 +381,13 @@ Describe 'switch_claude_account' {
                 throw $inner
             }
 
-            $parsed = Invoke-UsageAction -json | ConvertFrom-Json
+            $parsed = Invoke-UsageAction -Json | ConvertFrom-Json
             $parsed.'slot-1'.status              | Should -Be 'ok'
             $parsed.'slot-1'.is_cached_fallback  | Should -Be $true
             $parsed.'slot-1'.data.five_hour.utilization | Should -Be 1
         }
 
-        It '-json omits is_cached_fallback for fresh live responses' {
+        It '-Json omits is_cached_fallback for fresh live responses' {
             New-Slot -Name 'fresh' | Out-Null
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 return [pscustomobject]@{
@@ -395,14 +395,14 @@ Describe 'switch_claude_account' {
                 }
             }
 
-            $parsed = Invoke-UsageAction -json | ConvertFrom-Json
+            $parsed = Invoke-UsageAction -Json | ConvertFrom-Json
             $parsed.fresh.status | Should -Be 'ok'
             # Property either absent or explicitly false — never true.
             $hasField = ($parsed.fresh | Get-Member -Name 'is_cached_fallback' -MemberType NoteProperty)
             if ($hasField) { $parsed.fresh.is_cached_fallback | Should -Not -Be $true }
         }
 
-        It '-json emits a per-slot dictionary that round-trips via ConvertFrom-Json' {
+        It '-Json emits a per-slot dictionary that round-trips via ConvertFrom-Json' {
             New-Slot -Name 'alpha' | Out-Null
             New-Slot -Name 'bravo' -AccessToken 'sk-ant-oat-bravo' -RefreshToken 'sk-ant-ort-bravo' | Out-Null
 
@@ -415,7 +415,7 @@ Describe 'switch_claude_account' {
                 throw [System.Exception]::new('network down')
             }
 
-            $raw    = Invoke-UsageAction -json
+            $raw    = Invoke-UsageAction -Json
             $parsed = $raw | ConvertFrom-Json
 
             ($parsed | Get-Member -MemberType NoteProperty | ForEach-Object Name) | Sort-Object |
@@ -514,7 +514,7 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match 'limited'
         }
 
-        It '-json emits plan_status alongside status for HTTP-ok rows' {
+        It '-Json emits plan_status alongside status for HTTP-ok rows' {
             New-Slot -Name 'capped' | Out-Null
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 return [pscustomobject]@{
@@ -523,20 +523,20 @@ Describe 'switch_claude_account' {
                 }
             }
 
-            $raw    = Invoke-UsageAction -json
+            $raw    = Invoke-UsageAction -Json
             $parsed = $raw | ConvertFrom-Json
 
             $parsed.capped.status      | Should -Be 'ok'
             $parsed.capped.plan_status | Should -Be 'limited 5h'
         }
 
-        It '-json omits plan_status for HTTP-failure rows' {
+        It '-Json omits plan_status for HTTP-failure rows' {
             New-Slot -Name 'dead' | Out-Null
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 throw [System.Exception]::new('network down')
             }
 
-            $raw    = Invoke-UsageAction -json
+            $raw    = Invoke-UsageAction -Json
             $parsed = $raw | ConvertFrom-Json
 
             $parsed.dead.status      | Should -Be 'error'
@@ -771,9 +771,9 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match 'not hardlinked'
         }
 
-        It '-json mode suppresses reconcile advisory text from stdout' {
+        It '-Json mode suppresses reconcile advisory text from stdout' {
             # The auto-save branch normally prints a yellow advisory; in
-            # -json mode the JSON output must remain parseable.
+            # -Json mode the JSON output must remain parseable.
             $payload = @{
                 claudeAiOauth = @{
                     accessToken      = 'sk-ant-oat-JSON'
@@ -792,19 +792,19 @@ Describe 'switch_claude_account' {
                 }
             }
 
-            $raw = Invoke-UsageAction -json
+            $raw = Invoke-UsageAction -Json
             { $raw | ConvertFrom-Json } | Should -Not -Throw
             $raw | Should -Not -Match '\[Sync\]'
         }
 
-        # --- Get-UsageSnapshot / Format-UsageFrame / -watch guards ---
+        # --- Get-UsageSnapshot / Format-UsageFrame / -Watch guards ---
         #
         # The watch loop itself (sleeps + key reads) is not unit-tested;
         # instead we exercise the three seams it is built on:
         #   1. Get-UsageSnapshot returns the data shape the loop consumes.
         #   2. Format-UsageFrame renders a frame + optional footer.
-        #   3. Invoke-UsageAction -watch refuses bad surfaces (redirected
-        #      output, combined with -json).
+        #   3. Invoke-UsageAction -Watch refuses bad surfaces (redirected
+        #      output, combined with -Json).
 
         It 'Get-UsageSnapshot returns Results + NoSlots flags' {
             New-Slot -Name 'alpha' | Out-Null
@@ -845,12 +845,12 @@ Describe 'switch_claude_account' {
             ($out.IndexOf('alpha')) | Should -BeLessThan ($out.IndexOf('HELLO-FROM-FOOTER'))
         }
 
-        It 'Invoke-UsageAction -watch -json throws (mutually exclusive)' {
-            { Invoke-UsageAction -watch -json 6>$null } |
-                Should -Throw -ExpectedMessage '*-watch and -json cannot be combined*'
+        It 'Invoke-UsageAction -Watch -Json throws (mutually exclusive)' {
+            { Invoke-UsageAction -Watch -Json 6>$null } |
+                Should -Throw -ExpectedMessage '*-Watch and -Json cannot be combined*'
         }
 
-        It 'Invoke-UsageAction -watch throws when stdout is redirected (interactive guard)' {
+        It 'Invoke-UsageAction -Watch throws when stdout is redirected (interactive guard)' {
             # Pester cannot truly redirect the outer console, but we can
             # fake [Console]::IsOutputRedirected by defining a local
             # override. Use the script's defensive: we expect the check
@@ -858,7 +858,7 @@ Describe 'switch_claude_account' {
             # deterministic. To simulate, we temporarily alias Console's
             # static property via a wrapper: not feasible without PSCustom
             # refactor, so instead we assert the *loop itself does not run*
-            # by setting -interval high and confirming the guard fires
+            # by setting -Interval high and confirming the guard fires
             # before any HTTP call. The cleanest check is to rely on the
             # happy-path assertion elsewhere and skip the redirected test
             # when [Console]::IsOutputRedirected is false (the Pester
@@ -868,8 +868,8 @@ Describe 'switch_claude_account' {
                 Set-ItResult -Skipped -Because 'Console stdout is not redirected in this host; guard cannot be exercised here.'
                 return
             }
-            { Invoke-UsageAction -watch 6>$null } |
-                Should -Throw -ExpectedMessage '*-watch requires an interactive terminal*'
+            { Invoke-UsageAction -Watch 6>$null } |
+                Should -Throw -ExpectedMessage '*-Watch requires an interactive terminal*'
         }
     }
 
@@ -1486,7 +1486,7 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match '└─'
         }
 
-        It 'middle-truncates long emails in the Account column (full email kept in -json)' {
+        It 'middle-truncates long emails in the Account column (full email kept in -Json)' {
             # Craft an email longer than $Script:AccountColumnMaxWidth (32)
             # so the truncation path fires.
             $longEmail = 'extremely.long.local.part@extraordinarily-long-domain.example.com'
@@ -1514,9 +1514,9 @@ Describe 'switch_claude_account' {
             $out | Should -Match '…'
             $out | Should -Not -Match ([regex]::Escape($longEmail))
 
-            # -json must still carry the full untruncated email under
+            # -Json must still carry the full untruncated email under
             # account.email for scripting consumers.
-            $raw    = Invoke-UsageAction -json
+            $raw    = Invoke-UsageAction -Json
             $parsed = $raw | ConvertFrom-Json
             $parsed.longslot.account.email | Should -Be $longEmail
         }
