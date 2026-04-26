@@ -17,17 +17,17 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 ```
 [Usage] Plan usage
 
-  Session  [█████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  22%
+  Session  [█████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  22%
 
-  Week     [██████████████████████████░░░░░░░░░░░░░░░░░]  62%
+  Week     [███████████████████████████░░░░░░░░░░░░░░░░]  62%
 
      Slot         Account                 Session         Week           Status
      -----------  ----------------------  --------------  -------------  -----------
-  *  work         alex@acme.io             18% (2h 11m)    42% (102h)     ok
-     personal     alex.dev@gmail.com        3% (4h 02m)     7% (146h)     ok
-     dev          alex@startup.dev          9% (3h 41m)    34% (118h)     ok
-     client-acme  ada.lovelace@arpa.net    71% (1h 04m)    92% (41h)      near limit
-     legacy       team@example.com         12% (3h 18m)   100% (12h)     limited 7d
+  *  work         alex@acme.io            18% (2h 11m)    42% (102h)     ok
+     personal     alex.dev@gmail.com      3% (4h 02m)     7% (146h)      ok
+     dev          alex@startup.dev        9% (3h 41m)     34% (118h)     ok
+     client-acme  ada.lovelace@arpa.net   71% (1h 04m)    92% (41h)      near limit
+     legacy       team@example.com        12% (3h 18m)    100% (12h)     limited 7d
 
 [Watch] Last poll: 14:32:07  |  next in 47s
 ```
