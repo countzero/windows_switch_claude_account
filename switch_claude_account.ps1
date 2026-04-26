@@ -1860,11 +1860,18 @@ function Update-SlotTokens {
                 Update-ScaState -LastSyncHash $newHash | Out-Null
             }
             catch {
-                # Slot file is the source of truth; .credentials.json
-                # propagation failed but the next reconcile (next sca
-                # invocation) will re-mirror. Yellow advisory so the
-                # user sees the partial-failure state explicitly.
-                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Next sca invocation will retry." 'Yellow'
+                # Slot file holds the new tokens; .credentials.json still
+                # has the old ones. The next Invoke-Reconcile will hash-
+                # match-noop (state.last_sync_hash equals .credentials.json's
+                # current bytes) so this gap does NOT auto-heal -- the
+                # mirror direction is .credentials.json -> slot, never the
+                # reverse. The user must re-propagate explicitly via
+                # `sca switch <slot>` (which writes the slot's bytes back
+                # into .credentials.json). Until they do, Anthropic may
+                # have rotated the refresh_token we just consumed; Claude
+                # Code reading the stale .credentials.json could fail its
+                # own next refresh and require re-login.
+                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
             }
         }
     }
