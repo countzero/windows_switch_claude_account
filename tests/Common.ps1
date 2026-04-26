@@ -36,6 +36,17 @@ $global:PROFILE = [pscustomobject]@{ CurrentUserAllHosts = $script:FakeProfilePa
 # stops Invoke-Main from running, so tests drive individual functions.
 . $script:ScriptPath
 
+# Force PlainText rendering for the entire test session. With every colored
+# call site now going through Write-Color (which emits inline ANSI SGR
+# codes), PowerShell's WriteImpl -> GetOutputString filter strips those
+# codes when OutputRendering=PlainText. That keeps every existing
+# string-match assertion in the suite valid against the ANSI-stripped
+# byte stream -- no test pattern needs to know about ANSI codes. Tests
+# that need to verify the no-color toggle itself (Helpers.Tests.ps1's
+# 'No-color mode' Context) override this to 'Host' in their It bodies
+# and restore via try/finally.
+$PSStyle.OutputRendering = 'PlainText'
+
 # Default /api/oauth/profile mock: fails so rows have no email and the
 # two-line display short-circuits. Tests that exercise email display
 # override this with their own ParameterFilter mock. The filter makes

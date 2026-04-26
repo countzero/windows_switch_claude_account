@@ -72,19 +72,25 @@ Param (
     [int]
     $interval = 60,
 
-    # -NoColor: suppress all ANSI color output for this invocation. We
-    # implement no-color via a single $PSStyle.OutputRendering = 'PlainText'
-    # toggle inside Invoke-Main (PS 7.2+ native; the host respects this at
-    # the chokepoint of every Write-Host -ForegroundColor call). Precedence:
-    #   -NoColor flag > $env:NO_COLOR non-empty > default colored.
-    # The alt-buffer / sync-mode / clear-screen / cursor-home VT sequences
-    # in Invoke-UsageWatch are message bytes, not SGR attributes, so they
-    # are intentionally NOT suppressed by no-color mode -- watch mode
-    # remains fully functional in B&W. NO_COLOR (https://no-color.org) is
-    # honored as the de facto industry standard for opting out of colors
-    # without per-invocation flags.
+    # -nocolor: suppress all ANSI color output for this invocation. We
+    # implement no-color via two cooperating pieces:
+    #   1. The `Write-Color` helper wraps every colored message string
+    #      with inline ANSI SGR codes (NOT the legacy -ForegroundColor
+    #      attribute path, which is structurally broken on Windows for
+    #      this purpose -- see the helper's docstring for the full
+    #      mechanism).
+    #   2. A single `$PSStyle.OutputRendering = 'PlainText'` toggle in
+    #      Invoke-Main: PowerShell's `WriteImpl` -> `GetOutputString`
+    #      then strips inline SGR codes from every Write-Host message
+    #      before they reach stdout, so the terminal sees plain text.
+    # Precedence: -nocolor flag > $env:NO_COLOR non-empty > default colored.
+    # NO_COLOR (https://no-color.org) is honored as the de facto industry
+    # standard for opting out of colors without per-invocation flags.
+    # Watch mode's alt-buffer / sync-mode / clear-screen / cursor-home VT
+    # sequences are message bytes (not SGR), so they remain unaffected --
+    # watch mode keeps working in B&W; only color tinting is suppressed.
     [switch]
-    $NoColor
+    $nocolor
 )
 
 # We are resolving the script path to reference this file when
@@ -713,7 +719,7 @@ function Show-Help {
         "  help, -h         Show this help",
         "",
         "OPTIONS",
-        "  -NoColor         Suppress all ANSI color output (also: set NO_COLOR env var)",
+        "  -nocolor         Suppress all ANSI color output (also: set NO_COLOR env var)",
         "",
         "EXAMPLES",
         "  $cmd save slot-1                 # save current login as 'slot-1'",
@@ -725,7 +731,7 @@ function Show-Help {
         "  $cmd usage -watch                # live refresh; 60s polls; Ctrl-C to quit",
         "  $cmd usage -watch -interval 300  # slower refresh (floor is 60s)",
         "  $cmd usage -json                 # emit usage as JSON for scripting",
-        "  $cmd usage -NoColor              # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
+        "  $cmd usage -nocolor              # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
         "",
         "FILES",
         "  Active login : %USERPROFILE%\.claude\.credentials.json",
@@ -740,6 +746,70 @@ function Show-Help {
     )
 
     $lines | ForEach-Object { Write-Host $_ }
+}
+
+# Single chokepoint for ALL colored output. Replaces every previous
+# `Write-Host -ForegroundColor X` call site.
+#
+# Why this exists: on Windows, `Write-Host -ForegroundColor` does NOT
+# emit ANSI SGR codes. It calls the legacy Win32 `SetConsoleTextAttribute`
+# API (an out-of-band kernel RPC into conhost), then writes the text
+# bytes via `Console.Out.Write`, then restores the attribute. The two
+# channels (byte stream + Win32 attribute API) are not synchronized
+# with each other -- inside DEC 2026 sync mode + the alternate screen
+# buffer (`sca usage -watch`) the per-cell attributes don't align with
+# the buffered cell writes, and the body renders in default colors.
+# Verified against PS 7.6 source: ConsoleHostUserInterface.cs's
+# `Write(fg, bg, value, newLine)` is `RawUI.ForegroundColor = X` ->
+# `WriteImpl` -> restore. No ANSI emission anywhere.
+#
+# `Write-Color` puts SGR codes INTO the message string itself:
+#   `\e[<color>m<message>\e[0m`
+# That moves the color information into the byte stream, which:
+#   1. Sits inside the DEC 2026 sync envelope correctly -> watch mode
+#      renders in color.
+#   2. Flows through PowerShell's `WriteImpl(string)` -> `GetOutputString
+#      (value, supportsVT)` filter, which strips SGR when
+#      `$PSStyle.OutputRendering = 'PlainText'` -> -nocolor mode works.
+#
+# The previous `$PSStyle.OutputRendering = 'PlainText'` toggle (in
+# `Invoke-Main`) was structurally broken on Windows for the legacy
+# `-ForegroundColor` path before this refactor; this helper is what
+# actually makes that toggle effective.
+#
+# Color name mapping: PowerShell legacy `ConsoleColor` and PS7's
+# `$PSStyle.Foreground` use opposite naming conventions. Legacy
+# "Dark*" names = the standard ANSI 30-37 colors; legacy un-prefixed
+# names (Yellow, Green, Red...) = ANSI bright 90-97. So our existing
+# `DarkYellow` (warm amber/mustard headers) maps to
+# `$PSStyle.Foreground.Yellow` (ANSI 33), and `Yellow` (advisory)
+# maps to `BrightYellow` (ANSI 93). Visually equivalent to the
+# pre-refactor rendering on every modern terminal palette.
+function Write-Color {
+    Param (
+        [Parameter(Mandatory)] [String]              $Message,
+        [AllowEmptyString()]   [AllowNull()] [String] $Color,
+        [switch] $NoNewline
+    )
+
+    $sgr = switch ($Color) {
+        'Yellow'     { $PSStyle.Foreground.BrightYellow }
+        'DarkYellow' { $PSStyle.Foreground.Yellow       }
+        'Green'      { $PSStyle.Foreground.BrightGreen  }
+        'Red'        { $PSStyle.Foreground.BrightRed    }
+        'Cyan'       { $PSStyle.Foreground.BrightCyan   }
+        'Gray'       { $PSStyle.Foreground.White        }
+        'DarkGray'   { $PSStyle.Foreground.BrightBlack  }
+        default      { '' }
+    }
+
+    if ($sgr) { $Message = "$sgr$Message$($PSStyle.Reset)" }
+
+    if ($NoNewline) {
+        Write-Host -NoNewline $Message
+    } else {
+        Write-Host $Message
+    }
 }
 
 # We are sanitizing names to ensure compatibility with the
@@ -780,7 +850,7 @@ function Get-SafeName {
     }
 
     if ($clean -ne $inputName) {
-        Write-Host "Sanitized to: '$clean'" -ForegroundColor "Yellow"
+        Write-Color "Sanitized to: '$clean'" 'Yellow'
     }
 
     return $clean
@@ -957,7 +1027,7 @@ function Get-NextSlotName {
     }
 
     if ($slots.Count -eq 1 -and $activeIdx -eq 0) {
-        Write-Host "[Switch] Only one slot ($(Format-SlotIdentity -Name $slots[0].Name -Email $slots[0].Email)) and it is already active. Nothing to do." -ForegroundColor "Yellow"
+        Write-Color "[Switch] Only one slot ($(Format-SlotIdentity -Name $slots[0].Name -Email $slots[0].Email)) and it is already active. Nothing to do." 'Yellow'
         return $null
     }
 
@@ -1003,7 +1073,7 @@ function Add-To-Profile {
     $encoding = Get-ProfileEncoding $ProfilePath
     Add-Content -LiteralPath $ProfilePath -Value $block -Encoding $encoding
 
-    Write-Host "[Install] Installed! Close and reopen PowerShell, then use: sca save <name>" -ForegroundColor "Green"
+    Write-Color "[Install] Installed! Close and reopen PowerShell, then use: sca save <name>" 'Green'
     Write-Host "   Quick ref: sca | sca -h | sca list | sca save <name> | sca switch <name> | sca remove <name>"
 }
 
@@ -1039,7 +1109,7 @@ function Remove-From-Profile {
 
     if (-not $hasStart -and -not $hasEnd) {
         if (-not $Quiet) {
-            Write-Host "[Uninstall] No Claude Account Switcher block found; profile unchanged." -ForegroundColor "Yellow"
+            Write-Color "[Uninstall] No Claude Account Switcher block found; profile unchanged." 'Yellow'
         }
         return
     }
@@ -1071,7 +1141,7 @@ function Remove-From-Profile {
     Set-Content -LiteralPath $ProfilePath -Value $new -Encoding $encoding -Force -NoNewline
 
     if (-not $Quiet) {
-        Write-Host "[Uninstall] Uninstalled. Close and reopen PowerShell to remove the alias." -ForegroundColor "Red"
+        Write-Color "[Uninstall] Uninstalled. Close and reopen PowerShell to remove the alias." 'Red'
     }
 }
 
@@ -1192,13 +1262,13 @@ function Invoke-Reconcile {
                     # Sidecar write failed — orphan tokens file. Get-Slots
                     # will hide it, so it's invisible but on disk; the
                     # user can `sca remove auto-<ts>` to clean it up.
-                    Write-Host "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" -ForegroundColor "Yellow"
+                    Write-Color "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" 'Yellow'
                 }
             }
             Update-ScaState -ActiveSlot $autoName -LastSyncHash $hash | Out-Null
 
             $oldIdent = Format-SlotIdentity -Name $state.active_slot -Email $slotEmail
-            Write-Host "[Sync] Active credentials are now $newEmail; previous slot $oldIdent preserved. Active slot is now '$autoName'." -ForegroundColor "Yellow"
+            Write-Color "[Sync] Active credentials are now $newEmail; previous slot $oldIdent preserved. Active slot is now '$autoName'." 'Yellow'
             return [pscustomobject]@{
                 Action       = 'identity-change'
                 Slot         = $autoName
@@ -1221,13 +1291,13 @@ function Invoke-Reconcile {
             Write-Sidecar -SlotPath $autoPath -OAuthAccount $newAccount -Source $sourceLabel
         }
         catch {
-            Write-Host "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" -ForegroundColor "Yellow"
+            Write-Color "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" 'Yellow'
         }
     }
     Update-ScaState -ActiveSlot $autoName -LastSyncHash $hash | Out-Null
 
     $autoIdent = Format-SlotIdentity -Name $autoName -Email $newEmail
-    Write-Host "[Sync] Auto-saved unknown active credentials as $autoIdent." -ForegroundColor "Yellow"
+    Write-Color "[Sync] Auto-saved unknown active credentials as $autoIdent." 'Yellow'
     return [pscustomobject]@{
         Action = 'auto-save'
         Slot   = $autoName
@@ -1363,7 +1433,7 @@ function Invoke-SaveAction {
 
     $displayEmail = if ($email -and $safeName.ToLowerInvariant() -ne $email.ToLowerInvariant()) { " ($email)" } else { '' }
     $sourceTail   = if ($sourceLabel -eq 'api_profile') { ' [identity from /api/oauth/profile]' } else { '' }
-    Write-Host "[Save] Saved as '$safeName'$displayEmail$sourceTail" -ForegroundColor "Green"
+    Write-Color "[Save] Saved as '$safeName'$displayEmail$sourceTail" 'Green'
 }
 
 function Invoke-SwitchAction {
@@ -1405,7 +1475,7 @@ function Invoke-SwitchAction {
         # emits no advisory — the slot table beneath the success line
         # makes the transition self-evident via the `*` marker.
         if (-not $rotation.HasActiveSlot) {
-            Write-Host "[Switch] No currently active slot detected. Rotating to $toIdent." -ForegroundColor "Yellow"
+            Write-Color "[Switch] No currently active slot detected. Rotating to $toIdent." 'Yellow'
         }
     } else {
         $safeName = Get-SafeName $Name
@@ -1443,8 +1513,8 @@ function Invoke-SwitchAction {
         Set-OAuthAccountInClaudeJson -OAuthAccount $slot.Sidecar.oauthAccount
     }
     catch {
-        Write-Host "[Switch] Tokens swapped to '$safeName' but ~/.claude.json oauthAccount update failed: $($_.Exception.Message)" -ForegroundColor "Yellow"
-        Write-Host "[Switch] Claude Code's /status email may not reflect the new slot until you fix and re-run." -ForegroundColor "Yellow"
+        Write-Color "[Switch] Tokens swapped to '$safeName' but ~/.claude.json oauthAccount update failed: $($_.Exception.Message)" 'Yellow'
+        Write-Color "[Switch] Claude Code's /status email may not reflect the new slot until you fix and re-run." 'Yellow'
     }
 
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -1461,7 +1531,7 @@ function Invoke-SwitchAction {
     # consistent table-header look. No trailing period: this is a
     # header, not a complete sentence.
     $toIdent = Format-SlotIdentity -Name $slot.Name -Email $slot.Email
-    Write-Host "[Switch] Switched to $toIdent" -ForegroundColor "DarkYellow"
+    Write-Color "[Switch] Switched to $toIdent" 'DarkYellow'
 
     # Render the saved-slot table beneath the success line so the user
     # sees the new active slot in context (the `*` marker now points at
@@ -1476,7 +1546,7 @@ function Invoke-SwitchAction {
     # Cyan `[Info]` apply hint, last line beneath the table. With the
     # ~/.claude.json oauthAccount swap above, starting Claude Code
     # fresh will show the new slot's email immediately on /status.
-    Write-Host "[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped)." -ForegroundColor "Cyan"
+    Write-Color "[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped)." 'Cyan'
     Write-Host ''
 }
 
@@ -1492,7 +1562,7 @@ function Invoke-ListAction {
     $slots = @((Get-Slots).Slots)
 
     if ($slots.Count -eq 0) {
-        Write-Host "[List] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
+        Write-Color "[List] No slots saved yet. Use: sca save <name>" 'Yellow'
         return
     }
 
@@ -1536,7 +1606,7 @@ function Invoke-RemoveAction {
         Remove-Item -LiteralPath $rf.FullName -Force
         Remove-Sidecar -SlotPath $rf.FullName
     }
-    Write-Host "[Remove] Removed '$safeName'" -ForegroundColor "Red"
+    Write-Color "[Remove] Removed '$safeName'" 'Red'
 }
 
 # --- usage action internals ---
@@ -1709,7 +1779,7 @@ function Update-SlotTokens {
                 # propagation failed but the next reconcile (next sca
                 # invocation) will re-mirror. Yellow advisory so the
                 # user sees the partial-failure state explicitly.
-                Write-Host "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Next sca invocation will retry." -ForegroundColor "Yellow"
+                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Next sca invocation will retry." 'Yellow'
             }
         }
     }
@@ -2305,7 +2375,7 @@ function Format-AggregateBars {
         $color = Get-AggregateBarColor -UsedPct $usedPct
 
         $line = '  {0,-8}[{1}] {2,3}%' -f $label, $bar, $usedPct
-        Write-Host $line -ForegroundColor $color
+        Write-Color $line $color
         Write-Host ''
     }
 }
@@ -2408,7 +2478,7 @@ function Format-UsageTable {
     # + 2 + statusW.
     $totalLineWidth = 2 + 1 + 1 + $nameW + 2 + $acctW + 2 + $fiveW + 2 + $sevenW + 2 + $statusW
 
-    Write-Host "[Usage] Plan usage" -ForegroundColor "DarkYellow"
+    Write-Color "[Usage] Plan usage" 'DarkYellow'
     Write-Host ''
     # Aggregate bars sit between the post-header blank and the column
     # header. Format-AggregateBars emits per bar: 'bar line' + blank,
@@ -2423,7 +2493,7 @@ function Format-UsageTable {
 
     foreach ($entry in $rows) {
         $color = Get-StatusColor -Label $entry.Status -IsActive ([bool]$entry.Row.IsActive)
-        Write-Host ($fmt -f $entry.Marker, $entry.Name, $entry.Account, $entry.Five, $entry.Seven, $entry.Status) -ForegroundColor $color
+        Write-Color ($fmt -f $entry.Marker, $entry.Name, $entry.Account, $entry.Five, $entry.Seven, $entry.Status) $color
     }
 }
 
@@ -2472,7 +2542,7 @@ function Format-ListTable {
     $fmt = "  {0} {1,-$nameW}  {2}"
 
     if (-not $SuppressHeader) {
-        Write-Host "[List] Saved slots" -ForegroundColor "DarkYellow"
+        Write-Color "[List] Saved slots" 'DarkYellow'
         Write-Host ''
     }
     Write-Host ($fmt -f ' ',  'Slot',         'Account')
@@ -2481,7 +2551,7 @@ function Format-ListTable {
     foreach ($entry in $rows) {
         $color = if ($entry.Slot.IsActive) { 'Green' } else { $null }
         if ($color) {
-            Write-Host ($fmt -f $entry.Marker, $entry.Name, $entry.Account) -ForegroundColor $color
+            Write-Color ($fmt -f $entry.Marker, $entry.Name, $entry.Account) $color
         } else {
             Write-Host ($fmt -f $entry.Marker, $entry.Name, $entry.Account)
         }
@@ -2505,13 +2575,13 @@ function Format-UsageVerbose {
     Param ([object] $Result)
 
     $name = $Result.Name
-    Write-Host "[Usage] Slot '$name'$(if ($Result.IsActive) { ' (active)' })" -ForegroundColor "DarkYellow"
+    Write-Color "[Usage] Slot '$name'$(if ($Result.IsActive) { ' (active)' })" 'DarkYellow'
 
     # Surface the OAuth account email whenever we could resolve it, so the
     # verbose drill-down answers the "which account is this?" question
     # without forcing the user to cross-reference the table.
     if ($Result.PSObject.Properties['Email'] -and $Result.Email) {
-        Write-Host "  Account: $($Result.Email)" -ForegroundColor "DarkGray"
+        Write-Color "  Account: $($Result.Email)" 'DarkGray'
     }
 
     if ($Result.Status -ne 'ok') {
@@ -2519,7 +2589,7 @@ function Format-UsageVerbose {
         return
     }
     if (-not $Result.Data) {
-        Write-Host "  (empty response)" -ForegroundColor "DarkGray"
+        Write-Color "  (empty response)" 'DarkGray'
         return
     }
 
@@ -2532,7 +2602,7 @@ function Format-UsageVerbose {
     $rationale   = Get-StatusRationale $planStatus
     $statusLine  = if ($rationale) { "$planStatus - $rationale" } else { $planStatus }
     $statusColor = Get-StatusColor -Label $planStatus -IsActive ([bool]$Result.IsActive)
-    Write-Host ("  Status:  $statusLine") -ForegroundColor $statusColor
+    Write-Color ("  Status:  $statusLine") $statusColor
 
     # Two-bucket render. Each Render-Bucket closure inlines the label so
     # this function does not depend on a lookup table; when buckets change
@@ -2557,7 +2627,7 @@ function Format-UsageVerbose {
     $seven = $Result.Data.seven_day
 
     if (-not $five -and -not $seven) {
-        Write-Host "  No plan-usage data (account may not have a subscription, or has not made a live API call yet)." -ForegroundColor "DarkGray"
+        Write-Color "  No plan-usage data (account may not have a subscription, or has not made a live API call yet)." 'DarkGray'
         return
     }
 
@@ -2665,7 +2735,7 @@ function Format-UsageFrame {
     )
 
     if (-not $Snapshot -or $Snapshot.NoSlots) {
-        Write-Host "[Usage] No slots saved yet. Use: sca save <name>" -ForegroundColor "Yellow"
+        Write-Color "[Usage] No slots saved yet. Use: sca save <name>" 'Yellow'
         if ($Footer) { Format-UsageFooter $Footer }
         return
     }
@@ -2689,7 +2759,7 @@ function Format-UsageFrame {
     # fallback in Get-SlotUsage's refresh-failure handler — hence the
     # endpoint-agnostic wording.
     if ($Snapshot.HasCacheFallback) {
-        Write-Host "  [Usage] Warning: Anthropic API rate limited — displaying cached data." -ForegroundColor "Yellow"
+        Write-Color "  [Usage] Warning: Anthropic API rate limited — displaying cached data." 'Yellow'
     }
 
     if ($Footer) { Format-UsageFooter $Footer } else { Write-Host '' }
@@ -2703,7 +2773,7 @@ function Format-UsageFooter {
 
     Write-Host ""
     foreach ($line in ($Footer -split "`r?`n")) {
-        Write-Host $line -ForegroundColor "DarkGray"
+        Write-Color $line 'DarkGray'
     }
 }
 
@@ -2840,7 +2910,7 @@ function Invoke-UsageWatch {
     }
 
     if ($Interval -lt $Script:UsageWatchMinInterval) {
-        Write-Host "[Usage] -interval below minimum; clamping to $($Script:UsageWatchMinInterval)s (polite to the unofficial endpoint)." -ForegroundColor "Yellow"
+        Write-Color "[Usage] -interval below minimum; clamping to $($Script:UsageWatchMinInterval)s (polite to the unofficial endpoint)." 'Yellow'
         $Interval = $Script:UsageWatchMinInterval
     }
 
@@ -2916,7 +2986,7 @@ function Invoke-UsageWatch {
                 Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer
             } else {
                 # First poll failed and we have nothing to render yet.
-                Write-Host "[Watch] Waiting for first successful /api/oauth/usage response..." -ForegroundColor "Yellow"
+                Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Yellow'
                 Format-UsageFooter $footer
             }
             Write-Host "`e[?2026l" -NoNewline
@@ -2953,7 +3023,7 @@ function Invoke-UsageWatch {
 # the chokepoint of every Write-Host -ForegroundColor call (and every
 # other ANSI-emitting cmdlet), so no per-call-site refactor is needed.
 # Precedence (most -> least specific):
-#   1. -NoColor switch (CLI flag)
+#   1. -nocolor switch (CLI flag)
 #   2. $env:NO_COLOR non-empty (https://no-color.org de facto standard)
 #   3. default colored
 # The previous $PSStyle.OutputRendering value is captured up-front and
@@ -2975,7 +3045,7 @@ function Invoke-Main {
 
     $previousRendering = $PSStyle.OutputRendering
     try {
-        if ($NoColor -or -not [string]::IsNullOrEmpty($env:NO_COLOR)) {
+        if ($nocolor -or -not [string]::IsNullOrEmpty($env:NO_COLOR)) {
             $PSStyle.OutputRendering = 'PlainText'
         }
 
