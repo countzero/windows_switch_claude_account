@@ -11,7 +11,7 @@ directory. Each slot is stored as a separate .credentials.<name>.json file.
 
 .PARAMETER Action
 Specifies the action to perform. Supported values are: save, switch, list, remove,
-install, uninstall, help.
+usage, install, uninstall, help.
 
 .PARAMETER Name
 Specifies the name of the credential slot. Required for save and remove.
@@ -317,9 +317,12 @@ function Write-ScaState {
 # this function attempts to identify the active slot by hashing every
 # slot file for a content match (mirrors the pre-state-file IsActive
 # computation). On a hit, it persists the fresh state and returns it. On
-# a miss it returns $null and lets callers decide:
-#   * Invoke-Reconcile auto-saves under a generated name,
-#   * Invoke-ListAction renders without an active marker.
+# a miss it returns $null and Invoke-Reconcile (the only caller that
+# acts on the null branch) auto-saves the unidentified bytes under a
+# generated name. Other callers tolerate $null gracefully: Invoke-
+# RemoveAction's active-slot guard short-circuits when state is null;
+# Invoke-ListAction reconciles before reading state, so by then the
+# state has been bootstrapped.
 #
 # Errors are swallowed so a corrupt state file or a transient migration
 # write failure does not break the tool — the next state-mutating call
@@ -434,10 +437,15 @@ function Update-ScaState {
 # overwrite our oauthAccount mutation. Refuse-while-running is the chosen
 # mitigation; see decision (2) in CLAUDE.md's planning history.
 
-# Returns $true if any process named 'claude' is running. The check is
-# scoped to the current user via Get-Process (which only enumerates
-# processes the current user can see). Wrapped as a function so tests
-# can mock it without driving real process state.
+# Returns $true if any process named 'claude' is running on the host.
+# Get-Process enumerates processes from ALL users on the system (limited
+# detail for processes owned by other users, but the Process objects
+# themselves still come back), so this refuses save/switch even when a
+# DIFFERENT user on a shared Windows host has Claude Code open. That is
+# intentional multi-user safety: if any user's Claude Code holds the
+# ~/.claude.json in-memory cache, our oauthAccount mutation could race
+# its flush. Wrapped as a function so tests can mock it without driving
+# real process state.
 function Test-ClaudeRunning {
     return [bool](Get-Process -Name 'claude' -ErrorAction SilentlyContinue)
 }
@@ -1023,9 +1031,12 @@ function Get-SlotFileName {
 # avoids re-reading the file at switch time.
 #
 # IsActive is sourced from $StateFile via Read-ScaState (which auto-
-# migrates by content-hash on first call). The function makes zero
-# network calls and zero hash computations on the slot files
-# themselves — `sca list` stays a pure offline render.
+# migrates by content-hash on first call). This function itself makes
+# zero network calls and zero hash computations on the slot files; HTTP
+# and hashing live in the calling action's Invoke-Reconcile prelude
+# (Invoke-ListAction, Invoke-SwitchAction, Invoke-UsageAction). Callers
+# that want a true offline read should call Get-Slots without first
+# reconciling.
 function Get-Slots {
     # One-time sidecar cleanup. Cheap (fires only when legacy sidecars
     # exist). The `.profile.json` shape is from a pre-v1 implementation
@@ -1642,12 +1653,16 @@ function Invoke-SwitchAction {
 }
 
 function Invoke-ListAction {
-    # Reconcile first so the slot file matches whatever Claude Code may
-    # have written into .credentials.json since the last sca call. This
-    # ensures the active-slot marker is always accurate — without it,
-    # `sca list` could show stale state when .credentials.json differs
-    # from state.last_sync_hash (see Invoke-SwitchAction /
-    # Invoke-UsageAction for the same pattern).
+    # Reconcile first so a cross-account swap that happened since the last
+    # sca call surfaces in the marker column. state.active_slot only
+    # changes through reconcile's identity-change branch (auto-save under
+    # auto-<UTC>); same-identity drift mirrors bytes but leaves the
+    # active slot unchanged, so the marker would be identical with or
+    # without reconcile in that case. The reconcile is also what
+    # bootstraps state on a fresh install (auto-migration via
+    # Read-ScaState, then auto-save via Invoke-Reconcile if no slot
+    # matched the active-credentials hash). Mirrors the prelude pattern
+    # in Invoke-SwitchAction / Invoke-UsageAction.
     Invoke-Reconcile | Out-Null
 
     $slots = @((Get-Slots).Slots)
@@ -1788,6 +1803,22 @@ function Get-SlotOAuth {
 #
 # Returns the new access token on success; throws with a descriptive
 # message on failure.
+#
+# Race with a running Claude Code: `sca usage` does NOT refuse while
+# Claude Code is running (only `save` / `switch` do — see
+# Test-ClaudeRunning callers), so an active-slot refresh triggered here
+# can race against Claude Code's own refresh. Anthropic rotates the
+# refresh_token on every successful /v1/oauth/token call: whichever
+# party (sca or Claude Code) calls second presents the now-rotated old
+# token and gets a 4xx, losing its session. We accept this as a
+# deliberate trade-off — refusing `sca usage` while Claude Code runs
+# would defeat the action's main use case (live monitoring during
+# work). In practice the race is rare (the refresh window is a ~60s
+# slice once per hour) and recoverable: if a refresh fails after this
+# function rotated the token, the slot file holds the new tokens; rerun
+# `sca switch <slot>` to repropagate them into .credentials.json. If
+# Claude Code rotated first and our call here lost, the user re-logs
+# into Claude Code and reruns `sca save <slot>` to recapture.
 function Update-SlotTokens {
     Param ([String] $SlotPath)
 
@@ -2418,9 +2449,11 @@ function Get-AggregateBarColor {
 #
 # Color thresholds via $Script:AggregateRedPct / $Script:AggregateYellowPct.
 #
-# Output: 5 Write-Host lines (blank, Session, blank, Week, blank). When
-# no qualifying rows exist, emits nothing — the table below renders
-# cleanly without orphan padding.
+# Output: 4 Write-Host lines per call (Session bar, blank, Week bar,
+# blank); the leading blank that precedes them comes from the caller's
+# post-header padding in Format-UsageTable. When no qualifying rows
+# exist, emits nothing — the table below renders cleanly without
+# orphan padding.
 #
 # Uses Write-Host (information stream / 6) rather than Write-Progress
 # (stream 4) for three reasons: (1) the suite's `6>&1 | Out-String`

@@ -27,9 +27,9 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 - **Atomic-rename writes survive an open Claude Code (for `.credentials.json` only)**. `Set-CredentialFileAtomic` calls `[System.IO.File]::Replace` / `::Move`, both of which invoke `MoveFileEx` and succeed against the FILE_SHARE_DELETE handle Claude Code keeps on `.credentials.json`. Retry policy: 3 attempts with 50 ms backoff to absorb transient sharing violations from antivirus / indexer scanners. **`sca save` / `sca switch` still refuse to operate while Claude Code is running** — but for a different reason: they read/write `~/.claude.json`'s `oauthAccount` block, which Claude Code keeps in an in-memory cache that may flush back and clobber our update.
 - **Execution policy**: May need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
 - **Token expiry**: OAuth tokens refresh / expire after ~1 hour of inactivity. Without a daemon, the slot file is at most one Claude-Code-refresh behind the active file at any moment; the next `sca usage` or `sca switch` invocation captures the refresh into the slot via `Invoke-Reconcile`. "One refresh behind" is harmless — the slot's previous refresh_token is still valid until rotated again. `Update-SlotTokens` (called by `sca usage` when the active slot's access token is expired) propagates new tokens to BOTH the slot file AND `.credentials.json`.
-- **Reconcile fires on usage and switch only** — not on `list` (pure offline render) or `remove`. Auto-migration from 1.x is silent inside `Read-ScaState`; users who haven't reconciled yet see a stale `last_sync_hash` until their first `sca usage`.
+- **Reconcile fires on `list`, `usage`, and `switch`** — not on `save` (the explicit save IS the capture) or `remove` (no downstream read of the active slot's bytes). Auto-migration from 1.x is silent inside `Read-ScaState`; the first reconciling action after the upgrade refreshes `last_sync_hash`.
 - **Cross-account swap detection**: when reconcile sees `.credentials.json` bytes differ from `state.last_sync_hash`, it identifies the live email by reading `~/.claude.json`'s `oauthAccount.emailAddress`. If the email matches the tracked slot's sidecar email, mirror through; if it differs, auto-save under `auto-<UTC-timestamp>(<new-email>)`. When `~/.claude.json` has no `oauthAccount`, falls back to a `/api/oauth/profile` HTTP call. Both probes failing falls into the same-identity mirror branch.
-- **Name sanitization**: invalid Windows filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and spaces are replaced with `_`. Brackets are sanitized because PowerShell's `-Path` parameter treats them as character-class wildcards; without sanitization, `sca remove foo[bar]` would silently wildcard-match unrelated slot files. Paired with `-LiteralPath` on every credential-file op as defense-in-depth.
+- **Name sanitization**: invalid Windows filename characters (`\ / : * ? " < > |` and control chars), parentheses (`(` `)`), PowerShell wildcard brackets (`[` `]`), and spaces are replaced with `_`. Brackets are sanitized because PowerShell's `-Path` parameter treats them as character-class wildcards; without sanitization, `sca remove foo[bar]` would silently wildcard-match unrelated slot files (paired with `-LiteralPath` on every credential-file op as defense-in-depth). Parens are sanitized because slot filenames encode the OAuth account email as `.credentials.<name>(<email>).json` — parens in the slot name would confuse `Get-SlotFileInfo`'s `(name, email)` split. `Get-SafeName` additionally strips trailing dots and hard-rejects reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`9`, `LPT1`-`9`).
 
 ## Script actions
 
@@ -37,7 +37,7 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 |------------|---------------|--------------|
 | `save`     | Yes           | Refuses if Claude Code is running. Resolves identity from `~/.claude.json`'s `oauthAccount` (primary, offline); falls back to `/api/oauth/profile` only when the cache is empty. Both failing → refuses. Atomic-writes `.credentials.json` bytes into `.credentials.<name>(<email>).json` AND a paired `.account.json` sidecar. Updates `state.active_slot` and `state.last_sync_hash`. No reconcile prelude — explicit save IS the capture. |
 | `switch`   | Optional      | Refuses if Claude Code is running. Reconciles first (so a pending refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json`, then atomic-writes the destination slot's captured `oauthAccount` (whitelisted fields) into `~/.claude.json`. If `<name>` omitted, rotates to the next saved slot in alphabetical order (wraps). Refuses to activate a slot with no sidecar. |
-| `list`     | No            | Renders saved slots as `Slot \| Account` table with leading active-marker column. Pure offline render — no network IO, no reconcile, no hashing. `*` marker comes from `state.active_slot`. Sidecar-less slots silently filtered out. |
+| `list`     | No            | Reconciles first (so cross-account swaps detected since the last `sca` call surface in the marker column), then renders saved slots as `Slot \| Account` with leading active-marker column. `*` marker comes from `state.active_slot`. Sidecar-less slots silently filtered out. |
 | `remove`   | Yes           | Deletes a named slot AND its sidecar. Walks the raw filesystem (not `Get-Slots`) so sidecar-less legacy slots can be cleaned by name. Refuses to remove the slot tracked as active in state. |
 | `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot for 5h / 7d plan-usage percentages. Auto-refreshes expired tokens via `Update-SlotTokens`. Accepts `-Json` for scripted output, or `-Watch` (optional `-Interval <seconds>`, floor 60) for live view. With `<name>`, renders verbose single-slot block. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile. |
@@ -50,19 +50,20 @@ The profile install/uninstall uses marker comments (`# === Claude Account Switch
 
 The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }` so tests can dot-source the script without triggering a live run. Each action body is extracted into an `Invoke-*Action` function so tests can call it directly. New actions: put the body in `Invoke-<Action>Action`, add a one-line dispatch to `Invoke-Main`.
 
-The two credentials-touching actions that need a fresh slot file (`switch`, `usage`) call `Invoke-Reconcile` first; `save` skips reconcile (the explicit save IS the capture); `list` and `remove` skip reconcile too. New actions follow the same rule: reconcile only when the slot file's bytes feed downstream logic.
+`switch`, `usage`, and `list` call `Invoke-Reconcile` first (`switch` / `usage` need a fresh slot file; `list` needs an accurate active-slot marker after a possible cross-account swap). `save` skips reconcile (the explicit save IS the capture) and `remove` skips it too. New actions follow the same rule: reconcile when the action's output or downstream writes depend on a fresh slot file or accurate `state.active_slot`.
 
 For color/output, table layout, watch-mode, and `/api/oauth/usage` schema details, see `.claude/rules/script-internals.md` (auto-loads when reading the script).
 
 ## Unofficial endpoints (`usage` action)
 
-The `usage` action depends on five pinned constants extracted from `claude.exe` 2.1.119 (a Bun-compiled binary). They live at the top of `switch_claude_account.ps1` under the `# --- Unofficial /api/oauth/usage constants ---` comment:
+The `usage` action and the reconcile / save identity-fallback path depend on six pinned constants extracted from `claude.exe` 2.1.119 (a Bun-compiled binary). They live at the top of `switch_claude_account.ps1` under the `# --- Unofficial /api/oauth/usage constants ---` comment:
 
-- `$Script:UsageEndpoint`  — `https://api.anthropic.com/api/oauth/usage`
-- `$Script:TokenEndpoint`  — `https://platform.claude.com/v1/oauth/token`
-- `$Script:OAuthClientId`  — `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude.ai subscription flow)
-- `$Script:AnthropicBeta`  — `oauth-2025-04-20`
-- `$Script:UsageUserAgent` — `claude-code/2.1.119`
+- `$Script:UsageEndpoint`   — `https://api.anthropic.com/api/oauth/usage`
+- `$Script:ProfileEndpoint` — `https://api.anthropic.com/api/oauth/profile` (used by `Get-SlotProfile` for the email-only identity fallback when `~/.claude.json` has no `oauthAccount`)
+- `$Script:TokenEndpoint`   — `https://platform.claude.com/v1/oauth/token`
+- `$Script:OAuthClientId`   — `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude.ai subscription flow)
+- `$Script:AnthropicBeta`   — `oauth-2025-04-20`
+- `$Script:UsageUserAgent`  — `claude-code/2.1.119`
 
 **Undocumented and unsupported by Anthropic.** When the call starts returning 4xx after a Claude Code upgrade, re-extract from `$(Get-Command claude).Source` using the grep recipe in the script header comment, bump the constants, and re-run `tests/Invoke-Tests.ps1`. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only — they will not catch the constants drifting out of date.
 

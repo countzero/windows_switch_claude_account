@@ -2,10 +2,14 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for Invoke-ListAction in switch_claude_account.ps1.
-# After the state-file redesign Invoke-ListAction is a pure offline
-# render: no network, no hashing, no hardlink self-check. The active
-# marker `*` is sourced from .sca-state.json (with one-time hash-based
-# migration on first call). Per-test sandbox setup lives in tests/Common.ps1.
+# Invoke-ListAction reconciles first (so cross-account swaps detected
+# since the last sca call surface in the marker column) and then
+# renders. The active marker `*` is sourced from .sca-state.json (with
+# one-time hash-based migration on first call). The reconcile prelude
+# may hash .credentials.json and may HTTP-fall-back through
+# Get-SlotProfile when ~/.claude.json has no oauthAccount; the test
+# bodies below mock those out where needed. Per-test sandbox setup
+# lives in tests/Common.ps1.
 
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
