@@ -201,6 +201,8 @@ Self-refreshing live view. Re-polls every `-Interval` seconds (default + floor *
 
 **Error handling**: HTTP failure mid-loop keeps previous snapshot on screen; second line under footer reads `[Watch] Last poll failed: <msg> (keeping previous data; will retry on next tick)`.
 
+**Terminal title (OSC 0)**: each successful poll emits `ESC ] 0 ; <title> BEL` via `Write-VTSequence` so the tab label / Windows taskbar / Alt-Tab tooltip carries live usage when the watch window is in the background. Format is deliberately minimal — `<5h%> | <7d%> | Switch Claude Account` — built by `Format-WatchTitle` (pure helper). Single-slot mode reads the row's bucket utilizations directly (null → `—`); multi-slot mode renders the pool mean across HTTP-ok rows using the same formula as `Format-AggregateBars`. Bare brand suffix when no usable data (no slots / all-error). Brand string lives in `$Script:WatchTitleSuffix`. Pre-watch title captured via `$Host.UI.RawUI.WindowTitle` (best-effort; some hosts throw) and restored with OSC 0 in the `finally` block; empty payload falls back to terminal-default tab label. Failed polls do NOT update the title — title and body go stale together until the next successful tick. Control bytes (`\x00-\x1F\x7F`) stripped before emit as defense-in-depth against OSC envelope breakout.
+
 ## Identity sidecar — filename parser
 
 ```

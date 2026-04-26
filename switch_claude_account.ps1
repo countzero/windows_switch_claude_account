@@ -2886,6 +2886,103 @@ function Format-UsageFooter {
     }
 }
 
+# Brand suffix appended to the watch-mode terminal title. Lives as a
+# script-scope constant so the wording is editable in one place. The
+# title's job is "make this background tab identifiable + show two
+# numbers"; the leading data carries the actionable bits, this trails.
+$Script:WatchTitleSuffix = 'Switch Claude Account'
+
+# Build the OSC 0 terminal-title string for `sca usage -Watch`. The
+# title format is deliberately minimal — two utilization numbers + brand
+# suffix — because the watch body already carries every richer signal
+# (status colors, reset countdowns, cache-fallback advisory). The title
+# only needs to answer "which tab is this and roughly where am I?" when
+# the watch window is in the background.
+#
+#   34% | 42% | Switch Claude Account     # both buckets present
+#   — | 42% | Switch Claude Account       # five_hour null
+#   Switch Claude Account                  # no usable data (no slots / all errors)
+#
+# Single-slot mode (`-Name` set, snapshot has 1 ok result) renders that
+# slot's bucket values directly; null buckets render as the em-dash
+# sentinel matching Format-UtilCell. Multi-slot mode renders the pool
+# mean of HTTP-ok rows using the same formula as Format-AggregateBars
+# (sum of clamped utilizations / N*100 * 100). When zero HTTP-ok rows
+# exist the title collapses to the bare brand suffix — there are no
+# numbers to report.
+#
+# Control bytes (\x00-\x1F, \x7F) are stripped from the assembled string
+# as defense-in-depth: slot names already pass Get-SafeName so user
+# input cannot reach this point with control bytes, but a future caller
+# (or a slot from a pre-sanitization era) cannot inject an OSC-envelope
+# breakout regardless.
+function Format-WatchTitle {
+    Param (
+        [String]         $Name,
+        [pscustomobject] $Snapshot
+    )
+
+    $suffix = $Script:WatchTitleSuffix
+
+    if (-not $Snapshot -or $Snapshot.NoSlots) { return $suffix }
+
+    $okResults = @($Snapshot.Results | Where-Object { $_.Status -eq 'ok' })
+    if ($okResults.Count -eq 0) { return $suffix }
+
+    # Render one bucket value to either ' NN%' (rounded percent) or '—'
+    # for null. Local helper so the single-slot and pool branches stay
+    # symmetrical at the call site.
+    $renderPct = {
+        Param ($v)
+        if ($null -eq $v) { return '—' }
+        return ('{0}%' -f [int][math]::Round([double]$v))
+    }
+
+    if ($Name -and $okResults.Count -eq 1) {
+        # Single-slot: the snapshot was filtered by name upstream. Read
+        # the row's bucket utilizations directly; null buckets render as
+        # em-dash so cold accounts produce '— | — | <suffix>' rather
+        # than misleading 0%.
+        $r     = $okResults[0]
+        $five  = if ($r.Data -and $r.Data.five_hour) { $r.Data.five_hour.utilization } else { $null }
+        $seven = if ($r.Data -and $r.Data.seven_day) { $r.Data.seven_day.utilization } else { $null }
+    } else {
+        # Multi-slot pool mean: same formula as Format-AggregateBars
+        # (sum of clamped utilizations / (N * 100) * 100, equivalently
+        # the mean across eligible rows). Null bucket values count as 0
+        # used — matches the bars above the table so title and bars
+        # never disagree.
+        $n        = $okResults.Count
+        $cap      = $n * 100
+        $sumFive  = 0.0
+        $sumSeven = 0.0
+        foreach ($r in $okResults) {
+            if ($r.Data -and $r.Data.five_hour -and $null -ne $r.Data.five_hour.utilization) {
+                $u = [double]$r.Data.five_hour.utilization
+                if ($u -lt 0)   { $u = 0 }
+                if ($u -gt 100) { $u = 100 }
+                $sumFive += $u
+            }
+            if ($r.Data -and $r.Data.seven_day -and $null -ne $r.Data.seven_day.utilization) {
+                $u = [double]$r.Data.seven_day.utilization
+                if ($u -lt 0)   { $u = 0 }
+                if ($u -gt 100) { $u = 100 }
+                $sumSeven += $u
+            }
+        }
+        $five  = [int][math]::Round(($sumFive  / $cap) * 100)
+        $seven = [int][math]::Round(($sumSeven / $cap) * 100)
+    }
+
+    $title = '{0} | {1} | {2}' -f (& $renderPct $five), (& $renderPct $seven), $suffix
+
+    # Strip control bytes (C0 + DEL). Defense-in-depth against an OSC
+    # envelope breakout via a malformed slot name, sidecar email, or
+    # future caller path. Tab/CR/LF are unusual in titles too — drop
+    # them all.
+    return ([regex]::Replace($title, '[\x00-\x1F\x7F]', ''))
+}
+
 function Invoke-UsageAction {
     Param (
         [string] $Name,
@@ -3021,6 +3118,13 @@ function Invoke-UsageWatch {
     }
 
     $origCursor = [Console]::CursorVisible
+    # Capture the pre-watch terminal title so the `finally` block can
+    # restore it on Ctrl-C. $Host.UI.RawUI.WindowTitle is the only
+    # portable read path (no terminal protocol reliably reports the
+    # current OSC 0 title back). Some hosts throw when RawUI is not
+    # available (test runners, ssh-without-tty); $null then signals
+    # "no restore" to the finally block.
+    $origTitle  = try { $Host.UI.RawUI.WindowTitle } catch { $null }
     $enteredAlt = $false
     try {
         # Enter alt screen buffer + hide cursor in one write. The alt
@@ -3050,6 +3154,19 @@ function Invoke-UsageWatch {
                     Invoke-Reconcile 6>$null | Out-Null
                     $snapshot      = Get-UsageSnapshot -Name $Name
                     $lastPollError = $null
+
+                    # Update the terminal title only on a successful poll
+                    # boundary — matches the user-chosen "only on poll"
+                    # cadence. On a failed poll the previous title (and
+                    # body) persist together until the next tick. OSC 0
+                    # ('ESC ] 0 ; <title> BEL') sets both window and icon
+                    # title; supported by Windows Terminal, modern ConHost,
+                    # VS Code, iTerm2, kitty, alacritty, WezTerm, foot,
+                    # gnome-terminal, mintty. Routed through Write-VTSequence
+                    # for parity with DEC sequences (bypasses the
+                    # OutputRendering=PlainText filter — see Write-VTSequence
+                    # docblock).
+                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot))
                 }
                 catch {
                     # Keep the previous snapshot visible. If the very first
@@ -3102,6 +3219,15 @@ function Invoke-UsageWatch {
         # The CursorVisible API restore is belt-and-suspenders for the
         # .NET-side state.
         if ($enteredAlt) {
+            # Restore the pre-watch terminal title via OSC 0. Empty
+            # payload when capture failed (RawUI unavailable) — most
+            # terminals reset the tab label to their profile default
+            # (Windows Terminal: profile name; VS Code: shell name).
+            # Emitted before the alt-buffer leave so the title swap and
+            # screen restore land in the same frame.
+            $restoreTitle = if ($null -ne $origTitle) { [string]$origTitle } else { '' }
+            $restoreTitle = [regex]::Replace($restoreTitle, '[\x00-\x1F\x7F]', '')
+            Write-VTSequence ("`e]0;{0}`a" -f $restoreTitle)
             Write-VTSequence "`e[?25h`e[?1049l"
         }
         [Console]::CursorVisible = $origCursor

@@ -257,6 +257,142 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Format-WatchTitle' {
+        # Pure string-builder for the OSC 0 watch-mode terminal title.
+        # The title carries only "two numbers + brand suffix" by design
+        # (KISS) — every richer signal already lives in the watch body.
+        # These tests pin the format string and the pool-mean formula so
+        # a future refactor cannot silently start emitting status words,
+        # slot names, or reset countdowns into the title.
+
+        # Build a minimal Get-UsageSnapshot-shaped object for a list of
+        # rows. Each row hashtable accepts: Status, FiveUtil, SevenUtil
+        # (any field omitted defaults to ok / null).
+        function script:New-FakeSnapshot {
+            Param ([object[]] $Rows)
+            $results = foreach ($r in $Rows) {
+                $five  = if ($r.ContainsKey('FiveUtil'))  { $r.FiveUtil }  else { $null }
+                $seven = if ($r.ContainsKey('SevenUtil')) { $r.SevenUtil } else { $null }
+                [pscustomobject]@{
+                    Name     = if ($r.ContainsKey('Name')) { $r.Name } else { 'slot-x' }
+                    Status   = if ($r.ContainsKey('Status')) { $r.Status } else { 'ok' }
+                    IsActive = $false
+                    Email    = $null
+                    Data     = if ($null -eq $five -and $null -eq $seven) {
+                                   $null
+                               } else {
+                                   [pscustomobject]@{
+                                       five_hour = if ($null -ne $five)  { [pscustomobject]@{ utilization = $five  } } else { $null }
+                                       seven_day = if ($null -ne $seven) { [pscustomobject]@{ utilization = $seven } } else { $null }
+                                   }
+                               }
+                    Error            = $null
+                    IsCachedFallback = $false
+                }
+            }
+            return [pscustomobject]@{
+                Results          = @($results)
+                NoSlots          = $false
+                HasCacheFallback = $false
+            }
+        }
+
+        It 'renders both buckets present (single-slot)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 34; SevenUtil = 42 })
+            Format-WatchTitle -Name 'slot-1' -Snapshot $snap |
+                Should -Be '34% | 42% | Switch Claude Account'
+        }
+
+        It 'rounds fractional utilization to nearest integer' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 33.6; SevenUtil = 41.4 })
+            Format-WatchTitle -Name 'slot-1' -Snapshot $snap |
+                Should -Be '34% | 41% | Switch Claude Account'
+        }
+
+        It 'renders em-dash for null buckets (single-slot, mixed null)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = $null; SevenUtil = 42 })
+            Format-WatchTitle -Name 'slot-1' -Snapshot $snap |
+                Should -Be '— | 42% | Switch Claude Account'
+        }
+
+        It 'renders bare suffix when both buckets null (single-slot)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = $null; SevenUtil = $null })
+            # Single-slot null/null still renders the em-dashes; bare
+            # suffix is reserved for "no usable rows at all" (no slots /
+            # all-error). Documents the intended distinction.
+            Format-WatchTitle -Name 'slot-1' -Snapshot $snap |
+                Should -Be '— | — | Switch Claude Account'
+        }
+
+        It 'returns bare suffix for empty snapshot (no slots saved)' {
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            Format-WatchTitle -Name '' -Snapshot $empty |
+                Should -Be 'Switch Claude Account'
+        }
+
+        It 'returns bare suffix when all rows are HTTP-failure (multi-slot)' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Status = 'expired'; FiveUtil = 10; SevenUtil = 10 }
+                @{ Status = 'error';   FiveUtil = 20; SevenUtil = 20 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be 'Switch Claude Account'
+        }
+
+        It 'computes pool mean across HTTP-ok rows (multi-slot)' {
+            # 50 + 100 over N=2 → mean 75% Session, 0 + 40 → mean 20% Week
+            $snap = New-FakeSnapshot -Rows @(
+                @{ FiveUtil = 50;  SevenUtil = 0 }
+                @{ FiveUtil = 100; SevenUtil = 40 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '75% | 20% | Switch Claude Account'
+        }
+
+        It 'pool mean ignores non-ok rows but counts null buckets as 0' {
+            # Two ok rows (one with null Week → 0 used in pool), one
+            # error row excluded entirely. Five: (60 + 90) / 200 = 75%.
+            # Week: (40 + 0) / 200 = 20%.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ FiveUtil = 60;  SevenUtil = 40 }
+                @{ FiveUtil = 90;  SevenUtil = $null }
+                @{ Status = 'expired'; FiveUtil = 100; SevenUtil = 100 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '75% | 20% | Switch Claude Account'
+        }
+
+        It 'pool mean clamps per-slot utilization to [0, 100]' {
+            # Anomalous 150% from the API is clamped to 100 before pool
+            # averaging — mirrors Format-AggregateBars semantics.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ FiveUtil = 150; SevenUtil = -10 }
+                @{ FiveUtil = 50;  SevenUtil = 50 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '75% | 25% | Switch Claude Account'
+        }
+
+        It 'strips control bytes from the assembled title' {
+            # Slot names already pass Get-SafeName, but the strip is
+            # defense-in-depth against an OSC envelope breakout via a
+            # tampered sidecar email or future caller path.
+            $rows  = @([pscustomobject]@{
+                Name = "x`e]0;EVIL`a"; Status = 'ok'; IsActive = $false; Email = $null
+                Data = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 10 }
+                    seven_day = [pscustomobject]@{ utilization = 20 }
+                }
+                Error = $null; IsCachedFallback = $false
+            })
+            $snap = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false }
+            $title = Format-WatchTitle -Name '' -Snapshot $snap
+            $title | Should -Not -Match "`e"
+            $title | Should -Not -Match "`a"
+            $title | Should -Be '10% | 20% | Switch Claude Account'
+        }
+    }
+
     Context 'Watch-mode VT control rendering' {
         # Regression guard for `sca usage -Watch -NoColor` flicker.
         #
@@ -297,6 +433,40 @@ Describe 'switch_claude_account' {
                 'StringDecorated.AnsiRegex). Routing them through Write-Host ' +
                 're-enables PSStyle.OutputRendering=PlainText stripping of DEC ' +
                 'private modes, which causes -Watch -NoColor to flicker.')
+        }
+
+        It 'Invoke-UsageWatch emits an OSC 0 title set inside the loop and restores the captured title in finally' {
+            # Pin the contract that watch mode (a) updates the terminal
+            # title on each successful poll and (b) restores the
+            # pre-watch title on exit. The static check guards against
+            # accidental removal during a future refactor; without
+            # title-set the background-window UX regresses, without
+            # title-restore the watch leaks its title into the user's
+            # post-Ctrl-C shell session.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-UsageWatch'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+
+            $body = $func.Extent.Text
+
+            # OSC 0 sequence: ESC ] 0 ; <title> BEL. Match the literal
+            # `e]0; opener — the renderer interpolation and BEL terminator
+            # vary across edits but the opener is invariant.
+            $body | Should -Match '`e\]0;' -Because (
+                'Invoke-UsageWatch must emit an OSC 0 (\e]0;<title>\a) ' +
+                'sequence so the terminal-title shows live usage when ' +
+                'the watch window is in the background.')
+
+            # The captured pre-watch title must be restored on exit.
+            $body | Should -Match '\$origTitle' -Because (
+                'Invoke-UsageWatch must capture and restore the pre-watch ' +
+                'terminal title; without restore the watch-mode title ' +
+                'persists into the user post-Ctrl-C shell session.')
         }
 
         It 'Write-VTSequence preserves DEC 2026 envelope verbatim under OutputRendering=PlainText' {
