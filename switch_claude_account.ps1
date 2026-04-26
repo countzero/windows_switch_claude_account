@@ -502,6 +502,13 @@ function ConvertTo-ScaJsonString {
 # claudeCodeTrialEndsAt, etc.) inside oauthAccount are also preserved
 # byte-equal — we only touch the five identity fields.
 #
+# Null-valued whitelisted fields are skipped (they preserve the existing
+# ~/.claude.json value). The asymmetry is deliberate: null → real
+# (upgrading a previously-null cached field to a populated value) still
+# works because the substituted value is non-null; real → null (which
+# would wipe Claude Code's cached identity when the sidecar carries the
+# /api/oauth/profile-fallback's null defaults) is blocked.
+#
 # Pre-flight test (CLAUDE.md history) verified this approach: editing
 # emailAddress and restarting Claude Code makes /status report the new
 # value, and the rest of the file round-trips byte-equal.
@@ -572,6 +579,17 @@ function Set-OAuthAccountInClaudeJson {
     foreach ($field in $whitelist) {
         if (-not $OAuthAccount.PSObject.Properties[$field]) { continue }
         $value = $OAuthAccount.$field
+        # Skip null values: preserve the existing ~/.claude.json field rather
+        # than nulling it out. This handles /api/oauth/profile-fallback
+        # sidecars that captured only emailAddress (the other four
+        # whitelisted fields default to $null in that path). The asymmetry
+        # is deliberate — a null value carries no information about Claude
+        # Code's actual identity, so the existing cached value is the better
+        # source of truth. The inverse direction (null → real, upgrading a
+        # previously-null cache to a populated value) still works because
+        # the new value is non-null and falls through to the substitution
+        # below.
+        if ($null -eq $value) { continue }
         # Field-pattern: `"name": "<any-string-or-null>"`. The capture
         # accepts both quoted strings and the bare `null` literal so a
         # null-valued cached field can be replaced with a real value.

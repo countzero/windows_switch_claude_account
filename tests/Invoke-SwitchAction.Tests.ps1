@@ -358,6 +358,79 @@ Describe 'switch_claude_account' {
             $afterObj.oauthAccount.subscriptionCreatedAt | Should -Be $beforeSubscriptionCreated
         }
 
+        # Regression guard for the fix that blocks real → null overwrites:
+        # /api/oauth/profile-fallback sidecars carry only emailAddress; the
+        # other four whitelisted fields default to $null. Switching to such
+        # a slot must NOT overwrite Claude Code's populated ~/.claude.json
+        # cache with null literals — the cached value is the better source
+        # of truth than no value.
+        It 'preserves populated ~/.claude.json fields when sidecar carries nulls' {
+            Set-SandboxClaudeJson `
+                -Email 'old@example.com' `
+                -AccountUuid 'preserved-uuid-123' `
+                -OrganizationUuid 'preserved-org-uuid' `
+                -DisplayName 'Preserved User' `
+                -OrganizationName 'Preserved Org'
+
+            New-SlotPair -CredDir $script:CredDirPath -Name 'slot' -Email 'new@example.com' -Content 'X' -OAuthAccount ([pscustomobject]@{
+                accountUuid      = $null
+                emailAddress     = 'new@example.com'
+                organizationUuid = $null
+                displayName      = $null
+                organizationName = $null
+            }) | Out-Null
+
+            Invoke-SwitchAction -Name 'slot' 6>$null
+
+            $obj = Get-Content -LiteralPath $ClaudeJsonPath -Raw | ConvertFrom-Json
+            # Email IS updated (the only sidecar field that was non-null).
+            $obj.oauthAccount.emailAddress     | Should -Be 'new@example.com'
+            # The other four are PRESERVED from ~/.claude.json's existing values.
+            $obj.oauthAccount.accountUuid      | Should -Be 'preserved-uuid-123'
+            $obj.oauthAccount.organizationUuid | Should -Be 'preserved-org-uuid'
+            $obj.oauthAccount.displayName      | Should -Be 'Preserved User'
+            $obj.oauthAccount.organizationName | Should -Be 'Preserved Org'
+        }
+
+        # Asymmetric-design check: blocking real → null must NOT also block
+        # null → real. A user whose ~/.claude.json had null cached fields
+        # (partial sign-in state) should still see those fields populated
+        # when they switch to a slot whose sidecar has the real values.
+        It 'upgrades previously-null ~/.claude.json fields when the sidecar carries real values' {
+            $rawJson = @'
+{
+  "numStartups": 1,
+  "autoUpdates": true,
+  "oauthAccount": {
+    "accountUuid": null,
+    "emailAddress": "old@example.com",
+    "organizationUuid": null,
+    "displayName": null,
+    "organizationName": null
+  }
+}
+'@
+            Set-Content -LiteralPath $ClaudeJsonPath -Value $rawJson -NoNewline -Encoding utf8NoBOM
+
+            New-SlotPair -CredDir $script:CredDirPath -Name 'slot' -Email 'new@example.com' -Content 'X' -OAuthAccount ([pscustomobject]@{
+                accountUuid      = 'fresh-uuid'
+                emailAddress     = 'new@example.com'
+                organizationUuid = 'fresh-org-uuid'
+                displayName      = 'Fresh User'
+                organizationName = 'Fresh Org'
+            }) | Out-Null
+
+            Invoke-SwitchAction -Name 'slot' 6>$null
+
+            $obj = Get-Content -LiteralPath $ClaudeJsonPath -Raw | ConvertFrom-Json
+            # All five fields upgraded from null to the sidecar's real values.
+            $obj.oauthAccount.accountUuid      | Should -Be 'fresh-uuid'
+            $obj.oauthAccount.emailAddress     | Should -Be 'new@example.com'
+            $obj.oauthAccount.organizationUuid | Should -Be 'fresh-org-uuid'
+            $obj.oauthAccount.displayName      | Should -Be 'Fresh User'
+            $obj.oauthAccount.organizationName | Should -Be 'Fresh Org'
+        }
+
         # Failure path: ~/.claude.json missing or malformed shouldn't
         # cascade into a broken switch — the credentials swap already
         # happened, we just emit a yellow advisory.
