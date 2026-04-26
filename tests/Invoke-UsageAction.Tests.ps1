@@ -46,6 +46,25 @@ Describe 'switch_claude_account' {
                 } | ConvertTo-Json -Depth 10 -Compress
                 $path = Join-Path $script:CredDirPath ".credentials.$Name.json"
                 Set-Content -LiteralPath $path -Value $payload -NoNewline -Encoding utf8NoBOM
+
+                # Sidecar pair so Get-Slots includes the slot. Mirrors
+                # New-SlotPair from Common.ps1 but inline because this
+                # helper writes its own credentials body shape.
+                $sidecarPath = $path -replace '\.json$', '.account.json'
+                $sidecar = [ordered]@{
+                    schema       = 1
+                    captured_at  = '2026-04-26T00:00:00.000Z'
+                    source       = 'test'
+                    oauthAccount = [ordered]@{
+                        accountUuid      = "test-acct-uuid-$Name"
+                        emailAddress     = "$Name@test.local"
+                        organizationUuid = 'test-org-uuid'
+                        displayName      = $Name
+                        organizationName = 'test-org'
+                    }
+                }
+                Set-Content -LiteralPath $sidecarPath -Value ($sidecar | ConvertTo-Json -Depth 5) -NoNewline -Encoding utf8NoBOM
+
                 return $path
             }
 
@@ -180,8 +199,11 @@ Describe 'switch_claude_account' {
         }
 
         It 'slot with no claudeAiOauth section: status is no-oauth; no HTTP call made' {
-            $path = Join-Path $script:CredDirPath '.credentials.apikey.json'
-            Set-Content -LiteralPath $path -Value '{"apiKey":"sk-ant-api..."}' -NoNewline -Encoding utf8NoBOM
+            # Use New-SlotPair but with non-OAuth body. The sidecar is
+            # synthesized by Common.ps1's helper so the slot is visible
+            # to Get-Slots; the slot file itself carries an apiKey-only
+            # body that Get-SlotOAuth recognizes as HasOAuth=false.
+            New-SlotPair -CredDir $script:CredDirPath -Name 'apikey' -Content '{"apiKey":"sk-ant-api..."}' | Out-Null
 
             Mock Invoke-RestMethod -MockWith { throw 'should not be called' }
 
@@ -716,9 +738,11 @@ Describe 'switch_claude_account' {
         }
 
         It 'reconcile auto-saves an unknown active credential under a fresh name' {
-            # No saved slots, .credentials.json present with novel tokens
-            # -> reconcile auto-saves. The auto-saved slot is then the
-            # only saved slot; the table renders it as active.
+            # No saved slots, .credentials.json present with novel tokens.
+            # Identity comes from ~/.claude.json (post-v2.1.0 probe), so
+            # set that up too — without it the auto-save would write a
+            # sidecar-less invisible slot and the table assertion below
+            # wouldn't find a row.
             $payload = @{
                 claudeAiOauth = @{
                     accessToken      = 'sk-ant-oat-LONER'
@@ -729,6 +753,7 @@ Describe 'switch_claude_account' {
                 }
             } | ConvertTo-Json -Compress
             Set-Content -LiteralPath $script:CredFilePath -Value $payload -NoNewline -Encoding utf8NoBOM
+            Set-SandboxClaudeJson -Email 'loner@example.com'
 
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 return [pscustomobject]@{
@@ -739,12 +764,9 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            # Reconcile advisory printed.
             $out | Should -Match '\[Sync\] Auto-saved unknown active credentials'
-            # Auto-saved slot row present and active.
             $out | Should -Match '(?m)^\s+\*\s+auto-\d{8}T\d{6}Z\s'
             $out | Should -Match '\b2%'
-            # No synth row, no hardlink advisory anywhere.
             $out | Should -Not -Match '<active>'
             $out | Should -Not -Match 'not hardlinked'
         }
@@ -762,6 +784,7 @@ Describe 'switch_claude_account' {
                 }
             } | ConvertTo-Json -Compress
             Set-Content -LiteralPath $script:CredFilePath -Value $payload -NoNewline -Encoding utf8NoBOM
+            Set-SandboxClaudeJson -Email 'json-test@example.com'
 
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 return [pscustomobject]@{
@@ -1362,7 +1385,29 @@ Describe 'switch_claude_account' {
         # Email now lives in the slot filename; Get-Slots parses it via
         # Get-SlotFileInfo and propagates .Email into the row objects.
         # These tests stage the filenames directly rather than running
-        # Invoke-SaveAction, so they isolate the display path.
+        # Invoke-SaveAction, so they isolate the display path. Each
+        # also drops a sidecar so Get-Slots includes the row (post-v2.1.0
+        # contract).
+        BeforeAll {
+            function New-TestSidecar {
+                Param ([string] $SlotPath, [string] $Email)
+                $sidecarPath = $SlotPath -replace '\.json$', '.account.json'
+                $sidecar = [ordered]@{
+                    schema       = 1
+                    captured_at  = '2026-04-26T00:00:00.000Z'
+                    source       = 'test'
+                    oauthAccount = [ordered]@{
+                        accountUuid      = 'test-acct-uuid'
+                        emailAddress     = if ($Email) { $Email } else { 'test@test.local' }
+                        organizationUuid = 'test-org-uuid'
+                        displayName      = if ($Email) { $Email } else { 'Test' }
+                        organizationName = 'test-org'
+                    }
+                }
+                Set-Content -LiteralPath $sidecarPath -Value ($sidecar | ConvertTo-Json -Depth 5) -NoNewline -Encoding utf8NoBOM
+            }
+        }
+
         It 'renders the email in the Account column when the slot name differs from the labeled email' {
             $payload = @{
                 claudeAiOauth = @{
@@ -1376,7 +1421,9 @@ Describe 'switch_claude_account' {
             } | ConvertTo-Json -Compress
             # Labeled filename directly — no save-time fetch involved.
             $labeled = '.credentials.work(ada.lovelace@arpa.net).json'
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value $payload -NoNewline -Encoding utf8NoBOM
+            $slotPath = Join-Path $script:CredDirPath $labeled
+            Set-Content -LiteralPath $slotPath -Value $payload -NoNewline -Encoding utf8NoBOM
+            New-TestSidecar -SlotPath $slotPath -Email 'ada.lovelace@arpa.net'
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
@@ -1403,7 +1450,9 @@ Describe 'switch_claude_account' {
                     subscriptionType = 'team'
                 }
             } | ConvertTo-Json -Compress
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath ".credentials.$email.json") -Value $payload -NoNewline -Encoding utf8NoBOM
+            $slotPath = Join-Path $script:CredDirPath ".credentials.$email.json"
+            Set-Content -LiteralPath $slotPath -Value $payload -NoNewline -Encoding utf8NoBOM
+            New-TestSidecar -SlotPath $slotPath -Email $email
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
@@ -1424,7 +1473,12 @@ Describe 'switch_claude_account' {
                     subscriptionType = 'team'
                 }
             } | ConvertTo-Json -Compress
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.pending.json') -Value $payload -NoNewline -Encoding utf8NoBOM
+            $slotPath = Join-Path $script:CredDirPath '.credentials.pending.json'
+            Set-Content -LiteralPath $slotPath -Value $payload -NoNewline -Encoding utf8NoBOM
+            # Sidecar must still have an emailAddress so Read-Sidecar
+            # validates it (sidecar contract: emailAddress required).
+            # The slot's filename-derived email stays $null though.
+            New-TestSidecar -SlotPath $slotPath -Email 'pending@test.local'
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
@@ -1448,7 +1502,9 @@ Describe 'switch_claude_account' {
                 }
             } | ConvertTo-Json -Compress
             $labeled = ".credentials.longslot($longEmail).json"
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value $payload -NoNewline -Encoding utf8NoBOM
+            $slotPath = Join-Path $script:CredDirPath $labeled
+            Set-Content -LiteralPath $slotPath -Value $payload -NoNewline -Encoding utf8NoBOM
+            New-TestSidecar -SlotPath $slotPath -Email $longEmail
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 

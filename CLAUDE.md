@@ -8,28 +8,30 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 
 - **Credential directory**: `%USERPROFILE%\.claude\`
 - **Active credentials**: `.credentials.json` — written by Claude Code via atomic rename on every OAuth refresh. `sca` writes it via the same atomic-rename primitive (`Set-CredentialFileAtomic`) so the file is byte-equal to the tracked slot file after every `sca save` / `sca switch` / reconcile pass. **No hardlinks are involved** (the previous design's hardlink approach was structurally broken by Claude Code's atomic-rename refreshes; replaced in v2.0.0 with state-file tracking).
+- **Claude Code config**: `%USERPROFILE%\.claude.json` (note: top-level, NOT inside `.claude\`) — Claude Code's persistent config. Its top-level `oauthAccount` block is what `/status` displays as "Email:". `sca` reads this block at save time (primary identity source — cannot drift from Claude Code's view) and writes the destination slot's captured `oauthAccount` back to it on `sca switch` (so `/status` follows the active slot). See "`~/.claude.json` ownership" below for the ownership / lock contract.
 - **State file**: `%USERPROFILE%\.claude\.sca-state.json` — schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." Read with `Read-ScaState` (auto-migrates from a 1.x install on first read by hashing `.credentials.json` against existing slot files); written via `Update-ScaState`.
-- **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled).
+- **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled, used only for the dedup case where slot name equals email).
+- **Identity sidecars** (v2.1.0+): `.credentials.<name>(<email>).account.json` alongside each slot file. JSON snapshot of the slot's `oauthAccount` (whitelisted: accountUuid, emailAddress, organizationUuid, displayName, organizationName) captured at save time. Restored to `~/.claude.json` on `sca switch` so Claude Code's `/status` follows the active slot. **Slots without a valid sidecar are HIDDEN from `list` / `usage` / rotation and refused by `switch`** — re-running `sca save <name>` while that slot is active recaptures the sidecar. There is no automated migration from pre-v2.1.0 installs; legacy slots become invisible until re-saved.
 - **PS version**: Requires PowerShell 7.0+ (`#Requires -Version 7.0`). Uses `$PROFILE.CurrentUserAllHosts` for the install target.
 - **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block
 
 ## Windows-specific gotchas
 
-- **Atomic-rename writes survive an open Claude Code**. `Set-CredentialFileAtomic` calls `[System.IO.File]::Replace` / `::Move`, both of which invoke `MoveFileEx` and succeed against the FILE_SHARE_DELETE handle Claude Code keeps on `.credentials.json` while running. So `sca save` / `sca switch` no longer require closing Claude Code first. The retry policy is 3 attempts with 50 ms backoff to absorb transient sharing violations from antivirus / indexer scanners. Note: a running Claude Code session may keep using its in-memory tokens until restarted — the file swap is instant, but the process state isn't. The `[Info]` line on `switch` says so.
+- **Atomic-rename writes survive an open Claude Code (for `.credentials.json` only)**. `Set-CredentialFileAtomic` calls `[System.IO.File]::Replace` / `::Move`, both of which invoke `MoveFileEx` and succeed against the FILE_SHARE_DELETE handle Claude Code keeps on `.credentials.json` while running. The retry policy is 3 attempts with 50 ms backoff to absorb transient sharing violations from antivirus / indexer scanners. **`sca save` / `sca switch` still refuse to operate while Claude Code is running** — but for a different reason: they read/write `~/.claude.json`'s `oauthAccount` block, which Claude Code keeps in an in-memory cache that may flush back and clobber our update mid-run. See "`~/.claude.json` ownership" below.
 - **Execution policy**: May need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
 - **Token expiry**: OAuth tokens refresh / expire after ~1 hour of inactivity. Without daemon the slot file is at most one Claude-Code-refresh behind the active file at any moment; the next `sca usage` or `sca switch` invocation captures the refresh into the slot via `Invoke-Reconcile`. "One refresh behind" is harmless in OAuth terms — the slot's previous refresh_token is still valid until rotated again, which Claude Code will do on its next API call. `Update-SlotTokens` (called by `sca usage` when the active slot's access token is expired) explicitly propagates the new tokens to BOTH the slot file AND `.credentials.json` so Claude Code's next call sees the latest refresh_token.
 - **Reconcile fires on usage and switch only** — not on `list` (kept as a pure offline render) or `remove`. The auto-migration path inside `Read-ScaState` handles upgrades from 1.x silently; users who have not yet reconciled see a stale `last_sync_hash` until their first `sca usage`.
-- **Cross-account swap detection**: when reconcile sees `.credentials.json` bytes differ from `state.last_sync_hash`, it makes one HTTP call to `/api/oauth/profile` to identify the new email. If the email matches the tracked slot's filename email, mirror through; if it differs, refuse to overwrite and auto-save under `auto-<UTC-timestamp>(<new-email>)` instead. Profile-fetch failure (offline / 401 / no-oauth) tolerantly falls into the mirror branch — preserving continuity over paranoia.
+- **Cross-account swap detection**: when reconcile sees `.credentials.json` bytes differ from `state.last_sync_hash`, it identifies the live email by reading `~/.claude.json`'s `oauthAccount.emailAddress` (offline; same source Claude Code uses for `/status`). If the email matches the tracked slot's sidecar email, mirror through; if it differs, auto-save under `auto-<UTC-timestamp>(<new-email>)` instead. When `~/.claude.json` has no `oauthAccount` (rare), reconcile falls back to a `/api/oauth/profile` HTTP call. Both probes failing (offline + missing cache) is treated as "unknown new identity" and falls into the same-identity mirror branch — preserving continuity over paranoia.
 - **Name sanitization**: Invalid Windows filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and spaces are replaced with `_`. Brackets are sanitized because PowerShell's `-Path` parameter treats them as character-class wildcards; without sanitization, `sca remove foo[bar]` would silently wildcard-match unrelated slot files. Paired with `-LiteralPath` on every credential-file op as defense-in-depth.
 
 ## Script actions
 
 | Action     | Requires name | What it does |
 |------------|---------------|--------------|
-| `save`     | Yes           | Atomic-writes `.credentials.json` bytes into `.credentials.<name>(<email>).json` (email resolved via `/api/oauth/profile`; falls back to unlabeled if offline). Updates `state.active_slot` and `state.last_sync_hash`. No reconcile prelude — explicit save IS the capture. |
-| `switch`   | Optional      | Reconciles first (so a pending Claude Code refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json` and updates state. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Output is a DarkYellow header line `[Switch] Switched to '<slot>' (<email>)`, the saved-slot table beneath, and a cyan `[Info] Restart Claude Code to fully apply the swap (running sessions may continue using the previous credentials until restarted).` Yellow advisory above the success line for the no-active-slot rotation edge case; single-slot-already-active no-op prints its advisory and skips the success line, table, and `[Info]` hint. |
-| `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape. Pure offline render — no network IO, no reconcile, no hashing. `*` marker comes from `state.active_slot`. |
-| `remove`   | Yes           | Deletes a named slot. Refuses to remove the slot tracked as active in state — user must `sca switch <other>` first. |
+| `save`     | Yes           | Refuses if Claude Code is running. Resolves identity from `~/.claude.json`'s `oauthAccount` (primary; offline; same source as `/status`); falls back to `/api/oauth/profile` only when the cache is empty. Both failing → refuses to save (no unlabeled-with-no-identity slots). Atomic-writes `.credentials.json` bytes into `.credentials.<name>(<email>).json` AND a paired `.credentials.<name>(<email>).account.json` sidecar with the captured `oauthAccount`. Updates `state.active_slot` and `state.last_sync_hash`. No reconcile prelude — explicit save IS the capture. |
+| `switch`   | Optional      | Refuses if Claude Code is running. Reconciles first (so a pending Claude Code refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json`, then atomic-writes the destination slot's captured `oauthAccount` (whitelisted fields only) into `~/.claude.json` so Claude Code's `/status` follows the swap. If `<name>` is omitted, rotates to the next saved slot in alphabetical order (wraps around). Refuses to activate a slot that has no sidecar. Output is a DarkYellow header line `[Switch] Switched to '<slot>' (<email>)`, the saved-slot table beneath, and a cyan `[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped).` Yellow advisory above the success line for the no-active-slot rotation edge case; single-slot-already-active no-op prints its advisory and skips the success line, table, and `[Info]` hint. |
+| `list`     | No            | Renders saved slots as a 2-data-column table (`Slot \| Account`) with a leading active-marker column. Mirrors `Format-UsageTable`'s shape. Pure offline render — no network IO, no reconcile, no hashing. `*` marker comes from `state.active_slot`. Slots without a valid sidecar are silently filtered out (they cannot be activated; user must re-save while active to make them visible). |
+| `remove`   | Yes           | Deletes a named slot AND its sidecar. Walks the raw filesystem (not `Get-Slots`) so sidecar-less legacy slots can be cleaned up by name. Refuses to remove the slot tracked as active in state — user must `sca switch <other>` first. |
 | `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot to report 5h / 7d plan-usage percentages. Auto-refreshes expired OAuth tokens via `Update-SlotTokens`, which propagates the new tokens to `.credentials.json` when the slot is the tracked active. Accepts `-json` for scripted output, or `-watch` (optional `-interval <seconds>`, floor 60) for a self-refreshing live view. With `<name>`, renders a verbose single-slot block. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile |
 | `uninstall`| No            | Removes wrapper function + aliases from profile |
@@ -174,7 +176,7 @@ The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as
 
 ### Switch action output
 
-`Invoke-SwitchAction` runs `Invoke-Reconcile` first (so a pending Claude Code refresh on the outgoing active slot is captured into its slot file before we overwrite `.credentials.json`), then atomic-writes the destination slot's bytes to `.credentials.json`, then prints a DarkYellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line.
+`Invoke-SwitchAction` refuses if Claude Code is running, then runs `Invoke-Reconcile` first (so a pending Claude Code refresh on the outgoing active slot is captured into its slot file before we overwrite `.credentials.json`), then atomic-writes the destination slot's bytes to `.credentials.json`, then writes the destination slot's captured `oauthAccount` (whitelisted fields) into `~/.claude.json` so Claude Code's `/status` follows the swap. Output is a DarkYellow header line, the saved-slot table beneath, and a cyan `[Info]` apply hint as the last line.
 
 ```
 [Switch] Switched to 'slot-1' (ada.lovelace@arpa.net)
@@ -184,12 +186,13 @@ The two table renderers (`Format-UsageTable` and `Format-ListTable`) are kept as
   * slot-1  ada.lovelace@arpa.net
     slot-2  ada@arpa.net
 
-[Info] Restart Claude Code to fully apply the swap (running sessions may continue using the previous credentials until restarted).
+[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped).
 ```
 
 - **Success line**: DarkYellow header, matches the `[List] Saved slots` / `[Usage] Plan usage` convention so all three actions present a consistent table-header look. Intentionally emitted with no trailing period — it is a header, not a sentence.
 - **Table beneath**: rendered via `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. The slot list is re-enumerated post-switch (one extra `Get-Slots` call) so the `*` marker reflects the just-updated `state.active_slot`. `-SuppressHeader` skips the `[List] Saved slots` DarkYellow header so the table sits cleanly under the `[Switch]` line.
-- **`[Info]` apply hint**: cyan, last line beneath the table. Wording softened from the previous "Close and restart Claude Code to apply." to reflect that atomic-rename writes work even while Claude Code is open — the file is swapped now, but a running Claude Code session keeps using its in-memory tokens until restarted. Suppressed for the single-slot no-op (nothing changed, nothing to apply).
+- **`[Info]` apply hint**: cyan, last line beneath the table. New wording reflects the post-v2.1.0 design: switch atomically updates BOTH `.credentials.json` (tokens) AND `~/.claude.json`'s `oauthAccount` (Email shown by `/status`), so on the next Claude Code start `/status` immediately reflects the active slot. The previous "running sessions may continue using the previous credentials" warning is retired — the refuse-while-running guard means there is no running session to worry about. Suppressed for the single-slot no-op (nothing changed, nothing to apply).
+- **`~/.claude.json` write failure** (rare: file disappeared mid-run, malformed, locked by another tool): yellow advisory `[Switch] Tokens swapped to '<name>' but ~/.claude.json oauthAccount update failed: <reason>` followed by `Claude Code's /status email may not reflect the new slot until you fix and re-run.` The credentials swap has already happened; only the email-display update failed. The user can re-run `sca switch <name>` after fixing the underlying issue.
 - **Yellow advisory branches** (printed above the success line):
   - **Reconcile advisories** (auto-save or identity-change): emitted by `Invoke-Reconcile` itself before the switch's own output. The user sees the unusual state explained before the success line.
   - **No active slot detected** (rotation only): `[Switch] No currently active slot detected. Rotating to <ident>.` Fires when `state.active_slot` is null or points at a missing slot file. Rotation still proceeds; the success line, table, and `[Info]` hint follow as usual.
@@ -255,39 +258,86 @@ Exit: Ctrl-C only. The loop installs no key listeners (no `[Console]::KeyAvailab
 
 Error handling: if an HTTP call fails mid-loop, the previous snapshot stays on screen and a second line appears under the footer reading `[Watch] Last poll failed: <msg> (keeping previous data; will retry on next tick)`.
 
-### Profile endpoint + filename-encoded email
+### Identity capture: filename + sidecar (post-v2.1.0)
 
-`Invoke-SaveAction` resolves the OAuth account email at save time via `GET https://api.anthropic.com/api/oauth/profile` (Claude Code's `Ql()` function, same auth token as the usage endpoint). Claude Code's exact header shape is used: `Authorization: Bearer <token>` + `Content-Type: application/json`, 10 s timeout, **no** `anthropic-beta` or `User-Agent`. Matches Ql() verbatim so a future Anthropic header-validation change breaks us no sooner than it breaks Claude Code itself.
+A slot's identity is captured ONCE at save time and frozen in two paired files:
 
-Response consumption is minimal — only `account.email` is rendered. The full response carries `account.uuid`, `account.display_name`, `organization.name`, `organization.organization_type`, `organization.rate_limit_tier`, `organization.has_extra_usage_enabled`, `organization.billing_type`, `organization.subscription_created_at`, `organization.cc_onboarding_flags`, `organization.claude_code_trial_ends_at`, and `organization.claude_code_trial_duration_days`; all still round-trip through `sca usage -json` under the per-slot `.data` key if callers need them.
+```
+.credentials.<name>(<email>).json          ← OAuth tokens (what Claude Code reads)
+.credentials.<name>(<email>).account.json  ← identity sidecar (sca-only; whitelisted oauthAccount)
+```
 
-The resolved email is embedded directly in the slot filename using the RFC 5322 parenthesized-comment form:
+Sidecar shape:
 
-- Labeled:       `.credentials.<slot>(<email>).json`
-- Unlabeled:     `.credentials.<slot>.json`  (profile fetch failed, or save ran offline)
-- Deduplicated:  when `<slot>` (case-insensitive) equals `<email>`, the tool keeps the unlabeled form to avoid visually redundant filenames like `.credentials.alice@example.com(alice@example.com).json`.
+```jsonc
+{
+  "schema": 1,
+  "captured_at": "2026-04-26T08:30:00.000Z",
+  "source": "claude_json" | "api_profile",   // where Invoke-SaveAction got the data
+  "oauthAccount": {
+    "accountUuid":      "...",
+    "emailAddress":     "...",
+    "organizationUuid": "...",
+    "displayName":      "...",
+    "organizationName": "..."
+  }
+}
+```
 
-The filename is the single source of truth. Because it is written by `sca save` from a fresh profile fetch against the tokens that were *just* stored, the email cannot drift from the tokens — any change to the account requires re-running `sca save`, which re-fetches the profile and renames the file. `sca usage` / `sca list` parse the email straight out of the filename (`Get-SlotFileInfo`) and make zero profile HTTP calls on the display path.
+Whitelist rationale: only the five identity fields are round-tripped. Volatile metadata Claude Code maintains itself (`billingType`, `accountCreatedAt`, `subscriptionCreatedAt`, `ccOnboardingFlags`, `claudeCodeTrialEndsAt`, `claudeCodeTrialDurationDays`, `hasExtraUsageEnabled`) is intentionally excluded — restoring stale values for those would diverge from Claude Code's own picture.
 
-Parse rule (regex, in `Get-SlotFileInfo`):
+**Identity resolution at save time** (`Invoke-SaveAction`, priority order):
+
+1. `~/.claude.json`'s `oauthAccount` (read by `Get-OAuthAccountFromClaudeJson`) — preferred. Same source Claude Code uses for `/status`, so the slot's labeled email cannot drift from Claude Code's display by construction. Offline (no HTTP).
+2. `/api/oauth/profile` (via `Get-SlotProfile`) — fallback for fresh installs where Claude Code hasn't populated `oauthAccount` yet. Yields only `emailAddress`; the other four whitelisted fields default to `null` in the sidecar.
+3. Both failing → save is **refused**. There are no unlabeled-no-identity slots — a slot must have an email or it doesn't exist.
+
+The atomic-pair invariant: tokens file is written first, then the sidecar. If the sidecar write fails, the tokens file is rolled back so a half-saved slot can never appear invisible-but-present (sidecar-less slot files are filtered out of `list` / `usage` / rotation; without rollback the user would see a slot disappear on the next `sca list`).
+
+**Filename parsing** (`Get-SlotFileInfo`, regex):
 ```
 ^\.credentials\.(.+?)(?:\(([^()]*@[^()]*)\))?\.json$
     group 1 = slot name (lazy)
     group 2 = email       (optional; only captured when the parens contain '@')
 ```
-The `@`-in-parens requirement keeps a slot named e.g. `work(v2)` parsing as *slot = `work(v2)`, email = none* rather than mis-splitting at the parens. `Get-SafeName` sanitizes `(` and `)` in user-provided slot names to `_`, so user input cannot inject parens into the filename and fool the parser.
+The `@`-in-parens requirement keeps a slot named e.g. `work(v2)` parsing as *slot = `work(v2)`, email = none*. `Get-SafeName` sanitizes `(` and `)` in user-provided slot names to `_`, so user input cannot inject parens and fool the parser.
 
-Save-time failure modes (all non-fatal; save still produces a usable slot):
-- Offline / timeout → unlabeled form; yellow advisory printed.
-- 401 / token revoked → unlabeled; advisory printed.
-- Response missing `account.email` → unlabeled; advisory printed.
-- Any subsequent `sca save <name>` upgrades the file to the labeled form once the profile fetch succeeds.
+**Filename-email vs sidecar-email**: by save-time construction, `.credentials.<name>(<email>).json`'s `<email>` always equals the sidecar's `oauthAccount.emailAddress`. `Format-AccountCell` (the cell renderer) reads the filename email; reconcile and switch use the sidecar block.
 
-Reconcile's identity safeguard makes one extra `Get-SlotProfile` call per `sca usage` / `sca switch` invocation when `.credentials.json` bytes differ from `state.last_sync_hash`. The call is the only profile-endpoint hit on the display path; it returns the email of the freshly-written tokens so reconcile can compare against the tracked slot's filename email and either mirror through (same identity) or auto-save (cross-account swap). Profile-fetch failure (offline / 401 / no-oauth) is tolerated — it falls into the same-identity mirror branch, preferring continuity over paranoia.
+**`sca list` / `sca usage` display**: emails render inline in the `Account` column on the same row as the slot name — no `└─ <email>` continuation. `Format-AccountCell` returns `—` when the slot name (case-insensitive) equals its embedded email (dedup form), and the middle-truncated email otherwise. The full untruncated email always lives in `sca usage <name>` verbose output and in `sca usage -json`.
 
-On-disk migration from the previous cache-based implementation: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` sidecars and the `.credentials.profile.json` file on each enumeration (the cleanup is cheap and idempotent once complete).
+**On-disk cleanup from v1**: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` cache sidecars from the cache-based v1 implementation on each enumeration (different filename pattern from the post-v2.1.0 `.account.json` sidecar; the v1 cleanup is cheap and idempotent once complete).
 
-Display contract: both `sca list` and `sca usage` render emails inline in the `Account` column on the same row as the slot name — there is no longer a `└─ <email>` continuation line anywhere. `Format-AccountCell` is the single source of truth for the dedup logic: it returns `—` when the slot is unlabeled (offline save) or when the slot name (case-insensitive) equals its embedded email, and the middle-truncated email otherwise. The full untruncated email always lives in `sca usage <name>` verbose output and in `sca usage -json`.
+### `~/.claude.json` ownership
+
+`~/.claude.json` is Claude Code's persistent config. It contains `oauthAccount` at the top level alongside ~50 other fields (project history, mcp configs, statsig gates, settings, etc.). `sca` interacts with it minimally and surgically:
+
+- **Read** (`Get-OAuthAccountFromClaudeJson`): full JSON parse via `ConvertFrom-Json`, extract whitelisted fields. Failure modes (file missing, parse error, no oauthAccount, empty emailAddress) all return `$null` so callers fall through to the `/api/oauth/profile` fallback or refuse the operation. Used by `Invoke-SaveAction` (primary identity source) and `Invoke-Reconcile` (identity probe).
+
+- **Write** (`Set-OAuthAccountInClaudeJson`): targeted regex substitution within the `"oauthAccount": { ... }` block, NOT a full JSON round-trip. The block's opening `{` is located by regex; brace-counting finds the matching close; whitelisted fields inside are substituted via `[regex]::Replace` with a `MatchEvaluator` (avoids `$1` / `$&` replacement-token surprises). Every other byte of the file is left untouched. Verified by tests asserting byte-equal preservation of unrelated top-level fields (`projects`, `mcpServers`, custom keys) through a full save → switch round trip.
+
+  Why not parse-and-reserialize: `~/.claude.json` is large (~18 KB), structurally complex (nested objects with unknown future fields), and PowerShell's `ConvertTo-Json -Depth 12` round-trip can introduce subtle differences (key ordering, trailing whitespace, integer vs decimal, `True`/`False` casing) that would silently rewrite the user's config. Targeted substitution is the safer minimum.
+
+  Used only by `Invoke-SwitchAction`, after the credentials swap, with the destination slot's sidecar `oauthAccount` as input.
+
+- **Lock contract**: there is **no** lockfile. Claude Code uses `proper-lockfile` to serialize its own writes via `~/.claude.json.lock`; `sca` deliberately does NOT participate in that lock. Instead, `sca save` and `sca switch` refuse to operate when Claude Code is running (`Test-ClaudeRunning`). This is simpler than locking and provides a stronger guarantee: zero possibility of Claude Code's in-memory `Un.config` cache being stale relative to our write, because Claude Code is not running to hold a stale cache.
+
+  **Pre-flight verification** (CLAUDE.md planning history, 2026-04-26): editing `oauthAccount.emailAddress` in `~/.claude.json` while Claude Code is closed and then starting Claude Code makes `claude auth status` (and `/status`) report the new value. Confirmed empirically. The write strategy is sound.
+
+- **Backup recovery**: Claude Code itself maintains rolling timestamped backups at `~/.claude.json.backup.<unix-ms>` (last 5 retained, throttled to ≥1 minute apart) on every config write. If a `sca` write ever corrupts `~/.claude.json` (e.g., a brace-counting bug we haven't anticipated), the user can restore from `~/.claude.json.backup.<latest>`. `sca` itself does NOT create backups — relying on Claude Code's existing mechanism.
+
+- **Failure mode**: if `Set-OAuthAccountInClaudeJson` throws (file missing, malformed JSON, unbalanced braces in the oauthAccount block), `Invoke-SwitchAction` catches the exception, prints a yellow advisory, and proceeds. The credentials swap has already happened; only the email-display update fails. The user can re-run the switch once the underlying issue is fixed.
+
+### Reconcile identity probe (post-v2.1.0)
+
+`Invoke-Reconcile` uses `~/.claude.json`'s `oauthAccount.emailAddress` as the primary identity probe (same source Claude Code uses for `/status`). The probe is offline — no HTTP call on the noop / mirror / identity-change paths, only on the rare auto-save fallback when both `~/.claude.json` and the slot are missing.
+
+Probe priority:
+1. `Get-OAuthAccountFromClaudeJson` — preferred; returns full `oauthAccount` for the auto-save sidecar.
+2. `Get-SlotProfile` against `.credentials.json` — fallback when (1) returns `$null`. Yields only `emailAddress`.
+3. Both failing → `$newEmail = $null`, falls into the same-identity mirror branch (continuity over paranoia).
+
+Identity comparison: live `~/.claude.json` email vs. the tracked slot's **sidecar** `oauthAccount.emailAddress` (NOT the filename email — sidecar is the source of truth). Auto-save branches always write a sidecar from the resolved identity (when available); auto-save without identity yields a sidecar-less slot file that `Get-Slots` will hide on the next enumeration.
 
 ## Testing
 

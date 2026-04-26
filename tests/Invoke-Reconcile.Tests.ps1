@@ -24,9 +24,8 @@ Describe 'switch_claude_account' {
         New-Item -ItemType Directory -Path $script:CD -Force | Out-Null
 
         # An OAuth-shaped credentials body. The exact tokens are irrelevant
-        # because Get-SlotProfile is stubbed at the HTTP layer; the JSON
-        # only needs to be parseable by Get-SlotOAuth so the function gets
-        # past the HasOAuth guard.
+        # because identity comes from ~/.claude.json (or the fallback profile
+        # endpoint); the JSON only needs to be parseable by Get-SlotOAuth.
         $script:CredsBody = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-x","refreshToken":"sk-ant-ort-x","expiresAt":9999999999999}}'
     }
 
@@ -63,17 +62,15 @@ Describe 'switch_claude_account' {
     Context 'Invoke-Reconcile (mirror)' {
         It 'mirrors .credentials.json into the tracked slot when emails match' {
             $credFile = Join-Path $script:CD '.credentials.json'
-            $slotFile = Join-Path $script:CD '.credentials.work(alice@example.com).json'
-            Set-Content -LiteralPath $credFile -Value $script:CredsBody     -NoNewline
-            Set-Content -LiteralPath $slotFile -Value 'STALE_OLD_CONTENT'   -NoNewline
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+
+            # Sidecar email == ~/.claude.json email -> mirror branch.
+            $slotFile = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content 'STALE_OLD_CONTENT'
+            Set-SandboxClaudeJson -Email 'alice@example.com'
 
             # Seed state pointing at the slot, with a stale hash so the
             # noop fast-path doesn't fire.
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
-                return [pscustomobject]@{ account = [pscustomobject]@{ email = 'alice@example.com' } }
-            }
 
             $r = Invoke-Reconcile 6>$null
             $r.Action | Should -Be 'mirror'
@@ -87,39 +84,24 @@ Describe 'switch_claude_account' {
             (Read-ScaState).last_sync_hash | Should -Be $expectedHash
         }
 
-        # Offline tolerance: profile fetch failure is treated as "unknown
-        # new identity" and falls into the mirror branch rather than
-        # triggering an over-eager auto-save. Documented in the function
-        # header. The default Common.ps1 mock makes Get-SlotProfile fail.
-        It 'mirrors when profile fetch fails (offline / no-oauth tolerance)' {
+        # Offline tolerance: when ~/.claude.json is missing AND the
+        # /api/oauth/profile fallback fails, the new identity is unknown
+        # and we mirror rather than auto-save. Same "preserve continuity"
+        # principle as before, just with the new probe.
+        It 'mirrors when neither ~/.claude.json nor /api/oauth/profile yields an email' {
             $credFile = Join-Path $script:CD '.credentials.json'
-            $slotFile = Join-Path $script:CD '.credentials.work(alice@example.com).json'
-            Set-Content -LiteralPath $credFile -Value $script:CredsBody   -NoNewline
-            Set-Content -LiteralPath $slotFile -Value 'STALE'             -NoNewline
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
 
+            $slotFile = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content 'STALE'
+
+            # ~/.claude.json missing entirely; default Common.ps1 mock
+            # makes the profile endpoint throw.
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE' | Out-Null
 
             $r = Invoke-Reconcile 6>$null
             $r.Action | Should -Be 'mirror'
             $r.Slot   | Should -Be 'work'
 
-            Get-Content -LiteralPath $slotFile -Raw | Should -Be $script:CredsBody
-        }
-
-        It 'mirrors when the slot is unlabeled (no embedded email)' {
-            $credFile = Join-Path $script:CD '.credentials.json'
-            $slotFile = Join-Path $script:CD '.credentials.work.json'
-            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
-            Set-Content -LiteralPath $slotFile -Value 'STALE'           -NoNewline
-
-            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE' | Out-Null
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
-                return [pscustomobject]@{ account = [pscustomobject]@{ email = 'someone@example.com' } }
-            }
-
-            $r = Invoke-Reconcile 6>$null
-            $r.Action | Should -Be 'mirror'
             Get-Content -LiteralPath $slotFile -Raw | Should -Be $script:CredsBody
         }
     }
@@ -129,15 +111,14 @@ Describe 'switch_claude_account' {
     Context 'Invoke-Reconcile (identity-change)' {
         It 'auto-saves under a new name when emails differ; preserves previous slot' {
             $credFile = Join-Path $script:CD '.credentials.json'
-            $slotFile = Join-Path $script:CD '.credentials.work(alice@example.com).json'
-            Set-Content -LiteralPath $credFile -Value $script:CredsBody  -NoNewline
-            Set-Content -LiteralPath $slotFile -Value 'OLD_ALICE_TOKENS' -NoNewline
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+
+            $slotFile = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content 'OLD_ALICE_TOKENS'
+
+            # New identity probe via ~/.claude.json: bob != alice -> identity-change.
+            Set-SandboxClaudeJson -Email 'bob@example.com' -AccountUuid 'bob-uuid' -OrganizationName 'bob-org'
 
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE' | Out-Null
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
-                return [pscustomobject]@{ account = [pscustomobject]@{ email = 'bob@example.com' } }
-            }
 
             $r = Invoke-Reconcile 6>$null
             $r.Action       | Should -Be 'identity-change'
@@ -148,12 +129,16 @@ Describe 'switch_claude_account' {
             # Original slot file (alice's tokens) preserved untouched.
             Get-Content -LiteralPath $slotFile -Raw | Should -Be 'OLD_ALICE_TOKENS'
 
-            # New auto-save slot exists, labeled with bob's email.
-            $autoPath = Join-Path $script:CD ".credentials.$($r.Slot)(bob@example.com).json"
-            Test-Path -LiteralPath $autoPath | Should -BeTrue
+            # New auto-save slot AND its sidecar exist, labeled with bob's email.
+            $autoPath    = Join-Path $script:CD ".credentials.$($r.Slot)(bob@example.com).json"
+            $autoSidecar = Join-Path $script:CD ".credentials.$($r.Slot)(bob@example.com).account.json"
+            Test-Path -LiteralPath $autoPath    | Should -BeTrue
+            Test-Path -LiteralPath $autoSidecar | Should -BeTrue
             Get-Content -LiteralPath $autoPath -Raw | Should -Be $script:CredsBody
+            $sidecarObj = Get-Content -LiteralPath $autoSidecar -Raw | ConvertFrom-Json
+            $sidecarObj.oauthAccount.emailAddress | Should -Be 'bob@example.com'
+            $sidecarObj.oauthAccount.accountUuid  | Should -Be 'bob-uuid'
 
-            # state.active_slot points at the new auto slot.
             (Read-ScaState).active_slot | Should -Be $r.Slot
         }
     }
@@ -161,35 +146,39 @@ Describe 'switch_claude_account' {
     # ----- auto-save branch ----------------------------------------------
 
     Context 'Invoke-Reconcile (auto-save)' {
-        It 'auto-saves when no state file exists and no slot hash matches' {
+        It 'auto-saves when no state file exists and identity comes from ~/.claude.json' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
 
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
-                return [pscustomobject]@{ account = [pscustomobject]@{ email = 'fresh@example.com' } }
-            }
+            Set-SandboxClaudeJson -Email 'fresh@example.com' -AccountUuid 'fresh-uuid'
 
             $r = Invoke-Reconcile 6>$null
             $r.Action | Should -Be 'auto-save'
             $r.Email  | Should -Be 'fresh@example.com'
             $r.Slot   | Should -Match '^auto-\d{8}T\d{6}Z$'
 
-            # Auto-saved slot file with labeled form.
-            $autoPath = Join-Path $script:CD ".credentials.$($r.Slot)(fresh@example.com).json"
-            Test-Path -LiteralPath $autoPath | Should -BeTrue
+            # Auto-saved slot file with labeled form + sidecar.
+            $autoPath    = Join-Path $script:CD ".credentials.$($r.Slot)(fresh@example.com).json"
+            $autoSidecar = Join-Path $script:CD ".credentials.$($r.Slot)(fresh@example.com).account.json"
+            Test-Path -LiteralPath $autoPath    | Should -BeTrue
+            Test-Path -LiteralPath $autoSidecar | Should -BeTrue
             Get-Content -LiteralPath $autoPath -Raw | Should -Be $script:CredsBody
 
             (Read-ScaState).active_slot | Should -Be $r.Slot
         }
 
-        It 'auto-saves with unlabeled form when profile fetch fails (offline)' {
+        It 'auto-saves with unlabeled form (no sidecar) when both identity sources fail' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
 
+            # No ~/.claude.json, default mock for profile endpoint throws.
             $r = Invoke-Reconcile 6>$null
             $r.Action | Should -Be 'auto-save'
             $r.Email  | Should -BeNullOrEmpty
 
+            # Slot file exists but no sidecar -> Get-Slots will hide it.
+            # Bytes are preserved on disk; user can `sca remove auto-<ts>`
+            # to clean up if they don't want it.
             $autoPath = Join-Path $script:CD ".credentials.$($r.Slot).json"
             Test-Path -LiteralPath $autoPath | Should -BeTrue
         }
@@ -221,15 +210,12 @@ Describe 'switch_claude_account' {
 
         It 'prints a yellow advisory line for identity-change' {
             $credFile = Join-Path $script:CD '.credentials.json'
-            $slotFile = Join-Path $script:CD '.credentials.work(alice@example.com).json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
-            Set-Content -LiteralPath $slotFile -Value 'OLD'             -NoNewline
+
+            New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content 'OLD' | Out-Null
+            Set-SandboxClaudeJson -Email 'bob@example.com'
 
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE' | Out-Null
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
-                return [pscustomobject]@{ account = [pscustomobject]@{ email = 'bob@example.com' } }
-            }
 
             $out = Invoke-Reconcile 6>&1 | Out-String
             $out | Should -Match "\[Sync\] Active credentials are now bob@example\.com"
@@ -246,9 +232,8 @@ Describe 'switch_claude_account' {
         # just wrote. Verifies migration -> noop integrates cleanly.
         It 'noops on first run when hash matches an existing slot (silent migration)' {
             $credFile = Join-Path $script:CD '.credentials.json'
-            $slotFile = Join-Path $script:CD '.credentials.work.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
-            Set-Content -LiteralPath $slotFile -Value $script:CredsBody -NoNewline
+            New-SlotPair -CredDir $script:CD -Name 'work' -Content $script:CredsBody | Out-Null
 
             $r = Invoke-Reconcile 6>$null
             $r.Action | Should -Be 'noop'

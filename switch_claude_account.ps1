@@ -75,11 +75,16 @@ Param (
 
 # We are resolving the script path to reference this file when
 # installing the alias into the user's PowerShell profile.
-$ScriptPath  = (Resolve-Path $PSCommandPath).Path
-$CredDir     = Join-Path $env:USERPROFILE ".claude"
-$CredFile    = Join-Path $CredDir ".credentials.json"
-$StateFile   = Join-Path $CredDir ".sca-state.json"
-$ProfilePath = $PROFILE.CurrentUserAllHosts
+$ScriptPath     = (Resolve-Path $PSCommandPath).Path
+$CredDir        = Join-Path $env:USERPROFILE ".claude"
+$CredFile       = Join-Path $CredDir ".credentials.json"
+$StateFile      = Join-Path $CredDir ".sca-state.json"
+# Claude Code's persistent config (top-level dotfile, NOT inside .claude/).
+# We read its `oauthAccount` block as the authoritative identity source
+# (it's what /status displays) and write whitelisted identity fields back
+# at switch time so Claude Code's display follows the active slot.
+$ClaudeJsonPath = Join-Path $env:USERPROFILE ".claude.json"
+$ProfilePath    = $PROFILE.CurrentUserAllHosts
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -318,8 +323,13 @@ function Read-ScaState {
         return $null
     }
 
+    # Exclude `.account.json` sidecars (introduced in v2.1.0) — they
+    # match the wildcard but are not credential files. Without this
+    # filter the auto-migration could hash a sidecar and never find
+    # a match (harmless), but still wastes I/O and is a defensive
+    # cleanup against future bugs.
     $files = Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ne '.credentials.json' }
+        Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
     foreach ($f in $files) {
         $parsed = Get-SlotFileInfo -FileName $f.Name
         if (-not $parsed) { continue }
@@ -369,6 +379,258 @@ function Update-ScaState {
 
     Write-ScaState -State $current
     return $current
+}
+
+# --- ~/.claude.json identity bridge ---------------------------------------
+#
+# Claude Code keeps `oauthAccount` (accountUuid, emailAddress, organizationUuid,
+# displayName, organizationName, plus billing/trial metadata) in a top-level
+# `~/.claude.json` config file. The /status screen's "Email:" line reads
+# `oauthAccount.emailAddress` from this cache; the cache is populated once at
+# login (from /api/oauth/profile) and is NOT refreshed on subsequent token
+# refreshes (see binary RE in CLAUDE.md). This file is therefore the single
+# authoritative source of "what email is Claude Code displaying right now."
+#
+# sca uses ~/.claude.json two ways:
+#   1. READ (sca save / reconcile identity probe): the email Claude Code
+#      shows IS what we want to label slots with — drift between sca and
+#      Claude Code becomes structurally impossible.
+#   2. WRITE (sca switch): we copy the destination slot's captured oauthAccount
+#      block back into ~/.claude.json so Claude Code's display follows the
+#      active slot across switches.
+#
+# Writing is gated by Test-ClaudeRunning: Claude Code holds ~/.claude.json
+# in an in-memory cache (Un.config) that is not auto-invalidated on external
+# changes, and a flush from a running Claude Code instance would silently
+# overwrite our oauthAccount mutation. Refuse-while-running is the chosen
+# mitigation; see decision (2) in CLAUDE.md's planning history.
+
+# Returns $true if any process named 'claude' is running. The check is
+# scoped to the current user via Get-Process (which only enumerates
+# processes the current user can see). Wrapped as a function so tests
+# can mock it without driving real process state.
+function Test-ClaudeRunning {
+    return [bool](Get-Process -Name 'claude' -ErrorAction SilentlyContinue)
+}
+
+# Read Claude Code's `oauthAccount` block out of ~/.claude.json. Returns a
+# pscustomobject with the whitelisted identity fields when the file exists,
+# parses, and contains a populated oauthAccount.emailAddress; otherwise $null.
+#
+# Whitelist (these are the fields that determine identity; volatile metadata
+# like billingType / trial dates is intentionally not surfaced — it changes
+# over time and should not round-trip through sca):
+#   accountUuid, emailAddress, organizationUuid, displayName, organizationName
+#
+# Failure modes (all -> $null, never throws):
+#   * file missing                     (fresh install / Claude Code never run)
+#   * file unparseable                 (corrupt JSON; Claude Code probably broken too)
+#   * no oauthAccount key              (logged out / API-key-only mode)
+#   * oauthAccount.emailAddress empty  (incomplete cache; treat as no identity)
+function Get-OAuthAccountFromClaudeJson {
+    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) { return $null }
+
+    try {
+        $obj = Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+
+    if (-not $obj.oauthAccount) { return $null }
+    $oa = $obj.oauthAccount
+    if ([string]::IsNullOrWhiteSpace([string]$oa.emailAddress)) { return $null }
+
+    return [pscustomobject]@{
+        accountUuid      = if ($oa.accountUuid)      { [string]$oa.accountUuid }      else { $null }
+        emailAddress     = [string]$oa.emailAddress
+        organizationUuid = if ($oa.organizationUuid) { [string]$oa.organizationUuid } else { $null }
+        displayName      = if ($oa.displayName)      { [string]$oa.displayName }      else { $null }
+        organizationName = if ($oa.organizationName) { [string]$oa.organizationName } else { $null }
+    }
+}
+
+# JSON-encode a string value. Returns the value with surrounding double
+# quotes and standard JSON escapes applied (\\ \" \n \r \t \b \f). Used by
+# Set-OAuthAccountInClaudeJson to substitute new field values into the
+# raw JSON text without depending on PowerShell's JSON serializer (which
+# would re-format the entire 18 KB+ config file and risk drift).
+function ConvertTo-ScaJsonString {
+    Param ([AllowEmptyString()] [AllowNull()] [string] $Value)
+    if ($null -eq $Value) { return 'null' }
+    $escaped = $Value.Replace('\', '\\').Replace('"', '\"')
+    $escaped = $escaped.Replace("`b", '\b').Replace("`f", '\f').Replace("`n", '\n').Replace("`r", '\r').Replace("`t", '\t')
+    return '"' + $escaped + '"'
+}
+
+# Replace the whitelisted identity fields inside ~/.claude.json's
+# oauthAccount block, leaving every other top-level field byte-equal.
+#
+# Strategy: locate the `"oauthAccount": { ... }` block by brace-counting,
+# then substitute each whitelisted "field": "value" pair within the block
+# via a single regex replace. The non-whitelisted fields (billingType,
+# claudeCodeTrialEndsAt, etc.) inside oauthAccount are also preserved
+# byte-equal — we only touch the five identity fields.
+#
+# Pre-flight test (CLAUDE.md history) verified this approach: editing
+# emailAddress and restarting Claude Code makes /status report the new
+# value, and the rest of the file round-trips byte-equal.
+#
+# Errors:
+#   * file missing                  -> throw
+#   * oauthAccount block missing    -> throw
+#   * unbalanced braces in block    -> throw (never seen in practice;
+#                                            indicates a corrupt file
+#                                            and we refuse to touch it)
+function Set-OAuthAccountInClaudeJson {
+    Param ([Parameter(Mandatory)] [pscustomobject] $OAuthAccount)
+
+    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) {
+        throw "~/.claude.json not found at '$ClaudeJsonPath'. Sign in to Claude Code first ('claude /login')."
+    }
+
+    $raw = Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop
+
+    # Locate the opening `"oauthAccount": {`. We accept whitespace variations
+    # because Claude Code's serializer indents with 2 spaces but a hand-edited
+    # file might have different whitespace — we tolerate that.
+    $startMatch = [regex]::Match($raw, '"oauthAccount"\s*:\s*\{')
+    if (-not $startMatch.Success) {
+        throw "~/.claude.json has no oauthAccount block. Sign in to Claude Code first."
+    }
+
+    # Brace-count from the opening { to find the matching close. Naive
+    # counter; doesn't track string-literal context. JSON keys / values
+    # cannot legally contain unescaped braces, so a brace inside a
+    # string requires a preceding backslash that we'd see — ignoring
+    # string context is safe for valid JSON.
+    $openBrace = $startMatch.Index + $startMatch.Length - 1
+    $depth = 1
+    $i = $openBrace + 1
+    while ($i -lt $raw.Length -and $depth -gt 0) {
+        $ch = $raw[$i]
+        if     ($ch -eq '{') { $depth++ }
+        elseif ($ch -eq '}') { $depth-- }
+        $i++
+    }
+    if ($depth -ne 0) {
+        throw "~/.claude.json oauthAccount block has unbalanced braces; refusing to write."
+    }
+    # $i now points just past the closing `}`. The block text spans
+    # [openBrace .. i), inclusive of both braces.
+    $blockText = $raw.Substring($openBrace, $i - $openBrace)
+
+    $whitelist = @('accountUuid', 'emailAddress', 'organizationUuid', 'displayName', 'organizationName')
+    $newBlock  = $blockText
+    foreach ($field in $whitelist) {
+        if (-not $OAuthAccount.PSObject.Properties[$field]) { continue }
+        $value = $OAuthAccount.$field
+        # Field-pattern: `"name": "<any-string-or-null>"`. The capture
+        # accepts both quoted strings and the bare `null` literal so a
+        # null-valued cached field can be replaced with a real value.
+        $pattern = '"' + [regex]::Escape($field) + '"\s*:\s*("(?:[^"\\]|\\.)*"|null)'
+        $rx = [regex]::new($pattern)
+
+        $encoded = ConvertTo-ScaJsonString $value
+        # MatchEvaluator avoids `$1` / `$&` regex-replacement-token
+        # surprises if the JSON-encoded value happens to contain `$`.
+        $replacement = '"' + $field + '": ' + $encoded
+        $newBlock = $rx.Replace($newBlock, [System.Text.RegularExpressions.MatchEvaluator] {
+            Param ($m)
+            return $replacement
+        }, 1)
+    }
+
+    if ($newBlock -eq $blockText) { return }  # no-op write
+
+    $newRaw = $raw.Substring(0, $openBrace) + $newBlock + $raw.Substring($i)
+    Set-CredentialFileAtomic -Path $ClaudeJsonPath -Bytes ([System.Text.Encoding]::UTF8.GetBytes($newRaw))
+}
+
+# --- Per-slot identity sidecar -------------------------------------------
+#
+# Each slot has a sidecar `.account.json` file alongside its credentials
+# file that captures the slot's frozen identity at save time:
+#
+#   .credentials.<name>(<email>).json         <- tokens (what Claude Code reads)
+#   .credentials.<name>(<email>).account.json <- identity sidecar (sca-only)
+#
+# Claude Code never reads the sidecar; it's purely sca state. The sidecar
+# is the authoritative source for switching: when sca switches, the
+# captured oauthAccount is written back into ~/.claude.json so Claude
+# Code's display follows. The slot filename's email and the sidecar's
+# emailAddress agree by construction (save writes both atomically).
+#
+# Slots without a valid sidecar are HIDDEN from list/usage/rotation and
+# refused by switch — there is no migration path from old states.
+# Re-running `sca save <name>` while that slot is active recaptures the
+# sidecar, making the slot visible again.
+
+# Map a slot credentials file path to its sidecar path.
+function Get-SidecarPath {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+    return $SlotPath -replace '\.json$', '.account.json'
+}
+
+# Read the sidecar JSON for a slot. Returns a pscustomobject with the
+# parsed contents, or $null if the sidecar is missing, unparseable, or
+# fails the schema/email shape check.
+function Read-Sidecar {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+
+    $sidecarPath = Get-SidecarPath -SlotPath $SlotPath
+    if (-not (Test-Path -LiteralPath $sidecarPath)) { return $null }
+
+    try {
+        $obj = Get-Content -LiteralPath $sidecarPath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+
+    if ($obj.schema -ne 1) { return $null }
+    if (-not $obj.oauthAccount) { return $null }
+    if ([string]::IsNullOrWhiteSpace([string]$obj.oauthAccount.emailAddress)) { return $null }
+    return $obj
+}
+
+# Atomic-write a sidecar for the given slot path. Source is informational:
+# 'claude_json' when oauthAccount came from ~/.claude.json (preferred),
+# 'api_profile' when it came from /api/oauth/profile (fallback), 'test'
+# in tests, etc. captured_at is informational for diagnostics.
+function Write-Sidecar {
+    Param (
+        [Parameter(Mandatory)] [string]       $SlotPath,
+        [Parameter(Mandatory)] [pscustomobject] $OAuthAccount,
+        [string] $Source = 'claude_json'
+    )
+
+    $payload = [ordered]@{
+        schema       = 1
+        captured_at  = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        source       = $Source
+        oauthAccount = [ordered]@{
+            accountUuid      = $OAuthAccount.accountUuid
+            emailAddress     = $OAuthAccount.emailAddress
+            organizationUuid = $OAuthAccount.organizationUuid
+            displayName      = $OAuthAccount.displayName
+            organizationName = $OAuthAccount.organizationName
+        }
+    }
+    $json  = $payload | ConvertTo-Json -Depth 5
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    Set-CredentialFileAtomic -Path (Get-SidecarPath -SlotPath $SlotPath) -Bytes $bytes
+}
+
+# Best-effort sidecar deletion. Silent on missing file.
+function Remove-Sidecar {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+    $sidecarPath = Get-SidecarPath -SlotPath $SlotPath
+    if (Test-Path -LiteralPath $sidecarPath) {
+        Remove-Item -LiteralPath $sidecarPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # We are detecting the profile file's encoding so install/uninstall can
@@ -540,6 +802,16 @@ function Get-SlotFileName {
 # single source of truth. Slots are returned sorted alphabetically by
 # name for deterministic rotation order and consistent list output.
 #
+# Sidecar requirement (post-v2.1.0): slots without a valid
+# `.credentials.<name>(<email>).account.json` sidecar are HIDDEN. The
+# sidecar carries the captured oauthAccount block restored to
+# ~/.claude.json on switch; without it, sca cannot keep Claude Code's
+# /status display in sync with the active slot, so the slot is
+# unusable. Re-running `sca save <name>` while that slot is active
+# recaptures the sidecar from ~/.claude.json and restores visibility.
+# No automated migration; legacy slots from pre-v2.1.0 simply become
+# invisible until re-saved.
+#
 # As a side effect, this function performs a one-time sweep to delete any
 # leftover .credentials.*.profile.json sidecar files from an earlier
 # version of the tool that used on-disk profile caching. The email is now
@@ -550,15 +822,21 @@ function Get-SlotFileName {
 # cosmetic, not functional.
 #
 # Returns an object with:
-#   Slots : array of { Name, Email, Path, IsActive }
+#   Slots : array of { Name, Email, Path, IsActive, Sidecar }
+#
+# Sidecar is the parsed sidecar object (not raw JSON), which Invoke-
+# SwitchAction needs to restore ~/.claude.json. Carrying it inline
+# avoids re-reading the file at switch time.
 #
 # IsActive is sourced from $StateFile via Read-ScaState (which auto-
-# migrates by content-hash on first call, transparently upgrading users
-# from the previous hardlink-based identification). The function makes
-# zero network calls and zero hash computations on the slot files
+# migrates by content-hash on first call). The function makes zero
+# network calls and zero hash computations on the slot files
 # themselves — `sca list` stays a pure offline render.
 function Get-Slots {
-    # One-time sidecar cleanup. Cheap (fires only when sidecars exist).
+    # One-time sidecar cleanup. Cheap (fires only when legacy sidecars
+    # exist). The `.profile.json` shape is from a pre-v1 implementation
+    # entirely separate from the post-v2.1.0 `.account.json` sidecar
+    # that this function actively requires.
     $orphans = Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.profile.json' -ErrorAction SilentlyContinue
     foreach ($o in $orphans) {
         Remove-Item -LiteralPath $o.FullName -Force -ErrorAction SilentlyContinue
@@ -567,9 +845,12 @@ function Get-Slots {
         Remove-Item -LiteralPath (Join-Path $CredDir '.credentials.profile.json') -Force -ErrorAction SilentlyContinue
     }
 
+    # Filter out sidecar files (`.credentials.*.account.json`) themselves
+    # so they don't get parsed as slot credentials. The wildcard
+    # `.credentials.*.json` would otherwise match them.
     $files = @(
         Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne '.credentials.json' } |
+            Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' } |
             Sort-Object -Property Name
     )
 
@@ -580,11 +861,19 @@ function Get-Slots {
         $parsed = Get-SlotFileInfo -FileName $file.Name
         if (-not $parsed) { continue }
 
+        # Sidecar requirement: skip slots without a valid sidecar so
+        # they don't appear in list / usage / rotation. The slot file
+        # itself stays on disk untouched — re-saving via `sca save
+        # <name>` while it's active will recapture the sidecar.
+        $sidecar = Read-Sidecar -SlotPath $file.FullName
+        if (-not $sidecar) { continue }
+
         [pscustomobject]@{
             Name     = $parsed.Name
             Email    = $parsed.Email
             Path     = $file.FullName
             IsActive = ($activeName -and $parsed.Name -eq $activeName)
+            Sidecar  = $sidecar
         }
     }
 
@@ -754,10 +1043,9 @@ function Remove-From-Profile {
 # Reconcile .credentials.json with the saved slot tracked in $StateFile.
 # Called at the start of every credentials-touching action that needs the
 # tracked slot to reflect Claude Code's most recent token refresh (sca
-# switch and sca usage in the redesigned model). Replaces the hardlink
-# auto-sync mechanism the script used to depend on.
+# switch and sca usage in the redesigned model).
 #
-# Algorithm (4 outcomes; never throws):
+# Algorithm (5 outcomes; never throws unless an atomic write itself fails):
 #   1. .credentials.json missing                   -> noop
 #   2. hash matches state.last_sync_hash           -> noop
 #   3. tracked slot exists, identity matches       -> mirror bytes -> slot
@@ -766,16 +1054,19 @@ function Remove-From-Profile {
 #                                                      old slot file preserved)
 #   5. no tracked slot, OR slot file is gone       -> auto-save under new name
 #
-# Identity check uses the OAuth /api/oauth/profile endpoint to resolve
-# the email of the current .credentials.json bytes, then compares it to
-# the email parsed out of the tracked slot's filename. A profile fetch
-# failure (offline, 401, no-oauth, rate limited) is treated as "unknown
-# new identity" and falls into the same-identity branch — i.e. we mirror
-# rather than risk over-eager auto-saves under transient network issues.
-# This is the safe failure mode: the slot's filename email is preserved
-# on disk; if Claude Code really did switch accounts while we were
-# offline, the user can see the labeled slot still claims the old email
-# and re-save manually.
+# Identity probe (post-v2.1.0): ~/.claude.json's oauthAccount.emailAddress.
+# This is the same source Claude Code uses for /status, so reconcile and
+# Claude Code can never disagree about the active identity. The probe is
+# offline (no HTTP), making it both faster and more reliable than the
+# previous /api/oauth/profile probe (which could occasionally return a
+# different email for the same account). When ~/.claude.json has no
+# oauthAccount yet (rare: fresh install, never logged into Claude Code),
+# we fall back to /api/oauth/profile so the noop / mirror branches still
+# work for users in that transient state.
+#
+# Tracked slot's identity comes from the slot's sidecar (which was
+# captured at save time from ~/.claude.json or /api/oauth/profile). This
+# is what we compare ~/.claude.json's current value against.
 #
 # Race protection: bytes are read from .credentials.json once, then both
 # hashed and written. If Claude Code rewrites the file between our read
@@ -811,26 +1102,44 @@ function Invoke-Reconcile {
         return [pscustomobject]@{ Action = 'noop'; Reason = 'hash-match' }
     }
 
-    # Bytes differ from last sync. Resolve new identity (best-effort).
-    $newProfile = Get-SlotProfile -SlotPath $CredFile
-    $newEmail   = if ($newProfile.Status -eq 'ok') { $newProfile.Email } else { $null }
+    # Bytes differ from last sync. Resolve new identity. Preferred: read
+    # ~/.claude.json's oauthAccount.emailAddress (offline; same source
+    # Claude Code uses). Fallback: /api/oauth/profile (network) when
+    # ~/.claude.json has no oauthAccount populated yet.
+    $newAccount = Get-OAuthAccountFromClaudeJson
+    $newEmail   = if ($newAccount) { $newAccount.emailAddress } else { $null }
+    if (-not $newEmail) {
+        $profileResult = Get-SlotProfile -SlotPath $CredFile
+        if ($profileResult.Status -eq 'ok') {
+            $newEmail = $profileResult.Email
+            # Synthesize a minimal accountInfo for the auto-save sidecar.
+            $newAccount = [pscustomobject]@{
+                accountUuid      = $null
+                emailAddress     = $newEmail
+                organizationUuid = $null
+                displayName      = $null
+                organizationName = $null
+            }
+        }
+    }
+    $sourceLabel = if ($newAccount -and $newAccount.accountUuid) { 'claude_json' } else { 'api_profile' }
 
     if ($state -and $state.active_slot) {
         $slot = Find-SlotByName -Name $state.active_slot
         if ($slot) {
-            # Tolerate offline / no-oauth on either side: we only block the
-            # mirror when BOTH emails are known AND they differ. This
-            # picks "preserve continuity" over "be paranoid about offline
-            # account-swaps", which is the right call for the 99% case
-            # (refreshes for the same account).
-            $sameIdentity = (-not $newEmail) -or (-not $slot.Email) -or ($newEmail -eq $slot.Email)
+            # Tracked slot's email comes from its sidecar (Get-Slots
+            # always populates this on the slot object). Tolerate
+            # offline / unknown-new-identity by falling into the
+            # same-identity branch — preserves continuity over paranoia.
+            $slotEmail    = if ($slot.Sidecar) { [string]$slot.Sidecar.oauthAccount.emailAddress } else { $slot.Email }
+            $sameIdentity = (-not $newEmail) -or (-not $slotEmail) -or ($newEmail -eq $slotEmail)
             if ($sameIdentity) {
                 Set-CredentialFileAtomic -Path $slot.Path -Bytes $bytes
                 Update-ScaState -LastSyncHash $hash | Out-Null
                 return [pscustomobject]@{
                     Action = 'mirror'
                     Slot   = $state.active_slot
-                    Email  = $slot.Email
+                    Email  = $slotEmail
                 }
             }
 
@@ -840,9 +1149,20 @@ function Invoke-Reconcile {
             $autoName = 'auto-' + ([DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'"))
             $autoPath = Join-Path $CredDir (Get-SlotFileName -Name $autoName -Email $newEmail)
             Set-CredentialFileAtomic -Path $autoPath -Bytes $bytes
+            if ($newAccount) {
+                try {
+                    Write-Sidecar -SlotPath $autoPath -OAuthAccount $newAccount -Source $sourceLabel
+                }
+                catch {
+                    # Sidecar write failed — orphan tokens file. Get-Slots
+                    # will hide it, so it's invisible but on disk; the
+                    # user can `sca remove auto-<ts>` to clean it up.
+                    Write-Host "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" -ForegroundColor "Yellow"
+                }
+            }
             Update-ScaState -ActiveSlot $autoName -LastSyncHash $hash | Out-Null
 
-            $oldIdent = Format-SlotIdentity -Name $state.active_slot -Email $slot.Email
+            $oldIdent = Format-SlotIdentity -Name $state.active_slot -Email $slotEmail
             Write-Host "[Sync] Active credentials are now $newEmail; previous slot $oldIdent preserved. Active slot is now '$autoName'." -ForegroundColor "Yellow"
             return [pscustomobject]@{
                 Action       = 'identity-change'
@@ -851,15 +1171,24 @@ function Invoke-Reconcile {
                 Email        = $newEmail
             }
         }
-        # state.active_slot pointed at a slot file that no longer exists;
-        # fall through to the auto-save fallback so the new bytes still
-        # land in *some* slot.
+        # state.active_slot pointed at a slot file that no longer exists
+        # OR the slot file exists but has no sidecar (Get-Slots filtered
+        # it out). Fall through to auto-save so the new bytes still land
+        # in a fresh, sidecared slot.
     }
 
-    # No tracked slot, or tracked slot file is gone. Auto-save fallback.
+    # No tracked slot, or tracked slot file/sidecar is gone. Auto-save fallback.
     $autoName = 'auto-' + ([DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'"))
     $autoPath = Join-Path $CredDir (Get-SlotFileName -Name $autoName -Email $newEmail)
     Set-CredentialFileAtomic -Path $autoPath -Bytes $bytes
+    if ($newAccount) {
+        try {
+            Write-Sidecar -SlotPath $autoPath -OAuthAccount $newAccount -Source $sourceLabel
+        }
+        catch {
+            Write-Host "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" -ForegroundColor "Yellow"
+        }
+    }
     Update-ScaState -ActiveSlot $autoName -LastSyncHash $hash | Out-Null
 
     $autoIdent = Format-SlotIdentity -Name $autoName -Email $newEmail
@@ -885,82 +1214,103 @@ function Invoke-SaveAction {
         throw "$CredFile not found. Log in via Claude Code first."
     }
 
-    # Find any pre-existing slot files for this slot name (labeled or
-    # unlabeled). We delete them before writing the new one so the save
-    # is idempotent even when the stored account has changed (and
-    # therefore the labeled form changes).
-    $existing = @(Get-Slots).Slots | Where-Object { $_.Name -eq $safeName }
+    # Refuse if Claude Code is running. We resolve identity from
+    # ~/.claude.json's oauthAccount, which Claude Code keeps in an
+    # in-memory cache and may flush back to disk at any moment. Saving
+    # while Claude Code runs would silently capture stale identity into
+    # the sidecar AND risk overwriting our writes if a flush races our
+    # write. Refuse-while-running is the chosen mitigation; see
+    # CLAUDE.md's planning history for the binary-RE rationale.
+    if (Test-ClaudeRunning) {
+        throw "Claude Code is running. Close it before 'sca save' so identity capture is consistent."
+    }
+
+    # Resolve identity. ~/.claude.json's oauthAccount is the preferred
+    # source (it's exactly what Claude Code's /status displays — drift-
+    # proof by construction). Fall back to a live /api/oauth/profile
+    # call only when ~/.claude.json has no oauthAccount yet (rare:
+    # fresh install, user wiped the config, etc.). Failing both ->
+    # refuse the save: a sidecar without identity is invalid by design.
+    $accountInfo = Get-OAuthAccountFromClaudeJson
+    $sourceLabel = 'claude_json'
+    if (-not $accountInfo) {
+        # Fallback path: live /api/oauth/profile. Returns only the email,
+        # so the rest of the oauthAccount fields default to $null. The
+        # slot is still usable (Claude Code re-derives missing fields
+        # from the next refresh response). Use a non-automatic-variable
+        # name (`$profileResult` rather than `$profile`) — `$profile` is
+        # PowerShell's automatic for the running profile path and a
+        # collision could surprise downstream code.
+        $profileResult = Get-SlotProfile -SlotPath $CredFile
+        if ($profileResult.Status -eq 'ok' -and $profileResult.Email) {
+            $accountInfo = [pscustomobject]@{
+                accountUuid      = $null
+                emailAddress     = $profileResult.Email
+                organizationUuid = $null
+                displayName      = $null
+                organizationName = $null
+            }
+            $sourceLabel = 'api_profile'
+        } else {
+            $reason = if ($profileResult.Error) {
+                Format-StatusErrorTail $profileResult.Error
+            } else {
+                $profileResult.Status
+            }
+            throw "Cannot resolve account identity: ~/.claude.json has no oauthAccount and /api/oauth/profile failed ($reason). Sign in to Claude Code first ('claude /login')."
+        }
+    }
+
+    $email = $accountInfo.emailAddress
+    if ([string]::IsNullOrWhiteSpace($email)) {
+        throw "Resolved oauthAccount has no emailAddress; cannot save."
+    }
 
     # Read .credentials.json bytes once. The same bytes are written to
     # the slot file via atomic rename and hashed for state.last_sync_hash;
     # this read-once-write-once approach ensures internal consistency
     # even if Claude Code rewrites .credentials.json during the save.
+    # (Claude Code is closed, but a background process — antivirus,
+    # backup tool — could still touch the file.)
     $bytes = [System.IO.File]::ReadAllBytes($CredFile)
 
-    # Write to the unlabeled filename first; rename to the labeled form
-    # only after we successfully fetch the OAuth profile. This keeps
-    # `sca save` working fully offline — if the profile fetch fails we
-    # still end up with a usable slot, just without the email suffix.
-    $unlabeledPath = Join-Path $CredDir (Get-SlotFileName -Name $safeName -Email $null)
+    # Final filename now that identity is known. We write directly to the
+    # final path; no unlabeled-then-rename dance.
+    $finalSlotName = Get-SlotFileName -Name $safeName -Email $email
+    $finalSlotPath = Join-Path $CredDir $finalSlotName
 
-    foreach ($e in $existing) {
-        if ($e.Path -ne $unlabeledPath -and (Test-Path -LiteralPath $e.Path)) {
-            Remove-Item -LiteralPath $e.Path -Force
+    # Find any pre-existing slot files / sidecars for this slot name
+    # (labeled or unlabeled, possibly with stale email). Delete them so
+    # the save is idempotent even when the stored account has changed.
+    # Get-Slots filters out sidecar-less slots, so we enumerate the raw
+    # file system here to also catch invisible legacy slots that share
+    # this slot name.
+    $rawFiles = @(
+        Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
+    )
+    foreach ($rf in $rawFiles) {
+        $parsed = Get-SlotFileInfo -FileName $rf.Name
+        if ($parsed -and $parsed.Name -eq $safeName -and $rf.FullName -ne $finalSlotPath) {
+            Remove-Item -LiteralPath $rf.FullName -Force -ErrorAction SilentlyContinue
+            Remove-Sidecar -SlotPath $rf.FullName
         }
     }
 
-    Set-CredentialFileAtomic -Path $unlabeledPath -Bytes $bytes
-    $finalSlotPath = $unlabeledPath
-
-    # Eager profile fetch. Success -> rename to labeled form. Failure
-    # (offline, 401, timeout, profile missing email) -> leave as
-    # unlabeled and emit a non-fatal yellow notice; the user can re-run
-    # `sca save <name>` when online to upgrade.
-    $finalEmail = $null
-    $profile    = Get-SlotProfile -SlotPath $unlabeledPath
-    if ($profile.Status -eq 'ok' -and $profile.Email) {
-        $labeledName = Get-SlotFileName -Name $safeName -Email $profile.Email
-        $labeledPath = Join-Path $CredDir $labeledName
-        if ($labeledPath -ne $unlabeledPath) {
-            if (Test-Path -LiteralPath $labeledPath) {
-                Remove-Item -LiteralPath $labeledPath -Force
-            }
-            # Plain Move-Item: hardlinks no longer in play, so the inode-
-            # preserving property the previous design relied on is moot.
-            # If the rename fails (email contains an NTFS-invalid character
-            # like '<' or ':'), fall back to the unlabeled form and emit
-            # an advisory so the save still succeeds — user can re-run
-            # later if Anthropic ever returns a sanitizable email.
-            try {
-                Move-Item -LiteralPath $unlabeledPath -Destination $labeledPath -ErrorAction Stop
-                $finalEmail    = $profile.Email
-                $finalSlotPath = $labeledPath
-            }
-            catch {
-                Write-Host "[Save] Could not rename slot to labeled form (keeping unlabeled): $($_.Exception.Message)" -ForegroundColor "Yellow"
-            }
-        } else {
-            # Labeled == unlabeled (slot name equals email, dedup form):
-            # no rename needed, but the email is still known.
-            $finalEmail = $profile.Email
-        }
-    } else {
-        # Distinct user-facing message for the 'rate-limited' status —
-        # otherwise users hitting Anthropic's 429 would see an opaque
-        # "(slot saved unlabeled): rate-limited" line and might assume
-        # the save itself was rate-limited (it wasn't; only the email
-        # lookup was). The slot is fully usable; only the labeled
-        # filename suffix is missing and can be fixed by re-running
-        # `sca save <name>` once the rate limit clears. All other
-        # non-ok statuses (offline, unauthorized, error, no-oauth) keep
-        # the original generic wording with the underlying reason as
-        # the tail; long messages are kept terse via Format-StatusErrorTail.
-        if ($profile.Status -eq 'rate-limited') {
-            Write-Host "[Save] Could not resolve account email (Anthropic API rate limited; slot saved unlabeled — re-run 'sca save $safeName' later to label it)." -ForegroundColor "Yellow"
-        } else {
-            $reason = if ($profile.Error) { Format-StatusErrorTail $profile.Error } else { $profile.Status }
-            Write-Host "[Save] Could not resolve account email (slot saved unlabeled): $reason" -ForegroundColor "Yellow"
-        }
+    # Write tokens, then sidecar. Order matters for atomic-pair semantics:
+    # if the tokens write succeeds but the sidecar write fails, we delete
+    # the tokens file in the catch so a half-saved slot doesn't appear
+    # invisible-but-present (it would be present on disk but hidden by
+    # Get-Slots' sidecar filter). Conversely, an orphan sidecar without
+    # a matching tokens file is harmless — Get-Slots only iterates
+    # tokens files; sidecars are looked up by-path.
+    Set-CredentialFileAtomic -Path $finalSlotPath -Bytes $bytes
+    try {
+        Write-Sidecar -SlotPath $finalSlotPath -OAuthAccount $accountInfo -Source $sourceLabel
+    }
+    catch {
+        Remove-Item -LiteralPath $finalSlotPath -Force -ErrorAction SilentlyContinue
+        throw "Failed to write sidecar for slot '$safeName' ($($_.Exception.Message)); slot rolled back."
     }
 
     # Update state: this slot is now the active one, and its bytes match
@@ -976,12 +1326,22 @@ function Invoke-SaveAction {
     }
     Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
 
-    $displayEmail = if ($finalEmail) { " ($finalEmail)" } else { '' }
-    Write-Host "[Save] Saved as '$safeName'$displayEmail" -ForegroundColor "Green"
+    $displayEmail = if ($email -and $safeName.ToLowerInvariant() -ne $email.ToLowerInvariant()) { " ($email)" } else { '' }
+    $sourceTail   = if ($sourceLabel -eq 'api_profile') { ' [identity from /api/oauth/profile]' } else { '' }
+    Write-Host "[Save] Saved as '$safeName'$displayEmail$sourceTail" -ForegroundColor "Green"
 }
 
 function Invoke-SwitchAction {
     Param ([String] $Name)
+
+    # Refuse if Claude Code is running. Switch writes to ~/.claude.json's
+    # oauthAccount block from the destination slot's sidecar, and a
+    # running Claude Code instance keeps that file in an in-memory
+    # cache that may flush and clobber our update. Refusing is the
+    # simplest reliability guarantee — see CLAUDE.md's planning history.
+    if (Test-ClaudeRunning) {
+        throw "Claude Code is running. Close it before 'sca switch' so the email-display change applies cleanly."
+    }
 
     # Reconcile FIRST so any pending Claude Code refresh on the outgoing
     # active slot is mirrored into the saved slot file before we
@@ -1018,14 +1378,39 @@ function Invoke-SwitchAction {
 
     $slot = Find-SlotByName -Name $safeName
     if (-not $slot) {
-        throw "Slot '$safeName' not found."
+        # Find-SlotByName goes through Get-Slots which filters out
+        # sidecar-less slots, so the missing-slot error covers both
+        # "never existed" and "exists on disk but no sidecar". Tell the
+        # user about both possibilities so they can recover from a
+        # stale-state scenario.
+        throw "Slot '$safeName' not found (or missing its identity sidecar — re-save while active to recapture)."
     }
 
     # Atomic-rename copy: works even if Claude Code has .credentials.json
-    # open (it grants share-delete). Bytes are read from the slot file
-    # once and reused for both the write and the state hash.
+    # open (it grants share-delete) — but with the running guard above,
+    # this path normally only executes when Claude Code is closed.
+    # Bytes are read from the slot file once and reused for both the
+    # write and the state hash.
     $slotBytes = [System.IO.File]::ReadAllBytes($slot.Path)
     Set-CredentialFileAtomic -Path $CredFile -Bytes $slotBytes
+
+    # Restore the captured oauthAccount into ~/.claude.json so Claude
+    # Code's /status display matches the active slot on next start.
+    # The sidecar is guaranteed valid here (Get-Slots filtered out
+    # sidecar-less slots), so $slot.Sidecar.oauthAccount is populated.
+    # Failure to write ~/.claude.json (file locked, malformed,
+    # disappeared) bubbles up — the credentials swap has already
+    # happened, so the user sees the error and can rerun once the
+    # condition clears. We do NOT rollback the credentials write
+    # because Claude Code may have already started using the new
+    # tokens; rolling back would create more confusion.
+    try {
+        Set-OAuthAccountInClaudeJson -OAuthAccount $slot.Sidecar.oauthAccount
+    }
+    catch {
+        Write-Host "[Switch] Tokens swapped to '$safeName' but ~/.claude.json oauthAccount update failed: $($_.Exception.Message)" -ForegroundColor "Yellow"
+        Write-Host "[Switch] Claude Code's /status email may not reflect the new slot until you fix and re-run." -ForegroundColor "Yellow"
+    }
 
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -1053,12 +1438,10 @@ function Invoke-SwitchAction {
     $postSwitchInfo = Get-Slots
     Format-ListTable -Slots @($postSwitchInfo.Slots) -SuppressHeader
 
-    # Cyan `[Info]` apply hint, last line beneath the table. Wording
-    # softened from the previous "Close and restart" to reflect that
-    # atomic-rename writes work while Claude Code is open; the file is
-    # swapped now, but a running Claude Code session will keep using its
-    # in-memory tokens until restarted.
-    Write-Host "[Info] Restart Claude Code to fully apply the swap (running sessions may continue using the previous credentials until restarted)." -ForegroundColor "Cyan"
+    # Cyan `[Info]` apply hint, last line beneath the table. With the
+    # ~/.claude.json oauthAccount swap above, starting Claude Code
+    # fresh will show the new slot's email immediately on /status.
+    Write-Host "[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped)." -ForegroundColor "Cyan"
     Write-Host ''
 }
 
@@ -1086,10 +1469,22 @@ function Invoke-RemoveAction {
 
     $safeName = Get-SafeName $Name
 
-    # Look up by parsed slot-name so both labeled and unlabeled filename
-    # shapes resolve from a single user-visible name argument.
-    $slot = Find-SlotByName -Name $safeName
-    if (-not $slot) {
+    # Lookup walks the raw filesystem rather than Get-Slots so the user
+    # can clean up sidecar-less legacy slots that Get-Slots hides.
+    # Without this, an invisible legacy slot would be impossible to
+    # remove without manual filesystem editing.
+    $rawFiles = @(
+        Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
+    )
+    $matching = @()
+    foreach ($rf in $rawFiles) {
+        $parsed = Get-SlotFileInfo -FileName $rf.Name
+        if ($parsed -and $parsed.Name -eq $safeName) {
+            $matching += $rf
+        }
+    }
+    if ($matching.Count -eq 0) {
         throw "Slot '$safeName' not found."
     }
 
@@ -1102,7 +1497,10 @@ function Invoke-RemoveAction {
         throw "Cannot remove active slot '$safeName'. Run 'sca switch <other>' first, or delete .credentials.json manually if you want to drop tracking."
     }
 
-    Remove-Item -LiteralPath $slot.Path -Force
+    foreach ($rf in $matching) {
+        Remove-Item -LiteralPath $rf.FullName -Force
+        Remove-Sidecar -SlotPath $rf.FullName
+    }
     Write-Host "[Remove] Removed '$safeName'" -ForegroundColor "Red"
 }
 

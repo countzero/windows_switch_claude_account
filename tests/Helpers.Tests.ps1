@@ -117,10 +117,9 @@ Describe 'switch_claude_account' {
         # mis-identified which slot was active (or threw).
         It 'marks a literal bracket slot as active when its hash matches .credentials.json' {
             $credDir = Join-Path $script:SandboxHome '.claude'
-            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
-            Set-Content -LiteralPath (Join-Path $credDir '.credentials.fooa.json')    -Value 'A'  -NoNewline
-            Set-Content -LiteralPath (Join-Path $credDir '.credentials.foo[bar].json') -Value 'BR' -NoNewline
-            Set-Content -LiteralPath (Join-Path $credDir '.credentials.json')         -Value 'BR' -NoNewline
+            New-SlotPair -CredDir $credDir -Name 'fooa'     -Content 'A'  | Out-Null
+            New-SlotPair -CredDir $credDir -Name 'foo[bar]' -Content 'BR' | Out-Null
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.json') -Value 'BR' -NoNewline
 
             $info   = Get-Slots
             $active = @($info.Slots | Where-Object { $_.IsActive })
@@ -136,8 +135,7 @@ Describe 'switch_claude_account' {
         # once the directory is clean.
         It 'silently removes orphan .profile.json sidecars on first enumeration' {
             $credDir = Join-Path $script:SandboxHome '.claude'
-            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
-            Set-Content -LiteralPath (Join-Path $credDir '.credentials.work.json')         -Value 'W'                -NoNewline
+            New-SlotPair -CredDir $credDir -Name 'work' -Content 'W' | Out-Null
             Set-Content -LiteralPath (Join-Path $credDir '.credentials.work.profile.json') -Value '{"email":"w@x"}' -NoNewline
             Set-Content -LiteralPath (Join-Path $credDir '.credentials.profile.json')      -Value '{"email":"a@x"}' -NoNewline
 
@@ -158,9 +156,8 @@ Describe 'switch_claude_account' {
         # is labeled or not.
         It 'parses labeled filenames into (Name, Email) pairs' {
             $credDir = Join-Path $script:SandboxHome '.claude'
-            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
-            Set-Content -LiteralPath (Join-Path $credDir '.credentials.work(alice@example.com).json') -Value 'W' -NoNewline
-            Set-Content -LiteralPath (Join-Path $credDir '.credentials.solo.json')                    -Value 'S' -NoNewline
+            New-SlotPair -CredDir $credDir -Name 'work' -Email 'alice@example.com' -Content 'W' | Out-Null
+            New-SlotPair -CredDir $credDir -Name 'solo' -Content 'S' | Out-Null
 
             $slots = @((Get-Slots).Slots)
             $bySlotName = @{}
@@ -170,6 +167,32 @@ Describe 'switch_claude_account' {
             $bySlotName['work'].Email       | Should -Be 'alice@example.com'
             $bySlotName.ContainsKey('solo') | Should -BeTrue
             $bySlotName['solo'].Email       | Should -BeNullOrEmpty
+        }
+
+        # New: verify Get-Slots filters out slots without sidecars.
+        It 'hides slot files that have no sidecar (post-v2.1.0 contract)' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            # Bare slot file, no sidecar — invisible by design.
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.legacy.json') -Value 'L' -NoNewline
+            # Properly paired slot — visible.
+            New-SlotPair -CredDir $credDir -Name 'modern' -Content 'M' | Out-Null
+
+            $names = @((Get-Slots).Slots | ForEach-Object Name)
+            $names | Should -Be @('modern')
+            $names | Should -Not -Contain 'legacy'
+        }
+
+        # New: sidecar files themselves must not be enumerated as slots.
+        It 'does not enumerate .account.json sidecar files as slot credentials' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $credDir -Name 'work' -Content 'W' | Out-Null
+
+            $names = @((Get-Slots).Slots | ForEach-Object Name)
+            $names | Should -Be @('work')
+            # No phantom slot whose name ends in '.account' (would mean
+            # the sidecar leaked into Get-SlotFileInfo's parser).
+            $names | ForEach-Object { $_ | Should -Not -Match '\.account$' }
         }
     }
 

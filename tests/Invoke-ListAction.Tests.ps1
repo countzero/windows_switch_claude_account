@@ -31,48 +31,54 @@ Describe 'switch_claude_account' {
         }
 
         It 'lists slot names and marks the active slot with *' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
-            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'B' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Content 'B' | Out-Null
+            Set-Content -LiteralPath $script:CredFilePath -Value 'B' -NoNewline
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
-            # Table-shape rows: leading ` ` (inactive) or `*` (active),
-            # then the slot name. The `(active)` suffix is gone now —
-            # the `*` marker plus row coloring is the single source of
-            # truth, matching the usage table.
             $out | Should -Match '(?m)^\s+alpha\s'
             $out | Should -Match '(?m)^\s+\*\s+bravo\s'
             $out | Should -Not -Match '\(active\)'
-            # Header row present with both column labels.
             $out | Should -Match 'Slot'
             $out | Should -Match 'Account'
         }
 
         It 'lists slots without * when no active file exists' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
             $out | Should -Match '(?m)^\s+alpha\s'
             $out | Should -Not -Match '\(active\)'
-            # No row carries a `*` marker when no active file exists.
             $out | Should -Not -Match '(?m)^\s+\*\s+\w'
         }
 
         It 'excludes .credentials.json itself from the slot listing' {
-            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'X' -NoNewline
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.work.json') -Value 'W' -NoNewline
+            Set-Content -LiteralPath $script:CredFilePath -Value 'X' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Content 'W' | Out-Null
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
             $out | Should -Match 'work'
-            # If the Where-Object filter in Get-Slots ever regresses,
-            # .credentials.json itself leaks as a slot whose rendered name is
-            # the literal '.credentials'. Anchor to the list-row shape
-            # (leading ' * ' or '   ' indent) so this assertion catches the
-            # leak without false-positiving on legitimate slot names.
             $out | Should -Not -Match '(?m)^\s*\*?\s+\.credentials(\s|$)'
+        }
+
+        # Post-v2.1.0: slots without sidecars are hidden entirely.
+        # Re-running `sca save <name>` while that slot is active
+        # recaptures the sidecar and makes it visible again.
+        It 'hides slot files that have no sidecar' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'modern' -Content 'M' | Out-Null
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.legacy.json') -Value 'L' -NoNewline
+
+            $out = Invoke-ListAction 6>&1 | Out-String
+
+            $out | Should -Match '(?m)^\s+modern\s'
+            $out | Should -Not -Match '(?m)^\s+legacy\s'
+            # Legacy slot file remains on disk (not deleted by `list`),
+            # but is invisible in the table. User can `sca remove legacy`
+            # to clean up explicitly.
+            Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.legacy.json') | Should -BeTrue
         }
 
         # Email column rendering: parallels the Invoke-UsageAction email
@@ -80,30 +86,26 @@ Describe 'switch_claude_account' {
         # inline in an Account column instead of the old `└─ <email>`
         # continuation line.
         It 'renders the email in the Account column when slot is labeled' {
-            $labeled = '.credentials.work(ada.lovelace@arpa.net).json'
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value 'X' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'ada.lovelace@arpa.net' -Content 'X' | Out-Null
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
-            # Slot name and email on the same row; no '└─' continuation.
             $out | Should -Match '(?m)^\s+work\s+ada\.lovelace@arpa\.net\b'
             $out | Should -Not -Match '└─'
         }
 
         It "renders '-' in the Account column when slot name equals the embedded email (dedup form)" {
             $email = 'alice@example.com'
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath ".credentials.$email.json") -Value 'X' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name $email -Content 'X' | Out-Null
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
-            # The whole-email slot name appears, then the em-dash sentinel
-            # in place of a redundant Account cell.
             $out | Should -Match "(?m)^\s+$([regex]::Escape($email))\s+—\s*$"
             $out | Should -Not -Match '└─'
         }
 
         It "renders '-' in the Account column for unlabeled slot" {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.pending.json') -Value 'X' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'pending' -Content 'X' | Out-Null
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
@@ -115,8 +117,7 @@ Describe 'switch_claude_account' {
             $longEmail = 'extremely.long.local.part@extraordinarily-long-domain.example.com'
             $longEmail.Length | Should -BeGreaterThan $Script:AccountColumnMaxWidth
 
-            $labeled = ".credentials.longslot($longEmail).json"
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath $labeled) -Value 'X' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'longslot' -Email $longEmail -Content 'X' | Out-Null
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
@@ -140,9 +141,9 @@ Describe 'switch_claude_account' {
         # the user runs `sca usage` or `sca switch`.
 
         It 'no advisory output ever, regardless of .credentials.json state' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
-            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'UNKNOWN' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Content 'B' | Out-Null
+            Set-Content -LiteralPath $script:CredFilePath -Value 'UNKNOWN' -NoNewline
 
             $out = Invoke-ListAction 6>&1 | Out-String
             $out | Should -Not -Match 'Warning'
@@ -152,8 +153,8 @@ Describe 'switch_claude_account' {
 
         # Active marker comes from the state file when it exists.
         It 'IsActive marker reflects state.active_slot' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Content 'B' | Out-Null
 
             Update-ScaState -ActiveSlot 'alpha' -LastSyncHash 'X' | Out-Null
 
@@ -164,18 +165,17 @@ Describe 'switch_claude_account' {
 
         # Auto-migration on first call (no state file): hash-match
         # .credentials.json against existing slot files and seed state
-        # transparently. This keeps `sca list` correct after upgrading
-        # from the previous hardlink-based version.
+        # transparently. Read-ScaState's auto-migration walks raw files
+        # (not Get-Slots) so the active slot is identified even when
+        # the slot's sidecar exists.
         It 'auto-migrates state on first call by hash-matching .credentials.json' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.bravo.json') -Value 'B' -NoNewline
-            Set-Content -LiteralPath $script:CredFilePath                                      -Value 'B' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Content 'B' | Out-Null
+            Set-Content -LiteralPath $script:CredFilePath -Value 'B' -NoNewline
 
             $out = Invoke-ListAction 6>&1 | Out-String
 
-            # Migration silently identifies bravo as active.
             $out | Should -Match '(?m)^\s+\*\s+bravo\s'
-            # And persists for fast subsequent reads.
             (Read-ScaState).active_slot | Should -Be 'bravo'
         }
 
@@ -183,7 +183,7 @@ Describe 'switch_claude_account' {
         # state.active_slot stays whatever it was (maybe null on a fresh
         # install with no prior saves). Either way, no advisory.
         It 'list works without .credentials.json (no active marker; no advisory)' {
-            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.alpha.json') -Value 'A' -NoNewline
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
 
             $out = Invoke-ListAction 6>&1 | Out-String
             $out | Should -Match '(?m)^\s+alpha\s'
