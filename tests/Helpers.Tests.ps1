@@ -248,6 +248,74 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'uninstall'
             $out | Should -Match 'help, -h'
         }
+
+        It 'documents the -NoColor option and the NO_COLOR env var' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'OPTIONS'
+            $out | Should -Match '-NoColor'
+            $out | Should -Match 'NO_COLOR'
+        }
+    }
+
+    Context 'No-color mode' {
+        # Verifies the $PSStyle.OutputRendering toggle wired into
+        # Invoke-Main. The toggle is the entire no-color implementation
+        # (PS 7.2+ honors PlainText at the chokepoint of every
+        # Write-Host -ForegroundColor call), so these tests assert on
+        # the toggle's gate logic and its try/finally restore -- the
+        # 33 colored Write-Host call sites need no per-test coverage.
+        #
+        # We mock Invoke-ListAction so the action body becomes a single
+        # capture line that records $PSStyle.OutputRendering DURING
+        # dispatch. The post-call assertion then proves the try/finally
+        # restored the prior value. Pester 5's dynamic scoping makes
+        # the in-It $NoColor / $Action assignments visible to
+        # Invoke-Main (which is defined at the dot-sourced script
+        # scope and reads its parameters via the parent scope chain).
+        BeforeEach {
+            $script:capturedRendering = $null
+            Mock Invoke-ListAction { $script:capturedRendering = $PSStyle.OutputRendering }
+            # Defensive: ensure NO_COLOR is unset at the start of every
+            # test so leakage from a prior test (e.g. the env-var case)
+            # does not bleed through.
+            if (Test-Path Env:\NO_COLOR) { Remove-Item Env:\NO_COLOR }
+        }
+
+        It 'sets OutputRendering=PlainText during dispatch when -NoColor is bound, and restores on exit' {
+            $previousRendering = $PSStyle.OutputRendering
+            $NoColor = $true
+            $Action  = 'list'
+
+            Invoke-Main
+
+            $script:capturedRendering | Should -Be 'PlainText'
+            $PSStyle.OutputRendering  | Should -Be $previousRendering
+        }
+
+        It 'sets OutputRendering=PlainText during dispatch when $env:NO_COLOR is set, and restores on exit' {
+            $previousRendering = $PSStyle.OutputRendering
+            $env:NO_COLOR = '1'
+            try {
+                $Action = 'list'
+                Invoke-Main
+            }
+            finally {
+                Remove-Item Env:\NO_COLOR -ErrorAction SilentlyContinue
+            }
+
+            $script:capturedRendering | Should -Be 'PlainText'
+            $PSStyle.OutputRendering  | Should -Be $previousRendering
+        }
+
+        It 'leaves OutputRendering untouched when neither -NoColor nor $env:NO_COLOR is set' {
+            $previousRendering = $PSStyle.OutputRendering
+            $Action = 'list'
+
+            Invoke-Main
+
+            $script:capturedRendering | Should -Be $previousRendering
+            $PSStyle.OutputRendering  | Should -Be $previousRendering
+        }
     }
 
     AfterAll {

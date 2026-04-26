@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.2
 
 <#
 .SYNOPSIS
@@ -70,7 +70,21 @@ Param (
     # 60 to keep the unofficial endpoint politely polled; values below 60
     # get clamped up with a one-line notice. Defaults to 60.
     [int]
-    $interval = 60
+    $interval = 60,
+
+    # -NoColor: suppress all ANSI color output for this invocation. We
+    # implement no-color via a single $PSStyle.OutputRendering = 'PlainText'
+    # toggle inside Invoke-Main (PS 7.2+ native; the host respects this at
+    # the chokepoint of every Write-Host -ForegroundColor call). Precedence:
+    #   -NoColor flag > $env:NO_COLOR non-empty > default colored.
+    # The alt-buffer / sync-mode / clear-screen / cursor-home VT sequences
+    # in Invoke-UsageWatch are message bytes, not SGR attributes, so they
+    # are intentionally NOT suppressed by no-color mode -- watch mode
+    # remains fully functional in B&W. NO_COLOR (https://no-color.org) is
+    # honored as the de facto industry standard for opting out of colors
+    # without per-invocation flags.
+    [switch]
+    $NoColor
 )
 
 # We are resolving the script path to reference this file when
@@ -501,10 +515,27 @@ function Set-OAuthAccountInClaudeJson {
     }
 
     # Brace-count from the opening { to find the matching close. Naive
-    # counter; doesn't track string-literal context. JSON keys / values
-    # cannot legally contain unescaped braces, so a brace inside a
-    # string requires a preceding backslash that we'd see — ignoring
-    # string context is safe for valid JSON.
+    # counter; does NOT track string-literal context. Per RFC 8259, JSON
+    # strings may legally contain unescaped `{` and `}` — only `"`, `\`,
+    # and U+0000-U+001F must be escaped. So this counter would miscount
+    # an oauthAccount value like `"organizationName": "Acme {LLC}"`.
+    #
+    # Why this is acceptable in practice (NOT by JSON-spec construction):
+    #   * Of the five whitelisted identity fields, three are UUIDs and
+    #     one is an RFC 5321 email — none can contain `{` / `}`.
+    #   * `displayName` / `organizationName` are user-set in Anthropic's
+    #     console, but braces in those values are vanishingly rare.
+    #   * Non-whitelisted oauthAccount fields Claude Code emits today
+    #     (billingType enum, ISO timestamps, booleans, `ccOnboardingFlags`
+    #     nested object) cannot contain string-literal `}` — nested
+    #     object close-braces ARE real structural braces and counted
+    #     correctly.
+    #   * If a future Claude Code field with brace-bearing string content
+    #     trips this, ~/.claude.json may be corrupted; recovery is via
+    #     Claude Code's own `~/.claude.json.backup.<unix-ms>` rolling
+    #     backups (last 5 retained).
+    # If this assumption ever stops holding (e.g., Anthropic adds a free-
+    # form notes field), upgrade this to a string-literal-aware scanner.
     $openBrace = $startMatch.Index + $startMatch.Length - 1
     $depth = 1
     $i = $openBrace + 1
@@ -681,6 +712,9 @@ function Show-Help {
         "  uninstall        Remove the aliases from your PS profile",
         "  help, -h         Show this help",
         "",
+        "OPTIONS",
+        "  -NoColor         Suppress all ANSI color output (also: set NO_COLOR env var)",
+        "",
         "EXAMPLES",
         "  $cmd save slot-1                 # save current login as 'slot-1'",
         "  $cmd switch slot-2               # activate the 'slot-2' slot",
@@ -691,6 +725,7 @@ function Show-Help {
         "  $cmd usage -watch                # live refresh; 60s polls; Ctrl-C to quit",
         "  $cmd usage -watch -interval 300  # slower refresh (floor is 60s)",
         "  $cmd usage -json                 # emit usage as JSON for scripting",
+        "  $cmd usage -NoColor              # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
         "",
         "FILES",
         "  Active login : %USERPROFILE%\.claude\.credentials.json",
@@ -2772,6 +2807,23 @@ $Script:UsageWatchMinInterval = 60
 # — no regression. Renderer functions are reused unchanged; only this
 # loop emits the wrapper sequences.
 #
+# Unified write path. Every VT control sequence in the watch lifecycle
+# (alt-buffer enter/leave, cursor hide/show, sync-mode start/end, clear
+# screen, cursor home) is emitted via `Write-Host -NoNewline`, NOT via
+# [Console]::Out.Write. This is the bug fix for the "watch mode is
+# B&W" issue: when raw VT sequences are emitted via [Console]::Out.Write
+# while body content goes through Write-Host -ForegroundColor (which
+# routes via $Host.UI), the two write paths use independent flush
+# queues. The host's ANSI SGR codes can land outside the sync envelope
+# (or after the ESC[2J that just cleared them), making the body render
+# in default attributes. Routing every byte through Write-Host forces a
+# single flush queue and a deterministic byte order. The non-color VT
+# sequences (alt buffer / sync mode / clear / home / cursor hide) are
+# message bytes -- not SGR attributes -- so they remain unaffected by
+# $PSStyle.OutputRendering = 'PlainText'. That means watch mode keeps
+# working in no-color mode; only the body's color SGR codes are
+# suppressed.
+#
 # The loop is deliberately simple: blocking Invoke-RestMethod (via
 # Get-UsageSnapshot) inside the poll step, then a plain 1 s sleep
 # between frames. A runspace-based async poll would feel snappier
@@ -2799,7 +2851,11 @@ function Invoke-UsageWatch {
         # buffer gives a clean canvas and ensures the user's pre-watch
         # scrollback is restored on exit. Cursor-hide stops the caret
         # from blinking inside the table during the (atomic) repaint.
-        [Console]::Out.Write("`e[?1049h`e[?25l")
+        # Routed through Write-Host -NoNewline so every byte in the
+        # watch lifecycle shares the same flush queue as the body's
+        # Write-Host -ForegroundColor calls (see "Unified write path"
+        # in the function-level comment).
+        Write-Host "`e[?1049h`e[?25l" -NoNewline
         $enteredAlt = $true
         [Console]::CursorVisible = $false
 
@@ -2850,8 +2906,12 @@ function Invoke-UsageWatch {
             # iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal,
             # mintty, modern ConHost). Older terminals ignore the
             # unknown DEC mode markers and exhibit the prior
-            # Clear-Host-style flicker — no regression.
-            [Console]::Out.Write("`e[?2026h`e[2J`e[H")
+            # Clear-Host-style flicker — no regression. Sync-envelope
+            # markers travel through Write-Host -NoNewline so they
+            # share a flush queue with the body's Write-Host calls;
+            # otherwise the host's ANSI SGR codes land outside the
+            # envelope and the body renders in default attributes.
+            Write-Host "`e[?2026h`e[2J`e[H" -NoNewline
             if ($null -ne $snapshot) {
                 Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer
             } else {
@@ -2859,7 +2919,7 @@ function Invoke-UsageWatch {
                 Write-Host "[Watch] Waiting for first successful /api/oauth/usage response..." -ForegroundColor "Yellow"
                 Format-UsageFooter $footer
             }
-            [Console]::Out.Write("`e[?2026l")
+            Write-Host "`e[?2026l" -NoNewline
 
             # 1-second inter-frame wait. Ctrl-C terminates the loop via
             # the runtime's default handler; the surrounding `finally`
@@ -2871,10 +2931,12 @@ function Invoke-UsageWatch {
     finally {
         # Order matters: show cursor + leave alt buffer in one write so
         # the user's pre-watch terminal state is restored atomically.
-        # The CursorVisible API restore is belt-and-suspenders for the
+        # Same Write-Host -NoNewline routing as the entry write -- one
+        # uniform flush queue across the whole watch lifecycle. The
+        # CursorVisible API restore is belt-and-suspenders for the
         # .NET-side state.
         if ($enteredAlt) {
-            [Console]::Out.Write("`e[?25h`e[?1049l")
+            Write-Host "`e[?25h`e[?1049l" -NoNewline
         }
         [Console]::CursorVisible = $origCursor
     }
@@ -2885,6 +2947,20 @@ function Invoke-UsageWatch {
 # `exit` to avoid killing a host that dot-sourced us; the redundant
 # `exit` calls from install/uninstall branches are dropped because the
 # script naturally exits at the end of Invoke-Main with status 0.
+#
+# No-color mode lives entirely in this function via a single
+# $PSStyle.OutputRendering = 'PlainText' toggle. PS 7.2+ honors this at
+# the chokepoint of every Write-Host -ForegroundColor call (and every
+# other ANSI-emitting cmdlet), so no per-call-site refactor is needed.
+# Precedence (most -> least specific):
+#   1. -NoColor switch (CLI flag)
+#   2. $env:NO_COLOR non-empty (https://no-color.org de facto standard)
+#   3. default colored
+# The previous $PSStyle.OutputRendering value is captured up-front and
+# restored in the `finally` block so the toggle is scoped to this
+# invocation -- callers that dot-source this script (notably the test
+# suite, which calls Invoke-*Action directly and bypasses Invoke-Main)
+# are unaffected.
 function Invoke-Main {
     if ($help -or $Action -eq "help" -or $Action -eq "") {
         Show-Help
@@ -2897,14 +2973,24 @@ function Invoke-Main {
         New-Item -ItemType Directory -Path $CredDir -Force | Out-Null
     }
 
-    switch ($Action) {
-        "install"   { Add-To-Profile }
-        "uninstall" { Remove-From-Profile }
-        "save"      { Invoke-SaveAction   -Name $Name }
-        "switch"    { Invoke-SwitchAction -Name $Name }
-        "list"      { Invoke-ListAction }
-        "remove"    { Invoke-RemoveAction -Name $Name }
-        "usage"     { Invoke-UsageAction  -Name $Name -json:$json -watch:$watch -interval $interval }
+    $previousRendering = $PSStyle.OutputRendering
+    try {
+        if ($NoColor -or -not [string]::IsNullOrEmpty($env:NO_COLOR)) {
+            $PSStyle.OutputRendering = 'PlainText'
+        }
+
+        switch ($Action) {
+            "install"   { Add-To-Profile }
+            "uninstall" { Remove-From-Profile }
+            "save"      { Invoke-SaveAction   -Name $Name }
+            "switch"    { Invoke-SwitchAction -Name $Name }
+            "list"      { Invoke-ListAction }
+            "remove"    { Invoke-RemoveAction -Name $Name }
+            "usage"     { Invoke-UsageAction  -Name $Name -json:$json -watch:$watch -interval $interval }
+        }
+    }
+    finally {
+        $PSStyle.OutputRendering = $previousRendering
     }
 }
 

@@ -12,7 +12,7 @@ Single-file PowerShell tool — core logic lives in `switch_claude_account.ps1`.
 - **State file**: `%USERPROFILE%\.claude\.sca-state.json` — schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." Read with `Read-ScaState` (auto-migrates from a 1.x install on first read by hashing `.credentials.json` against existing slot files); written via `Update-ScaState`.
 - **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled, used only for the dedup case where slot name equals email).
 - **Identity sidecars** (v2.1.0+): `.credentials.<name>(<email>).account.json` alongside each slot file. JSON snapshot of the slot's `oauthAccount` (whitelisted: accountUuid, emailAddress, organizationUuid, displayName, organizationName) captured at save time. Restored to `~/.claude.json` on `sca switch` so Claude Code's `/status` follows the active slot. **Slots without a valid sidecar are HIDDEN from `list` / `usage` / rotation and refused by `switch`** — re-running `sca save <name>` while that slot is active recaptures the sidecar. There is no automated migration from pre-v2.1.0 installs; legacy slots become invisible until re-saved.
-- **PS version**: Requires PowerShell 7.0+ (`#Requires -Version 7.0`). Uses `$PROFILE.CurrentUserAllHosts` for the install target.
+- **PS version**: Requires PowerShell 7.2+ (`#Requires -Version 7.2`). Uses `$PROFILE.CurrentUserAllHosts` for the install target. The 7.2 floor (up from the original 7.0) is the version that introduced `$PSStyle.OutputRendering`, which is how no-color mode is implemented (single toggle in `Invoke-Main`; the host respects `PlainText` at the chokepoint of every `Write-Host -ForegroundColor` and other ANSI-emitting cmdlets, eliminating the need for a per-call-site wrapper). PS 7.0 / 7.1 are EOL; users on those versions need to upgrade.
 - **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block
 
 ## Windows-specific gotchas
@@ -55,6 +55,24 @@ The two credentials-touching actions that need a fresh slot file (`switch`, `usa
 - **DarkGray** is for dimmed metadata (account row in the verbose view, "no plan-usage data" fallback, watch-mode footer).
 
 The DarkYellow choice tracks the warm amber `#ffcb6b` used for `warning` / `info` in OpenCode's material theme. PowerShell's `Write-Host -ForegroundColor` is restricted to the 16-value `ConsoleColor` enum and cannot hit truecolor; `DarkYellow` renders as warm amber/mustard in modern terminals (Windows Terminal Campbell ≈`#C19C00`, VS Code, Alacritty) and is the closest hue match within the palette. The split also restores a visual distinction between header and warning, which both used to be plain `Yellow`.
+
+#### No-color mode
+
+`-NoColor` (CLI switch) and `$env:NO_COLOR` (the [no-color.org](https://no-color.org) de facto industry standard) suppress every color in the table above. Both surfaces degrade gracefully: structural text, the `*` active marker, table layout, table header underlines, and bar glyphs (`█`/`░`) are preserved unchanged — only the SGR codes that would tint them are skipped.
+
+Precedence (most → least specific):
+
+1. `-NoColor` switch on the CLI
+2. `$env:NO_COLOR` set to any non-empty value
+3. otherwise: colored (default)
+
+Implementation is a single `$PSStyle.OutputRendering = 'PlainText'` toggle inside `Invoke-Main`, gated by the precedence above and wrapped in a `try/finally` that restores the prior value on exit. PS 7.2+'s host respects `PlainText` at the chokepoint of every `Write-Host -ForegroundColor` call (and every other ANSI-emitting cmdlet), so no per-call-site refactor is needed — the 33 `Write-Host -ForegroundColor` sites in the script are unchanged. This is the entire reason the `#Requires` floor was bumped from 7.0 to 7.2.
+
+The `try/finally` scope is per-`Invoke-Main` call, NOT global, so dot-sourcing the script (notably from the test suite, which calls `Invoke-*Action` directly and bypasses `Invoke-Main`) does not mutate the test runner's `$PSStyle`. Tests that need to assert on no-color behavior set `$PSStyle.OutputRendering = 'PlainText'` themselves in their `BeforeEach`.
+
+**Watch mode is unaffected by no-color.** `Invoke-UsageWatch`'s alt-buffer / sync-mode / clear-screen / cursor-home / cursor-hide VT sequences are emitted as message bytes via `Write-Host -NoNewline`, not as SGR attributes — `$PSStyle.OutputRendering` only suppresses SGR codes. Watch mode remains fully functional in B&W; only the body's color tinting is suppressed.
+
+`FORCE_COLOR` (Node.js convention to force colors when piped) is intentionally NOT supported. PowerShell's `Write-Host` writes to the information stream (6), not stdout (1), so piping `sca` does not capture color-bearing output by default — the auto-disable-on-pipe scenario `FORCE_COLOR` exists to override doesn't apply.
 
 ## Unofficial endpoints (`usage` action)
 
@@ -240,6 +258,8 @@ Each per-slot entry carries the same fields as before plus a `plan_status` strin
 `Invoke-UsageWatch` provides a self-refreshing live view of the usage table or verbose view. It re-polls the endpoint every `-interval` seconds (default **60 s**, floor **60 s**) and redraws the frame once per second so reset deltas (`(2h 37m)`) and the countdown footer tick visibly between polls.
 
 **Flicker-free rendering.** The loop enters the alternate screen buffer (`ESC[?1049h`) and hides the cursor (`ESC[?25l`) on entry; the `finally` block restores both on Ctrl-C. Each frame is wrapped in DEC mode 2026 (synchronized output: `ESC[?2026h` … `ESC[?2026l`) with `ESC[2J` + cursor-home (`ESC[H`) at the start, then the existing `Format-UsageFrame` renderer is called unchanged. Inside the sync envelope the terminal buffers the clear-and-redraw and presents one atomic frame, so the user never sees the intermediate "blank screen" frame that the prior `Clear-Host` produced. Terminals that support DEC 2026 (Windows Terminal ≥ v1.13, VS Code, iTerm2 ≥ 3.4.13, kitty, alacritty, WezTerm, foot, gnome-terminal/vte, mintty, modern ConHost) render flicker-free; older terminals silently ignore the unknown DEC private mode and exhibit the previous `Clear-Host`-style flicker (no regression). Renderer functions (`Format-UsageFrame`, `Format-UsageTable`, `Format-AggregateBars`, `Format-UsageVerbose`, `Format-UsageFooter`) are untouched — only `Invoke-UsageWatch` emits the wrapper sequences, so the one-shot `sca usage` / `sca list` / `sca switch` paths are unaffected.
+
+**Unified write path.** Every VT control sequence in the watch lifecycle (alt-buffer enter/leave, cursor hide/show, sync-mode start/end, clear screen, cursor home) is emitted via `Write-Host -NoNewline`, NOT via `[Console]::Out.Write`. This is the bug fix for the original "watch mode renders B&W" issue: when raw VT sequences travel through `[Console]::Out.Write` while body content goes through `Write-Host -ForegroundColor` (which routes via `$Host.UI`), the two write paths use independent flush queues. The host's ANSI SGR codes can land outside the sync envelope (or after the `ESC[2J` that just cleared them), making the body render in default attributes. Routing every byte through `Write-Host` forces a single flush queue and a deterministic byte order. The non-color VT sequences are message bytes, not SGR attributes, so they are NOT suppressed by `$PSStyle.OutputRendering = 'PlainText'` — watch mode keeps working in no-color mode; only the body's color tinting is suppressed. See "No-color mode" above.
 
 Design split driven by the watch loop:
 
