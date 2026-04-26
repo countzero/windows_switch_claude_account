@@ -346,7 +346,7 @@ function Read-ScaState {
     # from the hardlink-based version).
     if (-not (Test-Path -LiteralPath $CredFile)) { return $null }
     try {
-        $activeHash = (Get-FileHash -LiteralPath $CredFile -Algorithm SHA256).Hash
+        $activeHash = Get-SHA256Hex -Path $CredFile
     }
     catch {
         return $null
@@ -363,7 +363,7 @@ function Read-ScaState {
         $parsed = Get-SlotFileInfo -FileName $f.Name
         if (-not $parsed) { continue }
         try {
-            if ((Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash -eq $activeHash) {
+            if ((Get-SHA256Hex -Path $f.FullName) -eq $activeHash) {
                 $state = [pscustomobject]@{
                     schema         = 1
                     active_slot    = $parsed.Name
@@ -491,6 +491,33 @@ function ConvertTo-ScaJsonString {
     $escaped = $Value.Replace('\', '\\').Replace('"', '\"')
     $escaped = $escaped.Replace("`b", '\b').Replace("`f", '\f').Replace("`n", '\n').Replace("`r", '\r').Replace("`t", '\t')
     return '"' + $escaped + '"'
+}
+
+# Compute SHA-256 of bytes (or a file's bytes) as uppercase hex with no
+# separators. This format matches Get-FileHash's .Hash output exactly,
+# which is the implicit invariant that state.last_sync_hash equality
+# depends on: callers may produce a hash here from in-memory bytes
+# during a save / switch / refresh, and Read-ScaState's auto-migration
+# may produce a hash here from a slot file on disk. Both code paths
+# need to compare equal byte-for-byte. Centralizing the format in one
+# helper makes that contract enforced rather than convention.
+function Get-SHA256Hex {
+    [CmdletBinding(DefaultParameterSetName = 'Bytes')]
+    Param (
+        [Parameter(Mandatory, ParameterSetName = 'Bytes', Position = 0)]
+        [byte[]] $Bytes,
+
+        [Parameter(Mandatory, ParameterSetName = 'Path')]
+        [String] $Path
+    )
+
+    if ($PSCmdlet.ParameterSetName -eq 'Path') {
+        $Bytes = [System.IO.File]::ReadAllBytes($Path)
+    }
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try   { return [BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '' }
+    finally { $sha.Dispose() }
 }
 
 # Replace the whitelisted identity fields inside ~/.claude.json's
@@ -1207,6 +1234,45 @@ function Remove-From-Profile {
     }
 }
 
+# Atomic-write a fresh auto-save slot file (and its identity sidecar, when
+# OAuthAccount is non-null) and update state.active_slot to point at it.
+# Returns the generated slot name on success.
+#
+# Caller owns the user-visible advisory message and the return-object
+# `Action` discriminator. Invoke-Reconcile has two auto-save callers
+# (cross-account swap detection vs unknown-state recovery) whose
+# advisory text and return shape differ enough that merging them into
+# one helper would conflate semantically distinct events; keeping the
+# advisory + return at the call sites preserves that distinction while
+# this helper handles the mechanical write sequence.
+#
+# Sidecar-write failure is non-fatal: a yellow advisory is printed
+# (Get-Slots will hide a sidecar-less slot, so the orphan tokens file
+# is invisible-but-on-disk and `sca remove` cleans it up by name).
+function New-AutoSaveSlot {
+    Param (
+        [Parameter(Mandatory)] [byte[]] $Bytes,
+        [String] $Email,
+        $OAuthAccount,
+        [String] $SourceLabel,
+        [Parameter(Mandatory)] [String] $LastSyncHash
+    )
+
+    $autoName = 'auto-' + ([DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'"))
+    $autoPath = Join-Path $CredDir (Get-SlotFileName -Name $autoName -Email $Email)
+    Set-CredentialFileAtomic -Path $autoPath -Bytes $Bytes
+    if ($OAuthAccount) {
+        try {
+            Write-Sidecar -SlotPath $autoPath -OAuthAccount $OAuthAccount -Source $SourceLabel
+        }
+        catch {
+            Write-Color "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" 'Yellow'
+        }
+    }
+    Update-ScaState -ActiveSlot $autoName -LastSyncHash $LastSyncHash | Out-Null
+    return $autoName
+}
+
 # Reconcile .credentials.json with the saved slot tracked in $StateFile.
 # Called at the start of every credentials-touching action that needs the
 # tracked slot to reflect Claude Code's most recent token refresh (sca
@@ -1253,16 +1319,10 @@ function Invoke-Reconcile {
 
     # Hash the bytes we just read (not the file path) so the (bytes, hash)
     # pair is internally consistent even if Claude Code rewrites the file
-    # mid-reconcile. BitConverter + dash-strip yields uppercase hex,
-    # matching Get-FileHash output so values written here round-trip
-    # equality with state seeded by Read-ScaState's auto-migration.
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', ''
-    }
-    finally {
-        $sha.Dispose()
-    }
+    # mid-reconcile. Get-SHA256Hex produces uppercase hex matching the
+    # format Read-ScaState's auto-migration uses, so values round-trip
+    # equality across credential-file sources.
+    $hash = Get-SHA256Hex -Bytes $bytes
 
     $state = Read-ScaState
     if ($state -and $state.last_sync_hash -eq $hash) {
@@ -1313,21 +1373,10 @@ function Invoke-Reconcile {
             # Cross-account swap detected. DON'T overwrite; auto-save the
             # new credentials under a fresh name so both identities are
             # preserved on disk and the user can resolve the conflict.
-            $autoName = 'auto-' + ([DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'"))
-            $autoPath = Join-Path $CredDir (Get-SlotFileName -Name $autoName -Email $newEmail)
-            Set-CredentialFileAtomic -Path $autoPath -Bytes $bytes
-            if ($newAccount) {
-                try {
-                    Write-Sidecar -SlotPath $autoPath -OAuthAccount $newAccount -Source $sourceLabel
-                }
-                catch {
-                    # Sidecar write failed — orphan tokens file. Get-Slots
-                    # will hide it, so it's invisible but on disk; the
-                    # user can `sca remove auto-<ts>` to clean it up.
-                    Write-Color "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" 'Yellow'
-                }
-            }
-            Update-ScaState -ActiveSlot $autoName -LastSyncHash $hash | Out-Null
+            $autoName = New-AutoSaveSlot -Bytes $bytes -Email $newEmail `
+                                         -OAuthAccount $newAccount `
+                                         -SourceLabel $sourceLabel `
+                                         -LastSyncHash $hash
 
             $oldIdent = Format-SlotIdentity -Name $state.active_slot -Email $slotEmail
             Write-Color "[Sync] Active credentials are now $newEmail; previous slot $oldIdent preserved. Active slot is now '$autoName'." 'Yellow'
@@ -1345,18 +1394,10 @@ function Invoke-Reconcile {
     }
 
     # No tracked slot, or tracked slot file/sidecar is gone. Auto-save fallback.
-    $autoName = 'auto-' + ([DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'"))
-    $autoPath = Join-Path $CredDir (Get-SlotFileName -Name $autoName -Email $newEmail)
-    Set-CredentialFileAtomic -Path $autoPath -Bytes $bytes
-    if ($newAccount) {
-        try {
-            Write-Sidecar -SlotPath $autoPath -OAuthAccount $newAccount -Source $sourceLabel
-        }
-        catch {
-            Write-Color "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" 'Yellow'
-        }
-    }
-    Update-ScaState -ActiveSlot $autoName -LastSyncHash $hash | Out-Null
+    $autoName = New-AutoSaveSlot -Bytes $bytes -Email $newEmail `
+                                 -OAuthAccount $newAccount `
+                                 -SourceLabel $sourceLabel `
+                                 -LastSyncHash $hash
 
     $autoIdent = Format-SlotIdentity -Name $autoName -Email $newEmail
     Write-Color "[Sync] Auto-saved unknown active credentials as $autoIdent." 'Yellow'
@@ -1484,13 +1525,7 @@ function Invoke-SaveAction {
     # .credentials.json (we just wrote them). Hash the bytes we wrote
     # rather than re-reading either file, for the read-once-write-once
     # consistency property described above.
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', ''
-    }
-    finally {
-        $sha.Dispose()
-    }
+    $hash = Get-SHA256Hex -Bytes $bytes
     Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
 
     $displayEmail = if ($email -and $safeName.ToLowerInvariant() -ne $email.ToLowerInvariant()) { " ($email)" } else { '' }
@@ -1579,13 +1614,7 @@ function Invoke-SwitchAction {
         Write-Color "[Switch] Claude Code's /status email may not reflect the new slot until you fix and re-run." 'Yellow'
     }
 
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = [BitConverter]::ToString($sha.ComputeHash($slotBytes)) -replace '-', ''
-    }
-    finally {
-        $sha.Dispose()
-    }
+    $hash = Get-SHA256Hex -Bytes $slotBytes
     Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
 
     # DarkYellow header line — matches the `[List] Saved slots` /
@@ -1827,13 +1856,7 @@ function Update-SlotTokens {
             try {
                 Set-CredentialFileAtomic -Path $CredFile -Bytes $newBytes
 
-                $sha = [System.Security.Cryptography.SHA256]::Create()
-                try {
-                    $newHash = [BitConverter]::ToString($sha.ComputeHash($newBytes)) -replace '-', ''
-                }
-                finally {
-                    $sha.Dispose()
-                }
+                $newHash = Get-SHA256Hex -Bytes $newBytes
                 Update-ScaState -LastSyncHash $newHash | Out-Null
             }
             catch {
@@ -1847,6 +1870,27 @@ function Update-SlotTokens {
     }
 
     return $newAccess
+}
+
+# Look up the slot's last successful /api/oauth/usage response in the
+# per-process cache and return it wrapped as an 'ok'+IsCachedFallback
+# result IF still within $Script:UsageCacheTTL minutes of capture.
+# Returns $null on cache miss or stale entry.
+#
+# Used by Get-SlotUsage's two 429 fallback paths (token-endpoint catch
+# and usage-endpoint catch) to collapse what would otherwise be a 4-level
+# if-contains/if-fresh/return ladder into a single helper call. Both
+# paths apply the same freshness policy: cache hits served as 'ok' keep
+# the watch display functional during rate-limited periods (usage data
+# only changes every few hours at most).
+function Get-CachedUsageOrNull {
+    Param ([String] $SlotPath)
+    if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) { return $null }
+    $entry = $Script:SlotUsageCache[$SlotPath]
+    if (([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheTTL) {
+        return $null
+    }
+    return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
 }
 
 # Call /api/oauth/usage for one slot. Auto-refreshes a token that is
@@ -1895,12 +1939,8 @@ function Get-SlotUsage {
             # would just extend the user's wait without changing the
             # outcome (and the watch loop will retry on its 60s tick).
             if (Test-Is429 $_.Exception) {
-                if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
-                    $entry = $Script:SlotUsageCache[$SlotPath]
-                    if (([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -lt $Script:UsageCacheTTL) {
-                        return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
-                    }
-                }
+                $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
+                if ($cached) { return $cached }
                 return [pscustomobject]@{ Status = 'rate-limited' }
             }
             # Non-429 refresh failure (timeout, 4xx other than 429, 5xx,
@@ -1953,17 +1993,17 @@ function Get-SlotUsage {
         #   3. No cache yet -> one retry after a short delay; the original
         #                      back-to-back-poll-collision case.
         if ($status -eq 429) {
+            $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
+            if ($cached) { return $cached }
+            # Cache miss vs stale-entry both reach this point. If the
+            # slot has ANY cache entry (stale or otherwise), drop to
+            # 'rate-limited' — we've been seeing 429s long enough that
+            # a 5s sleep won't change the outcome. If no cache entry
+            # exists at all, retry once after a short delay so back-to-
+            # back slot polls don't all hit the rate limit simultaneously.
             if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
-                $entry = $Script:SlotUsageCache[$SlotPath]
-                if (([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -lt $Script:UsageCacheTTL) {
-                    return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
-                }
-                # Stale cache: drop straight to 'rate-limited' rather
-                # than retry — see comment above.
                 return [pscustomobject]@{ Status = 'rate-limited' }
             }
-            # No cached data — retry once after a short delay so back-to-back
-            # slot polls don't all hit the rate limit simultaneously.
             Start-Sleep -Seconds 5
             try {
                 $resp2 = Invoke-RestMethod -Method Get `
