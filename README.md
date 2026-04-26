@@ -4,7 +4,7 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 
 ## Features
 
-- **Live plan-usage dashboard** — `sca usage -Watch` polls Anthropic's `/api/oauth/usage` and renders a flicker-free, auto-refreshing view of Session (5h) and Week (7d) limits across every slot
+- **Live plan-usage dashboard** — `sca usage -Watch` polls Anthropic's `/api/oauth/usage` and renders a flicker-free, auto-refreshing view of Session (5h) and Week (7d) limits across every slot; the terminal-tab title is updated each poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab
 - **Identity-aware slots** — each slot's OAuth email is captured at save time, baked into the filename, and locked in a sidecar; what you see in `list` is guaranteed to be who the tokens actually belong to
 - **Auto-reconcile** — silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
 - **Transparent token refresh** — expired access tokens are refreshed before usage queries and mirrored back into the active credentials file
@@ -14,23 +14,29 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 
 ## What `sca usage -Watch` looks like
 
-```ansi
-[33m[Usage] Plan usage[0m
+```
+[Usage] Plan usage
 
-  Session  [[92m█████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░[0m]  [92m22%[0m
+  Session  [█████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  22%
 
-  Week     [[93m██████████████████████████░░░░░░░░░░░░░░░░░[0m]  [93m62%[0m
+  Week     [██████████████████████████░░░░░░░░░░░░░░░░░]  62%
 
      Slot         Account                 Session         Week           Status
      -----------  ----------------------  --------------  -------------  -----------
-[92m  *  work         —                        18% (2h 11m)    42% (102h)     ok[0m
-[37m     personal     —                         3% (4h 02m)     7% (146h)     ok[0m
-[37m     dev          —                         9% (3h 41m)    34% (118h)     ok[0m
-[93m     client-acme  ada.lovelace@arpa.net    71% (1h 04m)    92% (41h)      near limit[0m
-[91m     legacy       team@example.com         12% (3h 18m)   103% now        limited 7d[0m
+  *  work         alex@acme.io             18% (2h 11m)    42% (102h)     ok
+     personal     alex.dev@gmail.com        3% (4h 02m)     7% (146h)     ok
+     dev          alex@startup.dev          9% (3h 41m)    34% (118h)     ok
+     client-acme  ada.lovelace@arpa.net    71% (1h 04m)    92% (41h)      near limit
+     legacy       team@example.com         12% (3h 18m)   100% (12h)     limited 7d
 
-[90m[Watch] Last poll: 14:32:07  |  next in 47s[0m
+[Watch] Last poll: 14:32:07  |  next in 47s
 ```
+
+The terminal-tab title is updated on every poll so the watch is useful even when the window is in the background:
+
+    22% | 62% | Switch Claude Account
+
+First number is Session (5h), second is Week (7d). Single-slot watch (`sca usage <name> -Watch`) shows that slot's numbers; multi-slot watch shows the pool mean across HTTP-ok slots. Pre-watch title is restored on Ctrl-C.
 
 > Bar color: green &lt;50%, yellow ≥50%, red ≥90%. Row color tracks slot status: green for the active+`ok` slot (including the `*` marker), gray for healthy inactive slots, yellow for `near limit` (≥90%), red for `limited 5h` / `limited 7d` (≥100%).
 
