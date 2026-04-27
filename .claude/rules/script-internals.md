@@ -83,6 +83,16 @@ Above the summary table, two pool-wide USAGE bars (one per bucket) emitted by `F
 
 When no eligible rows exist, `Format-AggregateBars` emits nothing.
 
+**README screenshot divergence**: the README's screenshot code blocks
+intentionally use ASCII space (U+0020) for empty cells instead of `▓`.
+GitHub's CSS font fallback renders `▓` at a slightly different
+effective width than `█` for some viewers, breaking visual alignment
+inside markdown code blocks. ASCII space is guaranteed cell-uniform and
+sidesteps the fallback issue. The live script keeps `█`/`▓`
+because real terminal monospace fonts (Consolas, SF Mono, Cascadia Code)
+render both Block Element glyphs at identical widths. Do not "re-sync"
+the README to `▓` — the divergence is deliberate.
+
 ## List table (`Format-ListTable`)
 
 2 data columns + leading `*` marker: `Slot | Account`. Mirrors `Format-UsageTable`'s shape (same active-marker conventions, same `Format-AccountCell` truncation). Pure offline render.

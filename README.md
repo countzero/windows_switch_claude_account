@@ -17,9 +17,9 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 ```
 [Usage] Plan usage
 
-  Session [█████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  22%
+  Session [█████████████                                                ]  22%
 
-  Week    [██████████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%
+  Week    [██████████████████████████████████████                       ]  62%
 
     Slot         Account                Session        Week         Status
     -----------  ---------------------  -------------  -----------  ------
@@ -149,9 +149,9 @@ sca usage -NoColor                # strip ANSI color (also: $env:NO_COLOR='1')
 ```
 [Usage] Plan usage
 
-  Session [█████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  10%
+  Session [█████                                              ]  10%
 
-  Week    [████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  24%
+  Week    [████████████                                       ]  24%
 
     Slot      Account             Session        Week         Status
     --------  ------------------  -------------  -----------  ------

@@ -123,3 +123,15 @@ pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pes
 The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode. Tests sandbox `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`. Test-writing conventions: `.claude/rules/tests.md`.
 
 Per-function complexity diagnostic (advisory, on-demand): `pwsh -NoProfile -File tests/Measure-Complexity.ps1` — AST walker reporting LOC, McCabe CC, max nesting per function. Rows with CC ≥ 10 or nest ≥ 4 flagged.
+
+## Default Change Workflow
+
+When asked to make a change, always follow these steps in order:
+
+1. Make the code change
+2. Run the test suite (Pester + PSScriptAnalyzer advisory) from the repo root:
+   - `pwsh -NoProfile -File tests/Invoke-Tests.ps1`
+
+PowerShell has no separate typecheck step — parse-time validation runs implicitly when the script is dot-sourced or invoked. PSScriptAnalyzer lint runs inside `Invoke-Tests.ps1` in advisory (non-fatal) mode, so a single command covers both tests and lint.
+
+Commit and push are **not** performed automatically. Only commit when the user explicitly requests it, and only push when the user explicitly requests it. These are separate steps — "commit" does not imply "push."
