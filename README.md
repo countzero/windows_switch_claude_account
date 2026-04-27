@@ -17,26 +17,26 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 ```
 [Usage] Plan usage
 
-  Session  [█████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  22%
+  Session [█████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  22%
 
-  Week     [███████████████████████████░░░░░░░░░░░░░░░░]  62%
+  Week    [██████████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░]  62%
 
-     Slot         Account                 Session         Week           Status
-     -----------  ----------------------  --------------  -------------  -----------
-  *  work         alex@acme.io            18% (2h 11m)    42% (102h)     ok
-     personal     alex.dev@gmail.com      3% (4h 02m)     7% (146h)      ok
-     dev          alex@startup.dev        9% (3h 41m)     34% (118h)     ok
-     client-acme  ada.lovelace@arpa.net   71% (1h 04m)    92% (41h)      near limit
-     legacy       team@example.com        12% (3h 18m)    100% (12h)     limited 7d
+    Slot         Account                Session        Week         Status
+    -----------  ---------------------  -------------  -----------  ------
+ *  work         alex@acme.io            18% (2h 11m)   42% (102h)  ok
+    personal     alex.dev@gmail.com       3% (4h 02m)    7% (146h)  ok
+    dev          alex@startup.dev         9% (3h 41m)   34% (118h)  ok
+    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit
+    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d
 
-[Watch] Last poll: 14:32:07  |  next in 47s
+[Watch] Last poll: 14:32:07
 ```
 
 The terminal-tab title is updated on every poll so the watch is useful even when the window is in the background:
 
     22% | 62% | Switch Claude Account
 
-First number is Session (5h), second is Week (7d). Single-slot watch (`sca usage <name> -Watch`) shows that slot's numbers; multi-slot watch shows the pool mean across HTTP-ok slots. Pre-watch title is restored on Ctrl-C.
+The numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
 > Bar color: green &lt;50%, yellow ≥50%, red ≥90%. Row color tracks slot status: green for the active+`ok` slot (including the `*` marker), gray for healthy inactive slots, yellow for `near limit` (≥90%), red for `limited 5h` / `limited 7d` (≥100%).
 
@@ -149,15 +149,14 @@ sca usage -NoColor                # strip ANSI color (also: $env:NO_COLOR='1')
 ```
 [Usage] Plan usage
 
-  Session [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  10%
+  Session [█████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  10%
 
-  Week    [██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  24%
+  Week    [████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  24%
 
-     Slot      Account  Session         Week           Status
-     --------  -------  --------------  -------------  ------
-  *  work      —         18% (2h 11m)    42% (102h)    ok
-     personal  —          3% (4h 02m)     7% (146h)    ok
-     api-key   —          —               —            no-oauth (api key or non-claude.ai slot)
+    Slot      Account             Session        Week         Status
+    --------  ------------------  -------------  -----------  ------
+ *  work      alex@acme.io         18% (2h 11m)   42% (102h)  ok
+    personal  alex.dev@gmail.com    3% (4h 02m)    7% (146h)  ok
 ```
 
 Decoding the output:
@@ -176,6 +175,8 @@ sca usage work
 
 ```
 [Usage] Slot 'work' (active)
+  Account: alex@acme.io
+  Status:  ok
   Session     18%  Resets 7:50pm Europe/Berlin
   Week        42%  Resets Apr 28, 9am Europe/Berlin
 ```
