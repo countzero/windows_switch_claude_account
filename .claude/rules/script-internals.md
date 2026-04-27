@@ -18,7 +18,7 @@ Two cooperating pieces — both required for `-NoColor` / `$env:NO_COLOR` to act
 
 **Color name translation**: PS legacy `ConsoleColor` and PS7's `$PSStyle.Foreground` use opposite conventions (legacy `Dark*` = ANSI 30-37; legacy un-prefixed = ANSI bright 90-97). Our `DarkYellow` headers map to `$PSStyle.Foreground.Yellow`; `Yellow` advisories map to `$PSStyle.Foreground.BrightYellow`.
 
-**No-color precedence** (most → least specific): `-NoColor` switch → `$env:NO_COLOR` non-empty → colored (default). Structural text, `*` active marker, table layout, header underlines, bar glyphs (`█`/`░`) preserved unchanged in no-color mode — only SGR codes are skipped. `FORCE_COLOR` intentionally unsupported (`Write-Host` writes to stream 6, not stdout, so piping doesn't capture color anyway).
+**No-color precedence** (most → least specific): `-NoColor` switch → `$env:NO_COLOR` non-empty → colored (default). Structural text, `*` active marker, table layout, header underlines, bar glyphs (`█`/`▓`) preserved unchanged in no-color mode — only SGR codes are skipped. `FORCE_COLOR` intentionally unsupported (`Write-Host` writes to stream 6, not stdout, so piping doesn't capture color anyway).
 
 The `try/finally` scope is per-`Invoke-Main`, NOT global. Tests dot-source the script and call `Invoke-*Action` directly, bypassing `Invoke-Main`; `tests/Common.ps1` sets `$PSStyle.OutputRendering = 'PlainText'` once per `BeforeEach`.
 
@@ -61,9 +61,9 @@ Above the summary table, two pool-wide USAGE bars (one per bucket) emitted by `F
 ```
 [Usage] Plan usage
 
-  Session [█████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░]  52%
+  Session [█████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  52%
 
-  Week    [████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  36%
+  Week    [████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  36%
 
      Slot    Account              Session         Week          Status
 ```
@@ -180,7 +180,7 @@ Claude Code internally re-shapes this into `{ rate_limits: { five_hour: { used_p
 
 ## Watch mode (`Invoke-UsageWatch`)
 
-Self-refreshing live view. Re-polls every `-Interval` seconds (default + floor **60 s**), redraws every 1 s so reset deltas and footer countdown tick.
+Self-refreshing live view. Re-polls every `-Interval` seconds (default + floor **60 s**), redraws every 1 s so the frame self-heals on terminal resize within ~1 s instead of waiting up to `-Interval` seconds.
 
 **Flicker-free rendering**:
 - Enter alt buffer (`ESC[?1049h`) + hide cursor (`ESC[?25l`) on entry; `finally` block restores on Ctrl-C.

@@ -60,10 +60,11 @@ Param (
     [switch] $Json,
 
     # -Watch: render a live, self-refreshing `usage` view that polls
-    # /api/oauth/usage every -Interval seconds and redraws on each poll.
-    # Interactive only — exits on Ctrl-C (runtime default). Mutually
-    # exclusive with -Json (enforced by parameter sets). Ignored by
-    # other actions.
+    # /api/oauth/usage every -Interval seconds and redraws every second
+    # (so reset deltas refresh and a terminal resize is reflected within
+    # ~1 s rather than at the next poll). Interactive only — exits on
+    # Ctrl-C (runtime default). Mutually exclusive with -Json (enforced
+    # by parameter sets). Ignored by other actions.
     # Mandatory in the 'Watch' set so it anchors the set: passing -Interval
     # alone resolves the binder to the 'Watch' set and then fails with
     # "Cannot process command because of one or more missing mandatory
@@ -2512,7 +2513,7 @@ function Format-AggregateBars {
         if ($filled -lt 0)         { $filled = 0 }    # defense-in-depth
         if ($filled -gt $barWidth) { $filled = $barWidth }
 
-        $bar = ('█' * $filled) + ('░' * ($barWidth - $filled))
+        $bar = ('█' * $filled) + ('▓' * ($barWidth - $filled))
 
         $color = Get-AggregateBarColor -UsedPct $usedPct
 
@@ -3109,14 +3110,16 @@ function Invoke-UsageAction {
 # round number.
 $Script:UsageWatchMinInterval = 60
 
-# Live `sca usage -Watch` loop: polls the endpoint every -Interval
-# seconds and redraws on each poll. Interactive only — throws when
-# output is redirected because the alt-screen + cursor-control sequences
-# would poison a captured log. Exits on Ctrl-C via the runtime's default
-# handler (Start-Sleep is interruptible); the `finally` block leaves
-# the alternate screen buffer and restores cursor visibility. On HTTP
-# failure the previous snapshot stays visible and an advisory is
-# appended to the footer so the display never blanks.
+# Live `sca usage -Watch` loop: redraws once per second and re-polls the
+# endpoint every -Interval seconds. The redraw cadence is decoupled from
+# the poll cadence so the frame self-heals on terminal resize within
+# ~1 s instead of waiting up to -Interval seconds for the next poll.
+# Interactive only — throws when output is redirected because the
+# alt-screen + cursor-control sequences would poison a captured log.
+# Exits on Ctrl-C via the runtime's default handler; the `finally`
+# block leaves the alternate screen buffer and restores cursor
+# visibility. On HTTP failure the previous snapshot stays visible and
+# an advisory is appended to the footer so the display never blanks.
 #
 # Flicker-free rendering. Each frame is wrapped in DEC mode 2026
 # (synchronized output: ESC[?2026h … ESC[?2026l) with ESC[2J + cursor-
@@ -3143,8 +3146,8 @@ $Script:UsageWatchMinInterval = 60
 # for the verified mechanism.
 #
 # The loop is deliberately simple: blocking Invoke-RestMethod (via
-# Get-UsageSnapshot) inside the poll step, then sleep until the next
-# poll boundary. A runspace-based async poll would feel snappier
+# Get-UsageSnapshot) inside the poll step, then a plain 1 s sleep
+# between frames. A runspace-based async poll would feel snappier
 # during the HTTP call but adds substantial complexity that is not
 # worth v1's budget.
 function Invoke-UsageWatch {
@@ -3181,44 +3184,54 @@ function Invoke-UsageWatch {
         [Console]::CursorVisible = $false
 
         $snapshot      = $null
+        $lastPoll      = [DateTime]::MinValue
         $lastPollError = $null
 
         while ($true) {
-            try {
-                # Reconcile at every poll boundary so a refresh that
-                # happened since the last poll is captured into the
-                # tracked slot before we read its bytes for the
-                # /api/oauth/usage call. Suppressed stdout — any
-                # advisory the reconcile emits would flash on every
-                # poll and the per-frame ESC[2J would shred it anyway.
-                Invoke-Reconcile 6>$null | Out-Null
-                $snapshot      = Get-UsageSnapshot -Name $Name
-                $lastPollError = $null
+            $now = [DateTime]::Now
+            $dueForPoll = ($null -eq $snapshot) -or (($now - $lastPoll).TotalSeconds -ge $Interval)
 
-                # Update the terminal title only on a successful poll —
-                # on a failed poll the previous title (and body) persist
-                # together until the next poll. OSC 0 ('ESC ] 0 ; <title>
-                # BEL') sets both window and icon title; supported by
-                # Windows Terminal, modern ConHost, VS Code, iTerm2,
-                # kitty, alacritty, WezTerm, foot, gnome-terminal,
-                # mintty. Routed through Write-VTSequence for parity
-                # with DEC sequences (bypasses the
-                # OutputRendering=PlainText filter — see Write-VTSequence
-                # docblock).
-                Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot))
-            }
-            catch {
-                # Keep the previous snapshot visible. If the very first
-                # poll failed we still need to show SOMETHING below the
-                # header, so render an empty frame and surface the
-                # error in the footer — the user can still quit cleanly.
-                $lastPollError = $_.Exception.Message
-            }
-            $lastPoll = [DateTime]::Now
+            if ($dueForPoll) {
+                try {
+                    # Reconcile at every poll boundary so a refresh that
+                    # happened since the last poll is captured into the
+                    # tracked slot before we read its bytes for the
+                    # /api/oauth/usage call. Suppressed stdout — any
+                    # advisory the reconcile emits would flash on every
+                    # poll and the per-frame ESC[2J would shred it anyway.
+                    Invoke-Reconcile 6>$null | Out-Null
+                    $snapshot      = Get-UsageSnapshot -Name $Name
+                    $lastPollError = $null
 
+                    # Update the terminal title only on a successful poll —
+                    # on a failed poll the previous title (and body) persist
+                    # together until the next tick. OSC 0 ('ESC ] 0 ; <title>
+                    # BEL') sets both window and icon title; supported by
+                    # Windows Terminal, modern ConHost, VS Code, iTerm2,
+                    # kitty, alacritty, WezTerm, foot, gnome-terminal,
+                    # mintty. Routed through Write-VTSequence for parity
+                    # with DEC sequences (bypasses the
+                    # OutputRendering=PlainText filter — see Write-VTSequence
+                    # docblock).
+                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot))
+                }
+                catch {
+                    # Keep the previous snapshot visible. If the very first
+                    # poll failed we still need to show SOMETHING below the
+                    # header, so render an empty frame and surface the
+                    # error in the footer — the user can still quit cleanly.
+                    $lastPollError = $_.Exception.Message
+                }
+                $lastPoll = $now
+            }
+
+            # Footer rebuilt every tick. The string is constant between
+            # poll boundaries (timestamp updates only on poll), but the
+            # rebuild is a cheap concat and keeps the redraw path single-
+            # branch. Multi-line only when the previous poll failed.
             $footer = "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))"
             if ($lastPollError) {
-                $footer += "`n[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next poll)"
+                $footer += "`n[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next tick)"
             }
 
             # Atomic frame: begin sync update, clear screen, cursor home,
@@ -3240,11 +3253,13 @@ function Invoke-UsageWatch {
             }
             Write-VTSequence "`e[?2026l"
 
-            # Sleep until the next poll. Start-Sleep is interruptible by
-            # Ctrl-C so the user can abort cleanly; the surrounding
-            # `finally` block leaves the alt buffer and restores cursor
-            # visibility on exit.
-            Start-Sleep -Seconds $Interval
+            # 1-second inter-frame wait. Decoupling redraw cadence from
+            # poll cadence lets the screen self-heal on terminal resize
+            # within ~1 s instead of waiting up to -Interval seconds.
+            # Ctrl-C terminates the loop via the runtime's default
+            # handler; the surrounding `finally` block leaves the alt
+            # buffer and restores cursor visibility on exit.
+            Start-Sleep -Seconds 1
         }
     }
     finally {
