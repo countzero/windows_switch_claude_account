@@ -93,7 +93,7 @@ A slot's identity is captured ONCE at save time and frozen in two paired files:
 2. `/api/oauth/profile` (via `Get-SlotProfile`); fallback for fresh installs where `oauthAccount` is empty. Yields only `emailAddress`; the other four whitelisted fields default to `null` in the sidecar.
 3. Both failing → save is **refused**. There are no unlabeled-no-identity slots.
 
-**Atomic-pair invariant**: tokens file is written first, then the sidecar. If the sidecar write fails, the tokens file is rolled back so a half-saved slot can never appear invisible-but-present.
+**Atomic-pair invariant on save**: existing slot bytes are snapshotted in memory first; tokens file is written, then the sidecar. If either write fails, the partial new pair is removed and the pre-existing pair is restored from the snapshot. A half-saved slot can never appear invisible-but-present, and a save failure cannot delete the user's existing slot.
 
 ## `~/.claude.json` ownership
 

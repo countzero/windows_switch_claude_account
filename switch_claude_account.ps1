@@ -1480,37 +1480,102 @@ function Invoke-SaveAction {
     $finalSlotPath = Join-Path $CredDir $finalSlotName
 
     # Find any pre-existing slot files / sidecars for this slot name
-    # (labeled or unlabeled, possibly with stale email). Delete them so
-    # the save is idempotent even when the stored account has changed.
-    # Get-Slots filters out sidecar-less slots, so we enumerate the raw
-    # file system here to also catch invisible legacy slots that share
-    # this slot name.
+    # (labeled or unlabeled, possibly with stale email) and SNAPSHOT
+    # their bytes into memory before any disk mutation. The snapshot is
+    # the rollback source for the catch path: if either the tokens or
+    # sidecar write fails, we restore from these buffers so a transient
+    # failure on a re-save cannot leave the user with no slot for this
+    # name. Get-Slots filters out sidecar-less slots, so we enumerate
+    # the raw file system here to also catch invisible legacy slots
+    # that share this slot name.
+    $snapshots = @()
     $rawFiles = @(
         Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
     )
     foreach ($rf in $rawFiles) {
         $parsed = Get-SlotFileInfo -FileName $rf.Name
-        if ($parsed -and $parsed.Name -eq $safeName -and $rf.FullName -ne $finalSlotPath) {
-            Remove-Item -LiteralPath $rf.FullName -Force -ErrorAction SilentlyContinue
-            Remove-Sidecar -SlotPath $rf.FullName
+        if (-not $parsed -or $parsed.Name -ne $safeName) { continue }
+
+        $snap = [pscustomobject]@{
+            Path         = $rf.FullName
+            Bytes        = $null
+            SidecarPath  = Get-SidecarPath -SlotPath $rf.FullName
+            SidecarBytes = $null
         }
+        try {
+            $snap.Bytes = [System.IO.File]::ReadAllBytes($rf.FullName)
+        }
+        catch {
+            # Read failure (file locked / unreadable). Mark non-restorable
+            # but proceed with the save: refusing on a stale file the
+            # user is explicitly overwriting would be surprising.
+            Write-Color "[Save] WARNING: could not snapshot $($rf.FullName) ($($_.Exception.Message)); rollback for this path will be skipped." 'Yellow'
+        }
+        if (Test-Path -LiteralPath $snap.SidecarPath) {
+            try {
+                $snap.SidecarBytes = [System.IO.File]::ReadAllBytes($snap.SidecarPath)
+            }
+            catch {
+                Write-Color "[Save] WARNING: could not snapshot $($snap.SidecarPath) ($($_.Exception.Message)); rollback for this path will be skipped." 'Yellow'
+            }
+        }
+        $snapshots += $snap
     }
 
-    # Write tokens, then sidecar. Order matters for atomic-pair semantics:
-    # if the tokens write succeeds but the sidecar write fails, we delete
-    # the tokens file in the catch so a half-saved slot doesn't appear
-    # invisible-but-present (it would be present on disk but hidden by
-    # Get-Slots' sidecar filter). Conversely, an orphan sidecar without
-    # a matching tokens file is harmless; Get-Slots only iterates
-    # tokens files; sidecars are looked up by-path.
-    Set-CredentialFileAtomic -Path $finalSlotPath -Bytes $bytes
+    # Write tokens, then sidecar. Order matters for atomic-pair semantics.
+    # On any failure we clear partial new state at $finalSlotPath, then
+    # restore each snapshot's bytes (tokens AND sidecar) so the slot
+    # returns to its pre-save state. An orphan sidecar without a matching
+    # tokens file is harmless; Get-Slots only iterates tokens files,
+    # sidecars are looked up by-path.
     try {
+        Set-CredentialFileAtomic -Path $finalSlotPath -Bytes $bytes
         Write-Sidecar -SlotPath $finalSlotPath -OAuthAccount $accountInfo -Source $sourceLabel
     }
     catch {
+        $innerMsg = $_.Exception.Message
+
+        # Clear any partial new pair we wrote. If $finalSlotPath happened
+        # to coincide with a snapshot path (same-email re-save), this
+        # also wipes the just-overwritten old bytes; the restore loop
+        # below puts them back.
         Remove-Item -LiteralPath $finalSlotPath -Force -ErrorAction SilentlyContinue
-        throw "Failed to write sidecar for slot '$safeName' ($($_.Exception.Message)); slot rolled back."
+        Remove-Sidecar -SlotPath $finalSlotPath
+
+        # Restore each snapshot. Per-snapshot try/catch so one restore
+        # failure does not abort the others.
+        foreach ($snap in $snapshots) {
+            if ($null -ne $snap.Bytes) {
+                try {
+                    Set-CredentialFileAtomic -Path $snap.Path -Bytes $snap.Bytes
+                }
+                catch {
+                    Write-Color "[Save] WARNING: could not restore $($snap.Path) ($($_.Exception.Message))." 'Yellow'
+                }
+            }
+            if ($null -ne $snap.SidecarBytes) {
+                try {
+                    Set-CredentialFileAtomic -Path $snap.SidecarPath -Bytes $snap.SidecarBytes
+                }
+                catch {
+                    Write-Color "[Save] WARNING: could not restore $($snap.SidecarPath) ($($_.Exception.Message))." 'Yellow'
+                }
+            }
+        }
+
+        throw "Save failed for slot '$safeName' ($innerMsg); attempted to restore previous slot state."
+    }
+
+    # New pair is durable. Delete obsolete siblings (any snapshot whose
+    # path differs from $finalSlotPath). Same-path snapshots were
+    # overwritten in place by the atomic Replace above and need no
+    # further action.
+    foreach ($snap in $snapshots) {
+        if ($snap.Path -ne $finalSlotPath) {
+            Remove-Item -LiteralPath $snap.Path -Force -ErrorAction SilentlyContinue
+            Remove-Sidecar -SlotPath $snap.Path
+        }
     }
 
     # Update state: this slot is now the active one, and its bytes match
