@@ -4,7 +4,7 @@ description: >
   Multi-pass PR code review. Use when reviewing pull request code changes for
   defects and design issues. Performs 3 review passes with escalating focus,
   deduplicates findings, and produces a severity-filtered summary with deep
-  links to the relevant code on GitHub. This skill is read-only and advisory —
+  links to the relevant code on GitHub. This skill is read-only and advisory;
   it never writes comments, reviews, or any data to GitHub.
 ---
 
@@ -51,23 +51,27 @@ overall design of the change:
    PR description (when a PR exists). Flag if the change does more or less
    than those stated goals.
 2. **Placement:** Do the changes live in the correct place? This repo's
-    layout:
-    - `switch_claude_account.ps1` — the entire application: parameter
-      parsing, name sanitization (`Get-SafeName`), profile management
-      (`Add-To-Profile`/`Remove-From-Profile`), and credential slot actions
-      (save/switch/list/remove).
-    - `README.md` — usage documentation.
-    - `.gitignore` — excludes `.claude/` directory.
-    There is no test suite; correctness is validated through manual runs.
-    Flag changes that mix concerns inappropriately (e.g., credential logic
-    embedded in profile management, or profile logic in credential actions).
+   layout:
+   - `switch_claude_account.ps1`: the entire application. Top-level
+     dispatcher in `Invoke-Main`; each action body is an `Invoke-*Action`
+     function. New actions go in their own `Invoke-<Action>Action` function
+     with a one-line dispatch in `Invoke-Main`.
+   - `tests/`: Pester 5 test suite, one file per action. Shared setup in
+     `tests/Common.ps1`.
+   - `.claude/rules/script-internals.md` and `.claude/rules/tests.md`:
+     deeper conventions for the script and tests respectively.
+   - `README.md`: usage documentation.
+   Flag changes that mix concerns inappropriately (e.g., credential logic
+   embedded in profile management, or profile logic in credential actions),
+   or that violate the reconcile rule documented in `CLAUDE.md` (which
+   actions must call `Invoke-Reconcile` first).
 3. **Complexity:** Is any part of the change more complex than necessary?
    Flag over-engineering, unnecessary abstractions, or functionality that
    is not required by the stated goal.
 
 Record design-level findings separately under `### Design` in the output,
 before the severity tables. Design findings do not go through the severity
-classification — they are qualitative observations for the author.
+classification; they are qualitative observations for the author.
 
 ### Workflow and User Communication
 
@@ -82,13 +86,13 @@ Use the TodoWrite tool to create and track these steps:
 
 Mark each todo as `in_progress` when starting and `completed` when done.
 After each pass, tell the user in one line how many new defects were found
-(e.g., "Pass 1 complete — found 6 defects."). After the summary, output the
+(e.g., "Pass 1 complete: found 6 defects."). After the summary, output the
 final severity tables directly in the conversation.
 
 ### Review Passes
 
 Three passes over the full diff, each with a different focus. All passes
-review the full diff. Findings are recorded **without severity** — just File,
+review the full diff. Findings are recorded **without severity**: just File,
 Line(s), and Description.
 
 Only flag defects in lines that are added or modified in this PR. Do not flag
@@ -99,24 +103,25 @@ Skip any finding that:
   range).
 - Describes the same logical issue as an existing finding but references a
   different location (e.g., a function definition vs. its call site). Two
-  findings about the same root cause count as one — keep the one closest to
+  findings about the same root cause count as one; keep the one closest to
   the root cause.
 
-**Pass 1 — General scan:**
+**Pass 1: General scan**
 Review the diff. Report all defects: bugs, logic errors, security issues, bad
-practices, missing validation, incorrect error handling. This project has no
-test suite — do not flag missing test coverage as a defect. Also check the
-project-specific concerns listed in the Project-Specific Review Checklist
-section below. Only flag defects in lines that are added or modified in this
-PR.
+practices, missing validation, incorrect error handling. For new or
+significantly changed functions in `switch_claude_account.ps1`, check whether
+corresponding test files in `tests/` cover the changed behavior; flag missing
+test coverage as a finding. Also check the project-specific concerns listed
+in the Project-Specific Review Checklist section below. Only flag defects in
+lines that are added or modified in this PR.
 
-**Pass 2 — What was missed:**
+**Pass 2: What was missed**
 Review the diff again, assuming defects were missed on the first pass. Focus
 on interactions between changed files, subtle logic errors, and implicit
 assumptions in the code. Only flag defects in lines that are added or modified
 in this PR.
 
-**Pass 3 — What the code does NOT do:**
+**Pass 3: What the code does NOT do**
 Assume there are still undiscovered defects. Focus on what is absent: missing
 error handling, missing edge cases, missing input validation, missing null
 checks, race conditions, resource leaks, and incorrect assumptions about
@@ -178,9 +183,13 @@ After Pass 3:
    - **Medium:** Bad practice that could lead to bugs, missing validation for
      unlikely but possible inputs, minor logic issue.
 5. **Filter:** Keep only Critical, High, and Medium.
-6. **Output in conversation:** One table per severity level, following the
-   link format rules in the Link Format section below. Omit a severity level
-   if it has no defects.
+6. **Compute report metadata:** files changed and additions/deletions via
+   `git diff --shortstat <base>...HEAD`; current timestamp; severity counts.
+7. **Output in conversation:** title (`# PR Review` + `## <branch> (vs <base>)`),
+   metadata table (see Output Template), Design section, then one table per
+   severity level following the Link Format rules. Omit a severity level if
+   it has no defects. If all severity buckets are empty, print
+   `No Critical/High/Medium findings.` in place of the severity tables.
 
 No data is written to GitHub. The developer or reviewer uses the output to
 manually create PR comments.
@@ -214,7 +223,7 @@ Fallback if Node.js is available:
 `https://github.com/{owner}/{repo}/blob/{full-sha}/{path}#L{start}-L{end}`.
 Note: blob links use `L` (not `R`) for line anchors.
 
-**Correct — markdown links with file path labels:**
+**Correct: markdown links with file path labels**
 
 ```markdown
 | File                                                                                                                  | Description                    |
@@ -223,7 +232,7 @@ Note: blob links use `L` (not `R`) for line anchors.
 | [/switch_claude_account.ps1:41-43](https://github.com/owner/repo/blob/4a7c9e1f/switch_claude_account.ps1#L41-L43)      | Name not sanitized before use  |
 ```
 
-**Wrong — do NOT use any of these formats:**
+**Wrong: do NOT use any of these formats**
 
 ```markdown
 | https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43 | ...  |
@@ -233,28 +242,59 @@ Note: blob links use `L` (not `R`) for line anchors.
 
 The first is wrong because it uses a raw URL instead of a markdown link. The
 second is wrong because the label is a URL instead of a file path. The third
-is wrong because it uses a filename only — the label must be the full path
+is wrong because it uses a filename only; the label must be the full path
 from the repository root with a leading `/`.
 
 **Full output template:**
 
 ```markdown
+# PR Review
+
+## <branch-or-head7> (vs <base>)
+
+| Field     | Value                                                                                                                                                       |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Branch    | [`<branch>`](https://github.com/OWNER/REPO/tree/<branch>) → [`<base>`](https://github.com/OWNER/REPO/tree/<base>)                                           |
+| HEAD      | [`<head7>`](https://github.com/OWNER/REPO/commit/<head7>)                                                                                                   |
+| PR        | [#42](https://github.com/OWNER/REPO/pull/42) (or `none` when no PR is open)                                                                                 |
+| Generated | YYYY-MM-DD HH:MM                                                                                                                                            |
+| Diff      | 3 files · +120 · −45                                                                                                                                        |
+| Findings  | 🔴 0 Critical · 🟠 1 High · 🟡 2 Medium                                                                                                                     |
+
 ### Design
 
 - <Qualitative observation about scope, placement, or complexity>
 
 ### Critical
 
-| File                                                                                                          | Description                       |
-| ------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| [/switch_claude_account.ps1:41-43](https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43) | Credentials leaked to stdout    |
+| File                                                                                                                  | Description                       |
+| --------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| [/switch_claude_account.ps1:41-43](https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43) | Credentials leaked to stdout      |
 
 ### High
 
-| File                                                                                                          | Description                       |
-| ------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| File                                                                                                                  | Description                       |
+| --------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
 | [/switch_claude_account.ps1:14-19](https://github.com/owner/repo/pull/42/files#diff-f6a7b8c9d0a1b2c3d4e5f6a7b8R14-R19) | Name not sanitized before file op |
 ```
+
+**Metadata-row formatting rules:**
+
+- **Branch:** link both branches to GitHub tree URLs:
+  `https://github.com/<owner>/<repo>/tree/<branch-name>`. Multi-segment
+  branch names (e.g. `feature/foo`) work without encoding because the
+  `tree/` path accepts literal slashes; percent-encode any branch name that
+  contains spaces or other reserved characters.
+- **HEAD:** use the 7-char short SHA in both the link label and the URL
+  (`/commit/<head7>`). GitHub redirects `/commit/<short>` to the full
+  commit, so the link resolves identically.
+- **PR:** the PR number when one exists, `none` otherwise.
+- **Diff:** plain text. Format: `<files> files · +<additions> · −<deletions>`,
+  with middle dots (` · `, U+00B7) as separators. Use the Unicode minus sign
+  (U+2212, `−`) for the deletions count, not the ASCII hyphen-minus.
+- **Findings:** `🔴 <n> Critical · 🟠 <n> High · 🟡 <n> Medium`. Severity
+  glyphs replace coloured pills to keep the recipe free of custom CSS while
+  staying scannable. Always show all three severities, even when zero.
 
 ### Constraints
 
@@ -266,4 +306,4 @@ from the repository root with a leading `/`.
   production code.
 - Do NOT report issues in generated files, lock files, or changelog entries.
 - File cells in output tables must use markdown link syntax with the file
-  path as label — see the Link Format section.
+  path as label; see the Link Format section.

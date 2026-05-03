@@ -8,7 +8,7 @@
 # Per-test sandbox setup lives in tests/Common.ps1; see that file for the
 # scoping rationale. Each top-level Describe must wrap a BeforeEach (Pester 5
 # forbids BeforeEach at file root), so all Contexts in this file nest under
-# one outer Describe named 'switch_claude_account' — same name as the other
+# one outer Describe named 'switch_claude_account', same name as the other
 # split files so test FullName paths stay stable.
 
 BeforeAll {
@@ -173,9 +173,9 @@ Describe 'switch_claude_account' {
         It 'hides slot files that have no sidecar (post-v2.1.0 contract)' {
             $credDir = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $credDir -Force | Out-Null
-            # Bare slot file, no sidecar — invisible by design.
+            # Bare slot file, no sidecar; invisible by design.
             Set-Content -LiteralPath (Join-Path $credDir '.credentials.legacy.json') -Value 'L' -NoNewline
-            # Properly paired slot — visible.
+            # Properly paired slot; visible.
             New-SlotPair -CredDir $credDir -Name 'modern' -Content 'M' | Out-Null
 
             $names = @((Get-Slots).Slots | ForEach-Object Name)
@@ -566,7 +566,7 @@ Describe 'switch_claude_account' {
             $body = $func.Extent.Text
 
             # OSC 0 sequence: ESC ] 0 ; <title> BEL. Match the literal
-            # `e]0; opener — the renderer interpolation and BEL terminator
+            # `e]0; opener; the renderer interpolation and BEL terminator
             # vary across edits but the opener is invariant.
             $body | Should -Match '`e\]0;' -Because (
                 'Invoke-UsageWatch must emit an OSC 0 (\e]0;<title>\a) ' +

@@ -61,9 +61,10 @@ Param (
 
     # -Watch: render a live, self-refreshing `usage` view that polls
     # /api/oauth/usage every -Interval seconds and redraws every second
-    # (so reset deltas and the countdown footer tick visibly). Interactive
-    # only — exits on Ctrl-C (runtime default). Mutually exclusive with
-    # -Json (enforced by parameter sets). Ignored by other actions.
+    # (so reset deltas refresh and a terminal resize is reflected within
+    # ~1 s rather than at the next poll). Interactive only; exits on
+    # Ctrl-C (runtime default). Mutually exclusive with -Json (enforced
+    # by parameter sets). Ignored by other actions.
     # Mandatory in the 'Watch' set so it anchors the set: passing -Interval
     # alone resolves the binder to the 'Watch' set and then fails with
     # "Cannot process command because of one or more missing mandatory
@@ -77,7 +78,7 @@ Param (
     # -Watch (-Watch is the set's mandatory anchor; see above).
     # [ValidateRange] rejects zero / negatives at bind time. The
     # 60-second floor is enforced as a runtime clamp-with-advisory inside
-    # Invoke-UsageWatch (deliberate — see CLAUDE.md "Watch mode").
+    # Invoke-UsageWatch (deliberate; see CLAUDE.md "Watch mode").
     [Parameter(ParameterSetName = 'Watch')]
     [ValidateRange(1, [int]::MaxValue)]
     [int] $Interval = 60,
@@ -234,7 +235,7 @@ $Script:AccountColumnMaxWidth  = 32
 #
 # Side effect: the destination always becomes a fresh inode after Replace.
 # We accept this; the script no longer relies on hardlinks for any
-# auto-sync property — the state file tracks the active slot instead.
+# auto-sync property; the state file tracks the active slot instead.
 #
 # Retry: up to 3 attempts on transient sharing violations with 50 ms
 # backoff. Persistent failure throws after the final attempt; the temp
@@ -325,7 +326,7 @@ function Write-ScaState {
 # state has been bootstrapped.
 #
 # Errors are swallowed so a corrupt state file or a transient migration
-# write failure does not break the tool — the next state-mutating call
+# write failure does not break the tool; the next state-mutating call
 # rewrites it.
 function Read-ScaState {
     if (Test-Path -LiteralPath $StateFile) {
@@ -355,7 +356,7 @@ function Read-ScaState {
         return $null
     }
 
-    # Exclude `.account.json` sidecars (introduced in v2.1.0) — they
+    # Exclude `.account.json` sidecars (introduced in v2.1.0); they
     # match the wildcard but are not credential files. Without this
     # filter the auto-migration could hash a sidecar and never find
     # a match (harmless), but still wastes I/O and is a defensive
@@ -425,7 +426,7 @@ function Update-ScaState {
 #
 # sca uses ~/.claude.json two ways:
 #   1. READ (sca save / reconcile identity probe): the email Claude Code
-#      shows IS what we want to label slots with — drift between sca and
+#      shows IS what we want to label slots with. Drift between sca and
 #      Claude Code becomes structurally impossible.
 #   2. WRITE (sca switch): we copy the destination slot's captured oauthAccount
 #      block back into ~/.claude.json so Claude Code's display follows the
@@ -455,7 +456,7 @@ function Test-ClaudeRunning {
 # parses, and contains a populated oauthAccount.emailAddress; otherwise $null.
 #
 # Whitelist (these are the fields that determine identity; volatile metadata
-# like billingType / trial dates is intentionally not surfaced — it changes
+# like billingType / trial dates is intentionally not surfaced: it changes
 # over time and should not round-trip through sca):
 #   accountUuid, emailAddress, organizationUuid, displayName, organizationName
 #
@@ -535,7 +536,7 @@ function Get-SHA256Hex {
 # then substitute each whitelisted "field": "value" pair within the block
 # via a single regex replace. The non-whitelisted fields (billingType,
 # claudeCodeTrialEndsAt, etc.) inside oauthAccount are also preserved
-# byte-equal — we only touch the five identity fields.
+# byte-equal; we only touch the five identity fields.
 #
 # Null-valued whitelisted fields are skipped (they preserve the existing
 # ~/.claude.json value). The asymmetry is deliberate: null → real
@@ -565,7 +566,7 @@ function Set-OAuthAccountInClaudeJson {
 
     # Locate the opening `"oauthAccount": {`. We accept whitespace variations
     # because Claude Code's serializer indents with 2 spaces but a hand-edited
-    # file might have different whitespace — we tolerate that.
+    # file might have different whitespace; we tolerate that.
     $startMatch = [regex]::Match($raw, '"oauthAccount"\s*:\s*\{')
     if (-not $startMatch.Success) {
         throw "~/.claude.json has no oauthAccount block. Sign in to Claude Code first."
@@ -573,18 +574,18 @@ function Set-OAuthAccountInClaudeJson {
 
     # Brace-count from the opening { to find the matching close. Naive
     # counter; does NOT track string-literal context. Per RFC 8259, JSON
-    # strings may legally contain unescaped `{` and `}` — only `"`, `\`,
+    # strings may legally contain unescaped `{` and `}`; only `"`, `\`,
     # and U+0000-U+001F must be escaped. So this counter would miscount
     # an oauthAccount value like `"organizationName": "Acme {LLC}"`.
     #
     # Why this is acceptable in practice (NOT by JSON-spec construction):
     #   * Of the five whitelisted identity fields, three are UUIDs and
-    #     one is an RFC 5321 email — none can contain `{` / `}`.
+    #     one is an RFC 5321 email; none can contain `{` / `}`.
     #   * `displayName` / `organizationName` are user-set in Anthropic's
     #     console, but braces in those values are vanishingly rare.
     #   * Non-whitelisted oauthAccount fields Claude Code emits today
     #     (billingType enum, ISO timestamps, booleans, `ccOnboardingFlags`
-    #     nested object) cannot contain string-literal `}` — nested
+    #     nested object) cannot contain string-literal `}`; nested
     #     object close-braces ARE real structural braces and counted
     #     correctly.
     #   * If a future Claude Code field with brace-bearing string content
@@ -618,7 +619,7 @@ function Set-OAuthAccountInClaudeJson {
         # than nulling it out. This handles /api/oauth/profile-fallback
         # sidecars that captured only emailAddress (the other four
         # whitelisted fields default to $null in that path). The asymmetry
-        # is deliberate — a null value carries no information about Claude
+        # is deliberate: a null value carries no information about Claude
         # Code's actual identity, so the existing cached value is the better
         # source of truth. The inverse direction (null → real, upgrading a
         # previously-null cache to a populated value) still works because
@@ -662,7 +663,7 @@ function Set-OAuthAccountInClaudeJson {
 # emailAddress agree by construction (save writes both atomically).
 #
 # Slots without a valid sidecar are HIDDEN from list/usage/rotation and
-# refused by switch — there is no migration path from old states.
+# refused by switch; there is no migration path from old states.
 # Re-running `sca save <name>` while that slot is active recaptures the
 # sidecar, making the slot visible again.
 
@@ -924,7 +925,7 @@ function Get-SafeName {
     # them to keep every Test-Path / Copy-Item / Remove-Item call below
     # unambiguous (defense-in-depth alongside -LiteralPath on those calls).
     # ( and ) are sanitized because slot filenames encode the OAuth account
-    # email as `.credentials.<slot>(<email>).json` — parens in the slot
+    # email as `.credentials.<slot>(<email>).json`; parens in the slot
     # name would confuse the parser in Get-SlotFileInfo and produce the
     # wrong (slot, email) split.
     $clean = $inputName -replace '[\\/:*?"<>|\[\]()\x00-\x1F ]', '_'
@@ -985,7 +986,7 @@ function Get-SlotFileInfo {
 
 # Build the slot filename for a given (name, email) pair. When email is
 # absent, or when the email (case-insensitively) equals the slot name, the
-# unlabeled form is returned — the slot name already conveys the account
+# unlabeled form is returned: the slot name already conveys the account
 # and a redundant parenthesized email suffix would only add visual noise.
 function Get-SlotFileName {
     Param (
@@ -1020,7 +1021,7 @@ function Get-SlotFileName {
 # encoded directly in the slot filename (see Get-SlotFileInfo) so those
 # sidecars are dead weight; removing them prevents stale emails from
 # lingering in the directory. Swallowed errors: if the cleanup can't
-# remove a file (lock / permissions) we leave it and move on — it is
+# remove a file (lock / permissions) we leave it and move on; it is
 # cosmetic, not functional.
 #
 # Returns an object with:
@@ -1068,7 +1069,7 @@ function Get-Slots {
 
         # Sidecar requirement: skip slots without a valid sidecar so
         # they don't appear in list / usage / rotation. The slot file
-        # itself stays on disk untouched — re-saving via `sca save
+        # itself stays on disk untouched; re-saving via `sca save
         # <name>` while it's active will recapture the sidecar.
         $sidecar = Read-Sidecar -SlotPath $file.FullName
         if (-not $sidecar) { continue }
@@ -1368,7 +1369,7 @@ function Invoke-Reconcile {
             # Tracked slot's email comes from its sidecar (Get-Slots
             # always populates this on the slot object). Tolerate
             # offline / unknown-new-identity by falling into the
-            # same-identity branch — preserves continuity over paranoia.
+            # same-identity branch; preserves continuity over paranoia.
             $slotEmail    = if ($slot.Sidecar) { [string]$slot.Sidecar.oauthAccount.emailAddress } else { $slot.Email }
             $sameIdentity = (-not $newEmail) -or (-not $slotEmail) -or ($newEmail -eq $slotEmail)
             if ($sameIdentity) {
@@ -1445,7 +1446,7 @@ function Invoke-SaveAction {
     }
 
     # Resolve identity. ~/.claude.json's oauthAccount is the preferred
-    # source (it's exactly what Claude Code's /status displays — drift-
+    # source (it's exactly what Claude Code's /status displays, drift-
     # proof by construction). Fall back to a live /api/oauth/profile
     # call only when ~/.claude.json has no oauthAccount yet (rare:
     # fresh install, user wiped the config, etc.). Failing both ->
@@ -1457,7 +1458,7 @@ function Invoke-SaveAction {
         # so the rest of the oauthAccount fields default to $null. The
         # slot is still usable (Claude Code re-derives missing fields
         # from the next refresh response). Use a non-automatic-variable
-        # name (`$profileResult` rather than `$profile`) — `$profile` is
+        # name (`$profileResult` rather than `$profile`); `$profile` is
         # PowerShell's automatic for the running profile path and a
         # collision could surprise downstream code.
         $profileResult = Get-SlotProfile -SlotPath $CredFile
@@ -1489,8 +1490,8 @@ function Invoke-SaveAction {
     # the slot file via atomic rename and hashed for state.last_sync_hash;
     # this read-once-write-once approach ensures internal consistency
     # even if Claude Code rewrites .credentials.json during the save.
-    # (Claude Code is closed, but a background process — antivirus,
-    # backup tool — could still touch the file.)
+    # (Claude Code is closed, but a background process, antivirus or
+    # backup tool, could still touch the file.)
     $bytes = [System.IO.File]::ReadAllBytes($CredFile)
 
     # Final filename now that identity is known. We write directly to the
@@ -1521,7 +1522,7 @@ function Invoke-SaveAction {
     # the tokens file in the catch so a half-saved slot doesn't appear
     # invisible-but-present (it would be present on disk but hidden by
     # Get-Slots' sidecar filter). Conversely, an orphan sidecar without
-    # a matching tokens file is harmless — Get-Slots only iterates
+    # a matching tokens file is harmless; Get-Slots only iterates
     # tokens files; sidecars are looked up by-path.
     Set-CredentialFileAtomic -Path $finalSlotPath -Bytes $bytes
     try {
@@ -1551,7 +1552,7 @@ function Invoke-SwitchAction {
     # oauthAccount block from the destination slot's sidecar, and a
     # running Claude Code instance keeps that file in an in-memory
     # cache that may flush and clobber our update. Refusing is the
-    # simplest reliability guarantee — see CLAUDE.md's planning history.
+    # simplest reliability guarantee; see CLAUDE.md's planning history.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca switch' so the email-display change applies cleanly."
     }
@@ -1560,7 +1561,7 @@ function Invoke-SwitchAction {
     # active slot is mirrored into the saved slot file before we
     # overwrite .credentials.json. If reconcile triggers an auto-save or
     # identity-change branch, its yellow advisory prints above the
-    # subsequent switch output — that is desired (the user sees
+    # subsequent switch output; that is desired (the user sees
     # context for the unusual state).
     Invoke-Reconcile | Out-Null
 
@@ -1568,7 +1569,7 @@ function Invoke-SwitchAction {
     # (alphabetical, wrap-around). Get-NextSlotName returns $null for
     # the single-slot-already-active no-op and prints its own yellow
     # advisory; we return in that case so neither the success line nor
-    # the table render (nothing has changed — the user already saw the
+    # the table render (nothing has changed, the user already saw the
     # advisory).
     if ([string]::IsNullOrWhiteSpace($Name)) {
         $rotation = Get-NextSlotName
@@ -1580,7 +1581,7 @@ function Invoke-SwitchAction {
         # No-active-slot advisory: yellow line surfaced before the green
         # success line so the user notices the unusual state. Rotation
         # proceeds either way. The happy path (HasActiveSlot=true)
-        # emits no advisory — the slot table beneath the success line
+        # emits no advisory; the slot table beneath the success line
         # makes the transition self-evident via the `*` marker.
         if (-not $rotation.HasActiveSlot) {
             Write-Color "[Switch] No currently active slot detected. Rotating to $toIdent." 'Yellow'
@@ -1596,11 +1597,11 @@ function Invoke-SwitchAction {
         # "never existed" and "exists on disk but no sidecar". Tell the
         # user about both possibilities so they can recover from a
         # stale-state scenario.
-        throw "Slot '$safeName' not found (or missing its identity sidecar — re-save while active to recapture)."
+        throw "Slot '$safeName' not found (or missing its identity sidecar; re-save while active to recapture)."
     }
 
     # Atomic-rename copy: works even if Claude Code has .credentials.json
-    # open (it grants share-delete) — but with the running guard above,
+    # open (it grants share-delete); but with the running guard above,
     # this path normally only executes when Claude Code is closed.
     # Bytes are read from the slot file once and reused for both the
     # write and the state hash.
@@ -1612,7 +1613,7 @@ function Invoke-SwitchAction {
     # The sidecar is guaranteed valid here (Get-Slots filtered out
     # sidecar-less slots), so $slot.Sidecar.oauthAccount is populated.
     # Failure to write ~/.claude.json (file locked, malformed,
-    # disappeared) bubbles up — the credentials swap has already
+    # disappeared) bubbles up; the credentials swap has already
     # happened, so the user sees the error and can rerun once the
     # condition clears. We do NOT rollback the credentials write
     # because Claude Code may have already started using the new
@@ -1628,7 +1629,7 @@ function Invoke-SwitchAction {
     $hash = Get-SHA256Hex -Bytes $slotBytes
     Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
 
-    # DarkYellow header line — matches the `[List] Saved slots` /
+    # DarkYellow header line; matches the `[List] Saved slots` /
     # `[Usage] Plan usage` convention so all three actions present a
     # consistent table-header look. No trailing period: this is a
     # header, not a complete sentence.
@@ -1639,7 +1640,7 @@ function Invoke-SwitchAction {
     # sees the new active slot in context (the `*` marker now points at
     # the just-activated row). Re-enumerate via Get-Slots so IsActive
     # reflects the post-switch state. -SuppressHeader keeps the visual
-    # weight low — the `[Switch]` line above is enough of a section
+    # weight low; the `[Switch]` line above is enough of a section
     # header.
     Write-Host ''
     $postSwitchInfo = Get-Slots
@@ -1726,7 +1727,7 @@ function Invoke-RemoveAction {
 #     (Invoke-UsageAction.Tests.ps1's 401 mock pattern), where
 #     .Response.StatusCode is already an integer.
 # Returns $false for null exceptions, exceptions without a Response member,
-# and any non-429 status — the caller's catch block falls through to its
+# and any non-429 status; the caller's catch block falls through to its
 # pre-existing error handling for those.
 function Test-Is429 {
     Param ($Exception)
@@ -1796,7 +1797,7 @@ function Get-SlotOAuth {
 # using the same request shape Claude Code itself sends (verified against
 # claude.exe 2.1.119). Writes the new tokens via Set-CredentialFileAtomic
 # (single write primitive shared with save / switch / state-file writes),
-# then — if the slot being refreshed is the currently-tracked active slot —
+# then, if the slot being refreshed is the currently-tracked active slot,
 # also writes the same bytes to .credentials.json so Claude Code's next
 # call sees the new refresh_token. This restores the auto-sync property
 # the previous hardlink-based design provided implicitly.
@@ -1805,13 +1806,13 @@ function Get-SlotOAuth {
 # message on failure.
 #
 # Race with a running Claude Code: `sca usage` does NOT refuse while
-# Claude Code is running (only `save` / `switch` do — see
+# Claude Code is running (only `save` / `switch` do; see
 # Test-ClaudeRunning callers), so an active-slot refresh triggered here
 # can race against Claude Code's own refresh. Anthropic rotates the
 # refresh_token on every successful /v1/oauth/token call: whichever
 # party (sca or Claude Code) calls second presents the now-rotated old
 # token and gets a 4xx, losing its session. We accept this as a
-# deliberate trade-off — refusing `sca usage` while Claude Code runs
+# deliberate trade-off: refusing `sca usage` while Claude Code runs
 # would defeat the action's main use case (live monitoring during
 # work). In practice the race is rare (the refresh window is a ~60s
 # slice once per hour) and recoverable: if a refresh fails after this
@@ -1960,7 +1961,7 @@ function Get-SlotUsage {
 
     $accessToken = $info.AccessToken
 
-    # Refresh if expired OR within a 60s grace window — covers clock skew
+    # Refresh if expired OR within a 60s grace window; covers clock skew
     # and the case where the token technically has 30s left but would
     # expire mid-call.
     $threshold = [DateTime]::UtcNow.AddSeconds(60)
@@ -1972,7 +1973,7 @@ function Get-SlotUsage {
             # 429 from the token endpoint shares the rate-limit policy
             # with the usage endpoint below: serve fresh cached usage
             # data when available, otherwise surface a clean
-            # 'rate-limited' status. No retry — the token endpoint shares
+            # 'rate-limited' status. No retry; the token endpoint shares
             # an upstream limiter with the usage endpoint, so a 5s sleep
             # would just extend the user's wait without changing the
             # outcome (and the watch loop will retry on its 60s tick).
@@ -2019,10 +2020,10 @@ function Get-SlotUsage {
         }
         # On 429 (rate limited), fall back to cached data if available and
         # still fresh. This keeps the watch display functional during rate-
-        # limited periods — usage data only changes every few hours at most.
+        # limited periods; usage data only changes every few hours at most.
         # Three explicit branches (vs. the previous if/else where a stale
         # cache fell through to the bottom 'error' return at the end of
-        # the catch — that hid behind Format-UsageTable's truncation but
+        # the catch; that hid behind Format-UsageTable's truncation but
         # mislabeled the status):
         #   1. Fresh cache  -> return cached as 'ok' with IsCachedFallback.
         #   2. Stale cache  -> 'rate-limited' (no retry; the cache being
@@ -2035,7 +2036,7 @@ function Get-SlotUsage {
             if ($cached) { return $cached }
             # Cache miss vs stale-entry both reach this point. If the
             # slot has ANY cache entry (stale or otherwise), drop to
-            # 'rate-limited' — we've been seeing 429s long enough that
+            # 'rate-limited'; we've been seeing 429s long enough that
             # a 5s sleep won't change the outcome. If no cache entry
             # exists at all, retry once after a short delay so back-to-
             # back slot polls don't all hit the rate limit simultaneously.
@@ -2057,7 +2058,7 @@ function Get-SlotUsage {
                 return [pscustomobject]@{ Status = 'ok'; Data = $resp2 }
             }
             catch {
-                # Second attempt also failed — return clean rate-limited status.
+                # Second attempt also failed; return clean rate-limited status.
                 return [pscustomobject]@{ Status = 'rate-limited' }
             }
         }
@@ -2075,7 +2076,7 @@ function Get-SlotUsage {
 #
 # No caching: email is authoritative only at `sca save` time, which writes
 # it directly into the slot filename. Subsequent `sca usage` / `sca list`
-# reads parse the filename via Get-SlotFileInfo — no HTTP. This keeps the
+# reads parse the filename via Get-SlotFileInfo. No HTTP. This keeps the
 # email self-consistent with the stored OAuth tokens: the only way to
 # update the email on a slot is to re-run `sca save`, which also re-runs
 # this call against the freshly-saved tokens.
@@ -2114,7 +2115,7 @@ function Get-SlotProfile {
             # is rate-limited, surface a clean 'rate-limited' status
             # rather than 'expired: <long 429 message>'. There is no
             # profile cache to fall back on (Get-SlotProfile is no-cache
-            # by design — see this function's docstring), so the
+            # by design; see this function's docstring), so the
             # rate-limited status is the only signal we can give.
             if (Test-Is429 $_.Exception) {
                 return [pscustomobject]@{ Status = 'rate-limited' }
@@ -2194,7 +2195,7 @@ function Format-ResetDelta {
     if ($delta.TotalSeconds -le 0) { return 'now' }
 
     if ($delta.TotalHours -ge 24) {
-        # Total hours, floor — at this scale minutes would only add noise.
+        # Total hours, floor; at this scale minutes would only add noise.
         $h = [int][math]::Floor($delta.TotalHours)
         return "(${h}h)"
     }
@@ -2277,7 +2278,7 @@ function Format-Truncate {
     if ($Max -le 1) { return '…' }
 
     # Keep more of the tail than the head so the domain (after the '@')
-    # stays visible for emails — the domain is the disambiguating part
+    # stays visible for emails; the domain is the disambiguating part
     # when multiple slots share a local-part. For $Max = 32 this gives
     # 15 leading + '…' + 16 trailing = 32 cells.
     $headLen = [math]::Max(1, [int][math]::Floor(($Max - 1) / 2))
@@ -2452,13 +2453,13 @@ function Get-AggregateBarColor {
 # Output: 4 Write-Host lines per call (Session bar, blank, Week bar,
 # blank); the leading blank that precedes them comes from the caller's
 # post-header padding in Format-UsageTable. When no qualifying rows
-# exist, emits nothing — the table below renders cleanly without
+# exist, emits nothing; the table below renders cleanly without
 # orphan padding.
 #
 # Uses Write-Host (information stream / 6) rather than Write-Progress
 # (stream 4) for three reasons: (1) the suite's `6>&1 | Out-String`
 # capture pattern would miss stream-4 output; (2) Write-Progress is
-# host-managed and transient — it would not sit inline above the table;
+# host-managed and transient (it would not sit inline above the table);
 # (3) it does not compose with Clear-Host watch redraws.
 function Format-AggregateBars {
     Param (
@@ -2512,7 +2513,7 @@ function Format-AggregateBars {
         if ($filled -lt 0)         { $filled = 0 }    # defense-in-depth
         if ($filled -gt $barWidth) { $filled = $barWidth }
 
-        $bar = ('█' * $filled) + ('░' * ($barWidth - $filled))
+        $bar = ('█' * $filled) + ('▓' * ($barWidth - $filled))
 
         $color = Get-AggregateBarColor -UsedPct $usedPct
 
@@ -2574,7 +2575,7 @@ function Format-UsageTable {
         # Status: plan-usability when HTTP was ok, HTTP-state otherwise.
         # The 'expired' and 'error' arms both route through
         # Format-StatusErrorTail so a long underlying exception cannot
-        # wrap the row — the previous 'expired' arm interpolated the raw
+        # wrap the row; the previous 'expired' arm interpolated the raw
         # message with no length cap, which produced multi-line table
         # rows when the token endpoint returned 429 with a long body.
         $statusText = switch ($r.Status) {
@@ -2614,7 +2615,7 @@ function Format-UsageTable {
 
     $fmt = "  {0} {1,-$nameW}  {2,-$acctW}  {3,-$fiveW}  {4,-$sevenW}  {5}"
 
-    # Total rendered line width — used to fit-to-table the aggregate
+    # Total rendered line width; used to fit-to-table the aggregate
     # bars above the header. Mirrors the $fmt pattern: 2 (indent) + 1
     # (marker) + 1 (sep) + nameW + 2 + acctW + 2 + fiveW + 2 + sevenW
     # + 2 + statusW.
@@ -2644,7 +2645,7 @@ function Format-UsageTable {
 # Format-UsageTable's column-width algorithm and row-coloring rules so
 # `sca list` and `sca usage` look like sibling views (same header style,
 # same active-marker conventions, same Account-cell truncation). Pure
-# offline render — no network calls, unlike Format-UsageTable. Used by
+# offline render: no network calls, unlike Format-UsageTable. Used by
 # Invoke-ListAction; kept as a sibling rather than a generic helper
 # because the column counts and per-cell rules differ enough that an
 # abstraction would cost more than it saves with only two callers.
@@ -2701,7 +2702,7 @@ function Format-ListTable {
 
     # Trailing blank line so the table has breathing room before the
     # next prompt (or before any advisory the caller emits below). Mirrors
-    # Format-UsageFrame's footer behavior — both `sca list` / `sca switch`
+    # Format-UsageFrame's footer behavior; both `sca list` / `sca switch`
     # / `sca usage` now end with a blank line so the views look consistent.
     Write-Host ''
 }
@@ -2784,7 +2785,7 @@ function Format-UsageVerbose {
 # `sca usage -Watch` possible: the watch loop re-gathers a fresh snapshot
 # each poll, keeps the previous snapshot visible during HTTP failures,
 # and calls the same frame renderer that the one-shot path uses. The
-# split also keeps the test matrix clean — unit tests mock the data
+# split also keeps the test matrix clean: unit tests mock the data
 # layer and assert on the rendered frame.
 #
 # Snapshot shape (Get-UsageSnapshot):
@@ -2840,7 +2841,7 @@ function Get-UsageSnapshot {
             Data     = $usage.Data
             Error    = $usage.Error
             # Email comes from the slot filename via Get-Slots (parsed by
-            # Get-SlotFileInfo). No HTTP call here — the only source of
+            # Get-SlotFileInfo). No HTTP call here; the only source of
             # truth for a slot's email is its filename, which was written
             # by `sca save` from a fresh profile fetch at that moment.
             Email            = $slot.Email
@@ -2856,7 +2857,7 @@ function Get-UsageSnapshot {
 }
 
 # Render one usage frame (table OR verbose view, plus optional advisory
-# and optional footer). Pure presentation — does not call the network.
+# and optional footer). Pure presentation; does not call the network.
 # Used by both the one-shot action and the live watch loop; the same
 # frame renders identically in either context so tests assert on the
 # frame shape without running the loop.
@@ -2865,9 +2866,9 @@ function Get-UsageSnapshot {
 #                -> summary table.
 # -Snapshot    : output of Get-UsageSnapshot for this frame.
 # -Footer      : optional string printed below the table / verbose view
-#                for the watch-mode "Last updated / next poll" line.
-#                Multi-line strings are split and each line rendered in
-#                the DarkGray information color.
+#                for the watch-mode "Last poll" line. Multi-line
+#                strings are split and each line rendered in the
+#                DarkGray information color.
 function Format-UsageFrame {
     Param (
         [String]                $Name,
@@ -2889,7 +2890,7 @@ function Format-UsageFrame {
         # -IncludeAggregateBars: render the pool-wide Session/Week
         # progress bars above the column header. Format-UsageVerbose's
         # non-ok fallback also calls Format-UsageTable but does NOT pass
-        # this switch — bars are a pool-level summary and would be
+        # this switch; bars are a pool-level summary and would be
         # off-topic on a single-slot drill-down.
         Format-UsageTable -Results @($results) -IncludeAggregateBars
     }
@@ -2898,10 +2899,10 @@ function Format-UsageFrame {
     # an Anthropic API returned 429 and we fell back to cached responses.
     # The 429 may have come from /api/oauth/usage (existing path) OR from
     # /v1/oauth/token during a token refresh that triggered the cache
-    # fallback in Get-SlotUsage's refresh-failure handler — hence the
+    # fallback in Get-SlotUsage's refresh-failure handler; hence the
     # endpoint-agnostic wording.
     if ($Snapshot.HasCacheFallback) {
-        Write-Color "  [Usage] Warning: Anthropic API rate limited — displaying cached data." 'Yellow'
+        Write-Color "  [Usage] Warning: Anthropic API rate limited; displaying cached data." 'Yellow'
     }
 
     if ($Footer) { Format-UsageFooter $Footer } else { Write-Host '' }
@@ -2948,7 +2949,7 @@ $Script:WatchTitleSuffix = 'Switch Claude Account'
 #
 # Threshold reuse: $Script:UtilWarnPct (90) / $Script:UtilLimitPct (100)
 # match Get-PlanStatus, so the title prefix and the body's Status column
-# stay in lockstep — '[!]' here corresponds to 'limited 5h' / 'limited 7d'
+# stay in lockstep; '[!]' here corresponds to 'limited 5h' / 'limited 7d'
 # / 'limited' there; '[~]' corresponds to 'near limit'. Limit wins over
 # warn when buckets straddle the two tiers.
 #
@@ -2956,7 +2957,7 @@ $Script:WatchTitleSuffix = 'Switch Claude Account'
 # simplification: a multi-slot pool mean averages a burned slot down to
 # noise (1 of 5 slots at 100% reads as ~20% mean), defeating the
 # alarm-glance value of the title. The active slot is the one currently
-# serving prompts — its numbers are what the user actually cares about.
+# serving prompts; its numbers are what the user actually cares about.
 #
 # Control bytes (\x00-\x1F, \x7F) are stripped from the assembled string
 # as defense-in-depth: slot names already pass Get-SafeName so user
@@ -2977,7 +2978,7 @@ function Format-WatchTitle {
     if ($results.Count -eq 0) { return $suffix }
 
     # Source row: explicit -Name wins; otherwise the active slot. We do
-    # NOT fall back to "first row" or "pool mean" — the active slot is
+    # NOT fall back to "first row" or "pool mean"; the active slot is
     # the right answer for an alarm-style display, and -Name is the
     # only reason to override it. Strict Name match (defense-in-depth
     # against an upstream caller that did not pre-filter the snapshot).
@@ -3002,7 +3003,7 @@ function Format-WatchTitle {
 
     # Alarm prefix: tiered to mirror Get-PlanStatus. '[!]' wins over
     # '[~]' (a bucket at limit is more actionable than another bucket
-    # only near limit). Null buckets contribute nothing to the alarm —
+    # only near limit). Null buckets contribute nothing to the alarm;
     # they cannot be at or above any threshold by definition.
     $hasLimit = (
         ($null -ne $five  -and [double]$five  -ge $Script:UtilLimitPct) -or
@@ -3023,7 +3024,7 @@ function Format-WatchTitle {
 
     # Strip control bytes (C0 + DEL). Defense-in-depth against an OSC
     # envelope breakout via a malformed slot name, sidecar email, or
-    # future caller path. Tab/CR/LF are unusual in titles too — drop
+    # future caller path. Tab/CR/LF are unusual in titles too; drop
     # them all.
     return ([regex]::Replace($title, '[\x00-\x1F\x7F]', ''))
 }
@@ -3110,13 +3111,15 @@ function Invoke-UsageAction {
 $Script:UsageWatchMinInterval = 60
 
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
-# endpoint every -Interval seconds. Interactive only — throws when output
-# is redirected because the alt-screen + cursor-control sequences would
-# poison a captured log. Exits on Ctrl-C via the runtime's default
-# handler; the `finally` block leaves the alternate screen buffer and
-# restores cursor visibility. On HTTP failure the previous snapshot
-# stays visible and an advisory is appended to the footer so the display
-# never blanks.
+# endpoint every -Interval seconds. The redraw cadence is decoupled from
+# the poll cadence so the frame self-heals on terminal resize within
+# ~1 s instead of waiting up to -Interval seconds for the next poll.
+# Interactive only; throws when output is redirected because the
+# alt-screen + cursor-control sequences would poison a captured log.
+# Exits on Ctrl-C via the runtime's default handler; the `finally`
+# block leaves the alternate screen buffer and restores cursor
+# visibility. On HTTP failure the previous snapshot stays visible and
+# an advisory is appended to the footer so the display never blanks.
 #
 # Flicker-free rendering. Each frame is wrapped in DEC mode 2026
 # (synchronized output: ESC[?2026h … ESC[?2026l) with ESC[2J + cursor-
@@ -3127,8 +3130,8 @@ $Script:UsageWatchMinInterval = 60
 # (ESC[?1049h) so the pre-watch terminal scrollback is restored on
 # exit, mirroring how top / htop / vim behave. Terminals without DEC
 # 2026 support (e.g. legacy ConHost) silently ignore the unknown DEC
-# private mode and fall back to the previous Clear-Host-style flicker
-# — no regression. Renderer functions are reused unchanged; only this
+# private mode and fall back to the previous Clear-Host-style flicker.
+# No regression. Renderer functions are reused unchanged; only this
 # loop emits the wrapper sequences.
 #
 # VT control sequences (alt buffer, sync mode, cursor hide/show, clear,
@@ -3193,23 +3196,22 @@ function Invoke-UsageWatch {
                     # Reconcile at every poll boundary so a refresh that
                     # happened since the last poll is captured into the
                     # tracked slot before we read its bytes for the
-                    # /api/oauth/usage call. Suppressed stdout — any
+                    # /api/oauth/usage call. Suppressed stdout; any
                     # advisory the reconcile emits would flash on every
                     # poll and the per-frame ESC[2J would shred it anyway.
                     Invoke-Reconcile 6>$null | Out-Null
                     $snapshot      = Get-UsageSnapshot -Name $Name
                     $lastPollError = $null
 
-                    # Update the terminal title only on a successful poll
-                    # boundary — matches the user-chosen "only on poll"
-                    # cadence. On a failed poll the previous title (and
-                    # body) persist together until the next tick. OSC 0
-                    # ('ESC ] 0 ; <title> BEL') sets both window and icon
-                    # title; supported by Windows Terminal, modern ConHost,
-                    # VS Code, iTerm2, kitty, alacritty, WezTerm, foot,
-                    # gnome-terminal, mintty. Routed through Write-VTSequence
-                    # for parity with DEC sequences (bypasses the
-                    # OutputRendering=PlainText filter — see Write-VTSequence
+                    # Update the terminal title only on a successful poll;
+                    # on a failed poll the previous title (and body) persist
+                    # together until the next tick. OSC 0 ('ESC ] 0 ; <title>
+                    # BEL') sets both window and icon title; supported by
+                    # Windows Terminal, modern ConHost, VS Code, iTerm2,
+                    # kitty, alacritty, WezTerm, foot, gnome-terminal,
+                    # mintty. Routed through Write-VTSequence for parity
+                    # with DEC sequences (bypasses the
+                    # OutputRendering=PlainText filter; see Write-VTSequence
                     # docblock).
                     Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot))
                 }
@@ -3217,30 +3219,30 @@ function Invoke-UsageWatch {
                     # Keep the previous snapshot visible. If the very first
                     # poll failed we still need to show SOMETHING below the
                     # header, so render an empty frame and surface the
-                    # error in the footer — the user can still quit cleanly.
+                    # error in the footer; the user can still quit cleanly.
                     $lastPollError = $_.Exception.Message
                 }
                 $lastPoll = $now
             }
 
-            $secsToNext = [math]::Max(0, [int][math]::Ceiling($Interval - ($now - $lastPoll).TotalSeconds))
-            $footerLines = @(
-                "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))  |  next in ${secsToNext}s"
-            )
+            # Footer rebuilt every tick. The string is constant between
+            # poll boundaries (timestamp updates only on poll), but the
+            # rebuild is a cheap concat and keeps the redraw path single-
+            # branch. Multi-line only when the previous poll failed.
+            $footer = "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))"
             if ($lastPollError) {
-                $footerLines += "[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next tick)"
+                $footer += "`n[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next tick)"
             }
-            $footer = $footerLines -join "`n"
 
             # Atomic frame: begin sync update, clear screen, cursor home,
             # draw via the existing renderer, end sync update. All output
             # between ESC[?2026h and ESC[?2026l is buffered by the
-            # terminal and presented in one swap — no flicker on
+            # terminal and presented in one swap; no flicker on
             # terminals that support the mode (Win Terminal, VS Code,
             # iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal,
             # mintty, modern ConHost). Older terminals ignore the
             # unknown DEC mode markers and exhibit the prior
-            # Clear-Host-style flicker — no regression.
+            # Clear-Host-style flicker; no regression.
             Write-VTSequence "`e[?2026h`e[2J`e[H"
             if ($null -ne $snapshot) {
                 Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer
@@ -3251,10 +3253,12 @@ function Invoke-UsageWatch {
             }
             Write-VTSequence "`e[?2026l"
 
-            # 1-second inter-frame wait. Ctrl-C terminates the loop via
-            # the runtime's default handler; the surrounding `finally`
-            # block leaves the alt buffer and restores cursor visibility
-            # on exit.
+            # 1-second inter-frame wait. Decoupling redraw cadence from
+            # poll cadence lets the screen self-heal on terminal resize
+            # within ~1 s instead of waiting up to -Interval seconds.
+            # Ctrl-C terminates the loop via the runtime's default
+            # handler; the surrounding `finally` block leaves the alt
+            # buffer and restores cursor visibility on exit.
             Start-Sleep -Seconds 1
         }
     }
@@ -3265,7 +3269,7 @@ function Invoke-UsageWatch {
         # .NET-side state.
         if ($enteredAlt) {
             # Restore the pre-watch terminal title via OSC 0. Empty
-            # payload when capture failed (RawUI unavailable) — most
+            # payload when capture failed (RawUI unavailable); most
             # terminals reset the tab label to their profile default
             # (Windows Terminal: profile name; VS Code: shell name).
             # Emitted before the alt-buffer leave so the title swap and

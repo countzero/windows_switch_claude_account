@@ -3,8 +3,8 @@
 # This file is intentionally NOT a function library. Wrapping the body in a
 # function would break PowerShell scoping: `. $script:ScriptPath` inside a
 # function dot-sources into the function's local scope, so the script's
-# top-level $CredDir / $CredFile / $ProfilePath bindings — and the functions
-# defined under switch_claude_account.ps1 — would not be visible to the
+# top-level $CredDir / $CredFile / $ProfilePath bindings, and the functions
+# defined under switch_claude_account.ps1, would not be visible to the
 # enclosing It block. Dot-sourcing this snippet from a BeforeEach script
 # block instead places every assignment and function into the BeforeEach's
 # test scope, which is exactly what Pester 5 expects.

@@ -96,7 +96,7 @@ Describe 'switch_claude_account' {
             # Saved slot + .credentials.json byte-equal: reconcile sees a
             # hash match, no-ops, and the table renders the saved slot
             # directly. The synth <active> row that previous versions
-            # appended on broken-hardlink state is gone — the active slot
+            # appended on broken-hardlink state is gone; the active slot
             # file IS the active credentials post-reconcile.
             $slotPath = New-Slot -Name 'work'
             Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
@@ -270,7 +270,7 @@ Describe 'switch_claude_account' {
         #
         # Regression for the bug originally reported via screenshot: a 429
         # from /v1/oauth/token surfaced as `expired: Response status code
-        # does not indicate success: 429 (Too Many Requests).` — long
+        # does not indicate success: 429 (Too Many Requests).`; long
         # enough to wrap the table row, and mislabeled relative to the
         # 'rate-limited' handling that already existed for the usage
         # endpoint. After the fix the same 429 routes through Test-Is429
@@ -305,7 +305,7 @@ Describe 'switch_claude_account' {
             $after.Length | Should -Be $before.Length
             for ($i = 0; $i -lt $before.Length; $i++) { $after[$i] | Should -Be $before[$i] }
 
-            # Usage endpoint was never called — refresh failure short-circuits.
+            # Usage endpoint was never called; refresh failure short-circuits.
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
         }
 
@@ -360,7 +360,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)^\s+slot-long\b.*\bexpired:'
             # Truncation marker present (the helper appends '...').
             $out | Should -Match 'expired: X+\.\.\.'
-            # The full 200-char tail must NOT appear verbatim — defense-in-depth
+            # The full 200-char tail must NOT appear verbatim; defense-in-depth
             # against the original wrapping bug for non-429 long messages.
             $out | Should -Not -Match ('X' * 100)
         }
@@ -397,7 +397,7 @@ Describe 'switch_claude_account' {
 
             $parsed = Invoke-UsageAction -Json | ConvertFrom-Json
             $parsed.fresh.status | Should -Be 'ok'
-            # Property either absent or explicitly false — never true.
+            # Property either absent or explicitly false; never true.
             $hasField = ($parsed.fresh | Get-Member -Name 'is_cached_fallback' -MemberType NoteProperty)
             if ($hasField) { $parsed.fresh.is_cached_fallback | Should -Not -Be $true }
         }
@@ -667,7 +667,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match "Slot 'alpha'"
             $out | Should -Not -Match "Slot 'bravo'"
 
-            # The two rendered buckets — labels match the table column
+            # The two rendered buckets; labels match the table column
             # headers and the aggregate-bar labels.
             $out | Should -Match '(?m)^\s+Session\s+\d'
             $out | Should -Match '(?m)^\s+Week\s+\d'
@@ -740,7 +740,7 @@ Describe 'switch_claude_account' {
         It 'reconcile auto-saves an unknown active credential under a fresh name' {
             # No saved slots, .credentials.json present with novel tokens.
             # Identity comes from ~/.claude.json (post-v2.1.0 probe), so
-            # set that up too — without it the auto-save would write a
+            # set that up too; without it the auto-save would write a
             # sidecar-less invisible slot and the table assertion below
             # wouldn't find a row.
             $payload = @{
@@ -883,7 +883,7 @@ Describe 'switch_claude_account' {
         It 'returns true for the real System.Net.HttpStatusCode enum value' {
             # PS7's Invoke-RestMethod surfaces 429 via HttpResponseException
             # whose Response.StatusCode is an [HttpStatusCode] enum. Casting
-            # that enum to [int] yields 429 — Test-Is429 must accept it.
+            # that enum to [int] yields 429; Test-Is429 must accept it.
             $ex = [System.Exception]::new('rate limited')
             $ex | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = [System.Net.HttpStatusCode]::TooManyRequests })
             Test-Is429 $ex | Should -BeTrue
@@ -1297,7 +1297,7 @@ Describe 'switch_claude_account' {
             $res.Email  | Should -Be 'alice@example.com'
 
             # No caching: a second call fires another HTTP request. This
-            # is by design — email is now encoded in the slot filename at
+            # is by design; email is now encoded in the slot filename at
             # save time, so Get-SlotProfile is only called at save time.
             Get-SlotProfile -SlotPath $slot | Out-Null
             Should -Invoke Invoke-RestMethod -Times 2 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' }
@@ -1419,7 +1419,7 @@ Describe 'switch_claude_account' {
                     rateLimitTier    = 'default_claude_max_5x'
                 }
             } | ConvertTo-Json -Compress
-            # Labeled filename directly — no save-time fetch involved.
+            # Labeled filename directly; no save-time fetch involved.
             $labeled = '.credentials.work(ada.lovelace@arpa.net).json'
             $slotPath = Join-Path $script:CredDirPath $labeled
             Set-Content -LiteralPath $slotPath -Value $payload -NoNewline -Encoding utf8NoBOM
@@ -1432,7 +1432,7 @@ Describe 'switch_claude_account' {
             # continuation line anywhere.
             $out | Should -Match '(?m)^\s+work\s+ada\.lovelace@arpa\.net\b'
             $out | Should -Not -Match '└─'
-            # Zero profile HTTP calls on the display path — email is from
+            # Zero profile HTTP calls on the display path; email is from
             # the filename, not the endpoint.
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' }
         }

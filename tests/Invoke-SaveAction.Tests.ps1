@@ -5,7 +5,7 @@
 #
 # Post-v2.1.0 contract:
 #   * Identity comes primarily from ~/.claude.json's oauthAccount block
-#     (same source Claude Code uses for /status — drift-proof).
+#     (same source Claude Code uses for /status, drift-proof).
 #   * /api/oauth/profile is a fallback when ~/.claude.json has no
 #     oauthAccount yet (rare).
 #   * Both sources missing -> refuse to save (no unlabeled slots).
@@ -116,7 +116,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'refuses to save when neither ~/.claude.json nor /api/oauth/profile yields an identity' {
-            # No ~/.claude.json at all — Get-OAuthAccountFromClaudeJson
+            # No ~/.claude.json at all; Get-OAuthAccountFromClaudeJson
             # returns $null. Common.ps1's default mock makes the profile
             # call throw, which Get-SlotProfile reports as 'error'.
             Remove-Item -LiteralPath $ClaudeJsonPath -Force -ErrorAction SilentlyContinue
@@ -199,7 +199,7 @@ Describe 'switch_claude_account' {
         }
 
         # Save while Claude Code holds .credentials.json open (with
-        # FILE_SHARE_DELETE) must succeed for the read of bytes — Claude
+        # FILE_SHARE_DELETE) must succeed for the read of bytes; Claude
         # Code is closed by contract (refuse-while-running guard) but a
         # background process (antivirus) might have it open. Regression
         # guard for the atomic-rename property.

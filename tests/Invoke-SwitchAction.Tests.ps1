@@ -60,7 +60,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'refuses to switch to a slot that has no sidecar (post-v2.1.0)' {
-            # Bare slot file without sidecar — invisible, treated as "not found".
+            # Bare slot file without sidecar; invisible, treated as "not found".
             Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.legacy.json') -Value 'L' -NoNewline
 
             { Invoke-SwitchAction -Name 'legacy' 6>$null } | Should -Throw -ExpectedMessage "*Slot 'legacy' not found*"
@@ -256,8 +256,8 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
 
-            # New wording: "Start Claude Code to apply the new identity"
-            # — both the email-in-status and the tokens are now swapped
+            # New wording: "Start Claude Code to apply the new identity";
+            # both the email-in-status and the tokens are now swapped
             # together, so on next start /status reflects the new slot
             # immediately. Also assert the previous "Restart Claude
             # Code…running sessions" wording is gone, since the in-memory
@@ -362,7 +362,7 @@ Describe 'switch_claude_account' {
         # /api/oauth/profile-fallback sidecars carry only emailAddress; the
         # other four whitelisted fields default to $null. Switching to such
         # a slot must NOT overwrite Claude Code's populated ~/.claude.json
-        # cache with null literals — the cached value is the better source
+        # cache with null literals; the cached value is the better source
         # of truth than no value.
         It 'preserves populated ~/.claude.json fields when sidecar carries nulls' {
             Set-SandboxClaudeJson `
@@ -432,7 +432,7 @@ Describe 'switch_claude_account' {
         }
 
         # Failure path: ~/.claude.json missing or malformed shouldn't
-        # cascade into a broken switch — the credentials swap already
+        # cascade into a broken switch; the credentials swap already
         # happened, we just emit a yellow advisory.
         It 'tolerates ~/.claude.json missing (yellow advisory; tokens still swap)' {
             Remove-Item -LiteralPath $ClaudeJsonPath -Force -ErrorAction SilentlyContinue
