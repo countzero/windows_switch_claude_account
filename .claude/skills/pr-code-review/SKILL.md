@@ -51,16 +51,20 @@ overall design of the change:
    PR description (when a PR exists). Flag if the change does more or less
    than those stated goals.
 2. **Placement:** Do the changes live in the correct place? This repo's
-    layout:
-    - `switch_claude_account.ps1` — the entire application: parameter
-      parsing, name sanitization (`Get-SafeName`), profile management
-      (`Add-To-Profile`/`Remove-From-Profile`), and credential slot actions
-      (save/switch/list/remove).
-    - `README.md` — usage documentation.
-    - `.gitignore` — excludes `.claude/` directory.
-    There is no test suite; correctness is validated through manual runs.
-    Flag changes that mix concerns inappropriately (e.g., credential logic
-    embedded in profile management, or profile logic in credential actions).
+   layout:
+   - `switch_claude_account.ps1` — the entire application. Top-level
+     dispatcher in `Invoke-Main`; each action body is an `Invoke-*Action`
+     function. New actions go in their own `Invoke-<Action>Action` function
+     with a one-line dispatch in `Invoke-Main`.
+   - `tests/` — Pester 5 test suite, one file per action. Shared setup in
+     `tests/Common.ps1`.
+   - `.claude/rules/script-internals.md` and `.claude/rules/tests.md` —
+     deeper conventions for the script and tests respectively.
+   - `README.md` — usage documentation.
+   Flag changes that mix concerns inappropriately (e.g., credential logic
+   embedded in profile management, or profile logic in credential actions),
+   or that violate the reconcile rule documented in `CLAUDE.md` (which
+   actions must call `Invoke-Reconcile` first).
 3. **Complexity:** Is any part of the change more complex than necessary?
    Flag over-engineering, unnecessary abstractions, or functionality that
    is not required by the stated goal.
@@ -104,11 +108,12 @@ Skip any finding that:
 
 **Pass 1 — General scan:**
 Review the diff. Report all defects: bugs, logic errors, security issues, bad
-practices, missing validation, incorrect error handling. This project has no
-test suite — do not flag missing test coverage as a defect. Also check the
-project-specific concerns listed in the Project-Specific Review Checklist
-section below. Only flag defects in lines that are added or modified in this
-PR.
+practices, missing validation, incorrect error handling. For new or
+significantly changed functions in `switch_claude_account.ps1`, check whether
+corresponding test files in `tests/` cover the changed behavior; flag missing
+test coverage as a finding. Also check the project-specific concerns listed
+in the Project-Specific Review Checklist section below. Only flag defects in
+lines that are added or modified in this PR.
 
 **Pass 2 — What was missed:**
 Review the diff again, assuming defects were missed on the first pass. Focus
@@ -178,9 +183,13 @@ After Pass 3:
    - **Medium:** Bad practice that could lead to bugs, missing validation for
      unlikely but possible inputs, minor logic issue.
 5. **Filter:** Keep only Critical, High, and Medium.
-6. **Output in conversation:** One table per severity level, following the
-   link format rules in the Link Format section below. Omit a severity level
-   if it has no defects.
+6. **Compute report metadata:** files changed and additions/deletions via
+   `git diff --shortstat <base>...HEAD`; current timestamp; severity counts.
+7. **Output in conversation:** title (`# PR Review` + `## <branch> (vs <base>)`),
+   metadata table (see Output Template), Design section, then one table per
+   severity level following the Link Format rules. Omit a severity level if
+   it has no defects. If all severity buckets are empty, print
+   `No Critical/High/Medium findings.` in place of the severity tables.
 
 No data is written to GitHub. The developer or reviewer uses the output to
 manually create PR comments.
@@ -239,22 +248,53 @@ from the repository root with a leading `/`.
 **Full output template:**
 
 ```markdown
+# PR Review
+
+## <branch-or-head7> (vs <base>)
+
+| Field     | Value                                                                                                                                                       |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Branch    | [`<branch>`](https://github.com/OWNER/REPO/tree/<branch>) → [`<base>`](https://github.com/OWNER/REPO/tree/<base>)                                           |
+| HEAD      | [`<head7>`](https://github.com/OWNER/REPO/commit/<head7>)                                                                                                   |
+| PR        | [#42](https://github.com/OWNER/REPO/pull/42) (or `none` when no PR is open)                                                                                 |
+| Generated | YYYY-MM-DD HH:MM                                                                                                                                            |
+| Diff      | 3 files · +120 · −45                                                                                                                                        |
+| Findings  | 🔴 0 Critical · 🟠 1 High · 🟡 2 Medium                                                                                                                     |
+
 ### Design
 
 - <Qualitative observation about scope, placement, or complexity>
 
 ### Critical
 
-| File                                                                                                          | Description                       |
-| ------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| [/switch_claude_account.ps1:41-43](https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43) | Credentials leaked to stdout    |
+| File                                                                                                                  | Description                       |
+| --------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| [/switch_claude_account.ps1:41-43](https://github.com/owner/repo/pull/42/files#diff-a1b2c3d4e5f6a7b8c9d0e1f2a3R41-R43) | Credentials leaked to stdout      |
 
 ### High
 
-| File                                                                                                          | Description                       |
-| ------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| File                                                                                                                  | Description                       |
+| --------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
 | [/switch_claude_account.ps1:14-19](https://github.com/owner/repo/pull/42/files#diff-f6a7b8c9d0a1b2c3d4e5f6a7b8R14-R19) | Name not sanitized before file op |
 ```
+
+**Metadata-row formatting rules:**
+
+- **Branch:** link both branches to GitHub tree URLs:
+  `https://github.com/<owner>/<repo>/tree/<branch-name>`. Multi-segment
+  branch names (e.g. `feature/foo`) work without encoding because the
+  `tree/` path accepts literal slashes; percent-encode any branch name that
+  contains spaces or other reserved characters.
+- **HEAD:** use the 7-char short SHA in both the link label and the URL
+  (`/commit/<head7>`). GitHub redirects `/commit/<short>` to the full
+  commit, so the link resolves identically.
+- **PR:** the PR number when one exists, `none` otherwise.
+- **Diff:** plain text. Format: `<files> files · +<additions> · −<deletions>`,
+  with middle dots (` · `, U+00B7) as separators. Use the Unicode minus sign
+  (U+2212, `−`) for the deletions count, not the ASCII hyphen-minus.
+- **Findings:** `🔴 <n> Critical · 🟠 <n> High · 🟡 <n> Medium`. Severity
+  glyphs replace coloured pills to keep the recipe free of custom CSS while
+  staying scannable. Always show all three severities, even when zero.
 
 ### Constraints
 

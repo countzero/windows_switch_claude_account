@@ -4,3 +4,4 @@ node_modules/
 tests/TestResults/
 *.sublime-workspace
 .claude/worktrees/
+.tmp/

@@ -134,4 +134,50 @@ When asked to make a change, always follow these steps in order:
 
 PowerShell has no separate typecheck step — parse-time validation runs implicitly when the script is dot-sourced or invoked. PSScriptAnalyzer lint runs inside `Invoke-Tests.ps1` in advisory (non-fatal) mode, so a single command covers both tests and lint.
 
-Commit and push are **not** performed automatically. Only commit when the user explicitly requests it, and only push when the user explicitly requests it. These are separate steps — "commit" does not imply "push."
+Commit and push are **not** performed automatically. Only commit when the user explicitly requests it, and only push when the user explicitly requests it. These are separate steps; "commit" does not imply "push."
+
+## Scratch files
+
+Ad-hoc agent artifacts (screenshots, diffs, scratch scripts, traces) go under `.tmp/sessions/<session-id>/`. `.tmp/` is gitignored. Never write scratch files to `.claude/`, the repo root, or `tests/`.
+
+## Multi-Agent Working Tree Discipline
+
+Multiple agents may share this directory; foreign uncommitted changes and untracked files are untouchable.
+
+1. **Foreign changes off-limits.** Never run `git checkout --`, `restore --`, `reset --hard`, `clean`, `rm`, `mv`, or `git stash pop/apply` on a path another agent modified or an untracked file another agent created. "Commit and push" does NOT authorise destructive cleanup of foreign paths.
+2. **Preflight.** `git status --porcelain -u` at task start and again before `git commit`.
+3. **Session-scoped scratch.** Use `<session-id>` from your runtime's session metadata if exposed; otherwise mint `YYYYMMDD-HHMMSS-<random6>`.
+4. **Stashes session-scoped.** Only with explicit pathspec and tagged message: `git stash push --message "session-<id>: <reason>" -- <files>`. Bare `git stash`, `-u`, `--all`, and pop/apply of foreign stashes are forbidden.
+5. **Edit and shell writes are mutually exclusive per file.** If a file was written outside the Edit tool, the cached content is stale. Re-Read before the next Edit. If Edit fails with "oldString not found", assume concurrent foreign write: surface to the user, do not guess.
+6. **Worktrees.** `.claude/worktrees/<branch-name>/` is gitignored. Cleanup with `git worktree remove <path>`; no `--force`.
+
+When your changes overlap foreign WIP in the same file, stop and ask. Do not reset, restore, or stash.
+
+## Version Control
+
+- [Semantic Versioning](https://semver.org/).
+- Changelog follows [Common Changelog](https://common-changelog.org).
+- LF line endings enforced via `.gitattributes`.
+- No `Co-Authored-By` trailer in commit messages.
+
+## Skills
+
+- `plan-review` (`.claude/skills/plan-review/`): second-pass design review before non-trivial plans.
+- `pr-code-review` (`.claude/skills/pr-code-review/`): multi-pass PR review.
+
+## Punctuation: prefer specific marks over the em dash
+
+The em dash (`—`) is reserved for genuine emphatic interruption or a sudden change in thought. For every other use, prefer the more specific mark; rewriting the sentence is also acceptable.
+
+| Use case                                      | Preferred mark   |
+| --------------------------------------------- | ---------------- |
+| Short aside tightly bound to the sentence     | `,` `,`          |
+| Tangential aside                              | `(` `)`          |
+| Introducing an explanation, list, or summary  | `:`              |
+| Joining two related independent clauses       | `;` or `.`       |
+| Rhetorical "not X — Y" contrast               | rewrite or `.`   |
+| Numeric or date range                         | `–` (en dash)    |
+| Compound modifier                             | `-` (hyphen)     |
+| Interrupted dialogue or genuine break in flow | `—` (keep it)    |
+
+Do not mechanically strip em dashes; keep the dash where it's the right mark. The rule is to stop using `—` as a default joiner where `:`, `;`, `,`, `(...)`, or a period would be clearer.
