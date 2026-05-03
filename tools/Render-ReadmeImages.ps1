@@ -35,14 +35,36 @@
     huge invisible gap between the fill and the closing bracket. Bar
     widths and percentages are unchanged from the README.
 
-    Color SGR map (must match Write-Color in switch_claude_account.ps1
-    around line 858):
-        DarkYellow -> ANSI 33  (warm amber, headers)
-        DarkGray   -> ANSI 90  (mid gray, footer / Account label)
-        Green      -> ANSI 92  (active+ok rows, green bars)
-        Yellow     -> ANSI 93  (yellow bars, near-limit rows)
-        Red        -> ANSI 91  (red bars, limited rows)
-        Gray       -> ANSI 37  (inactive+ok rows)
+    Why truecolor SGR (`ESC[38;2;R;G;Bm`) instead of named ANSI (`ESC[33m`,
+    `ESC[92m`, ...):
+
+    `freeze` interprets named SGR codes through its own hardcoded RGB map
+    (the `ansiPalette` map in `freeze/ansi.go`), which uses the vivid
+    charm palette (e.g. BrightGreen = #00D787, a turquoise). That does
+    NOT match what users see in the default Windows Terminal "Campbell"
+    scheme (e.g. BrightGreen = #16C60C, a pure green). Since the SVGs are
+    documentation of what `sca usage` looks like in the terminal, they
+    should match the modal user's view, not freeze's house style.
+
+    `freeze` does, however, honor truecolor SGR sequences and writes the
+    R;G;B values through verbatim as `fill="#RRGGBB"` (see the `case 38:
+    case 2:` branch in `freeze/ansi.go`). So we sidestep the hardcoded
+    palette by emitting Campbell hexes directly via truecolor.
+
+    Color map (logical name -> Campbell hex -> where it shows):
+        DarkYellow -> #C19C00  headers, bar percent label
+        DarkGray   -> #767676  footer, Account label
+        Green      -> #16C60C  active rows, ok status, green bars
+        Yellow     -> #F9F1A5  yellow bars, near-limit rows
+        Red        -> #E74856  red bars, limited rows
+        Gray       -> #CCCCCC  inactive ok rows
+
+    Logical name = the value passed to `Write-Color` in
+    switch_claude_account.ps1 around line 858. The mapping there from
+    logical name to `$PSStyle` SGR (DarkYellow -> 33, Green -> 92, ...)
+    is a runtime artifact of how Windows Terminal renders those SGRs as
+    Campbell hexes; here we burn the hexes in directly so the SVGs are
+    independent of any terminal palette.
 
 .PARAMETER OutputDir
     Where to write the rendered SVGs. Default: <repo>/docs/images.
@@ -106,14 +128,18 @@ $tmpRoot = Join-Path $repoRoot '.tmp/render'
 New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 
 # --- ANSI SGR helpers -------------------------------------------------------
+# Truecolor SGR (`ESC[38;2;R;G;Bm`) targeting Microsoft's Campbell palette
+# (Windows Terminal default) so the rendered SVGs match what users see in
+# default `pwsh.exe`, not freeze's hardcoded charm palette. See
+# .DESCRIPTION above for rationale.
 $ESC = [char]27
 $RESET  = "$ESC[0m"
-$DKYEL  = "$ESC[33m"   # DarkYellow  (headers)
-$DKGRY  = "$ESC[90m"   # DarkGray    (footer, Account label)
-$GREEN  = "$ESC[92m"   # Green       (active+ok rows, green bars)
-$YELLO  = "$ESC[93m"   # Yellow      (yellow bars, near-limit rows)
-$RED    = "$ESC[91m"   # Red         (red bars, limited rows)
-$GRAY   = "$ESC[37m"   # Gray        (inactive+ok rows)
+$DKYEL  = "$ESC[38;2;193;156;0m"    # #C19C00  Campbell Yellow      (DarkYellow)
+$DKGRY  = "$ESC[38;2;118;118;118m"  # #767676  Campbell Brt Black   (DarkGray)
+$GREEN  = "$ESC[38;2;22;198;12m"    # #16C60C  Campbell Brt Green   (Green)
+$YELLO  = "$ESC[38;2;249;241;165m"  # #F9F1A5  Campbell Brt Yellow  (Yellow)
+$RED    = "$ESC[38;2;231;72;86m"    # #E74856  Campbell Brt Red     (Red)
+$GRAY   = "$ESC[38;2;204;204;204m"  # #CCCCCC  Campbell White       (Gray)
 
 # --- Block 1: usage -Watch (README ~lines 17-33) ---------------------------
 # Multi-slot watch frame with 5 rows; bars at 22% (green) / 62% (yellow);
@@ -170,12 +196,14 @@ $scenarios = @(
 
 # --- Render -----------------------------------------------------------------
 # freeze flags rationale:
-#   --language ansi   : interpret SGR codes in input
-#   --window          : macOS-style traffic-light chrome (per user preference)
-#   --padding 30      : breathing room inside the window
-#   --margin 20       : drop-shadow space around the window
-#   --font.size 14    : default; readable in README at GitHub's render width
-#   --line-height 1.4 : avoids cramped vertical spacing
+#   --language ansi      : interpret SGR codes in input
+#   --window             : macOS-style traffic-light chrome (per user preference)
+#   --background #0C0C0C : Campbell terminal background; pairs with the Campbell
+#                          truecolor palette burned into the SGR helpers above
+#   --padding 30         : breathing room inside the window
+#   --margin 20          : drop-shadow space around the window
+#   --font.size 14       : default; readable in README at GitHub's render width
+#   --line-height 1.4    : avoids cramped vertical spacing
 # Font defaults to JetBrains Mono and is embedded as a base64 woff2 in the
 # SVG, so the rendered output is pixel-identical regardless of the
 # viewer's installed fonts. Adds ~300 KB per SVG, acceptable for README
@@ -193,6 +221,7 @@ foreach ($s in $scenarios) {
     & $freezeExe `
         --language    ansi `
         --window `
+        --background  '#0C0C0C' `
         --padding     30 `
         --margin      20 `
         --font.size   14 `

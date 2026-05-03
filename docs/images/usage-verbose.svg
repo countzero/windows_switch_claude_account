@@ -8,8 +8,8 @@
 	font-weight: normal;
 	font-style: normal;
 }
-</style><rect width="493.33" height="188.33" fill="#171717" x="20.00px" y="20.00px"/>
+</style><rect width="493.33" height="188.33" fill="#0c0c0c" x="20.00px" y="20.00px"/>
 <g font-family="JetBrains Mono" font-size="14.00px" fill="#c4c4c4" clip-path="url(#terminalMask)">
-<text x="50.00px" y="84.60px" xml:space="preserve"><tspan xml:space="preserve" fill="#D3E561">[Usage] Slot &apos;work&apos; (active)</tspan><tspan xml:space="preserve"/></text><text x="50.00px" y="104.20px" xml:space="preserve"><tspan xml:space="preserve" fill="#4B4B4B">  Account: alex@acme.io</tspan><tspan xml:space="preserve"/></text><text x="50.00px" y="123.80px" xml:space="preserve"><tspan xml:space="preserve" fill="#00D787">  Status:  ok</tspan><tspan xml:space="preserve"/></text><text x="50.00px" y="143.40px" xml:space="preserve"><tspan xml:space="preserve">  Session     18%  Resets 7:50pm Europe/Berlin</tspan></text><text x="50.00px" y="163.00px" xml:space="preserve"><tspan xml:space="preserve">  Week        42%  Resets Apr 28, 9am Europe/Berlin</tspan></text>
+<text x="50.00px" y="84.60px" xml:space="preserve"><tspan xml:space="preserve" fill="#c19c00">[Usage] Slot &apos;work&apos; (active)</tspan><tspan xml:space="preserve"/></text><text x="50.00px" y="104.20px" xml:space="preserve"><tspan xml:space="preserve" fill="#767676">  Account: alex@acme.io</tspan><tspan xml:space="preserve"/></text><text x="50.00px" y="123.80px" xml:space="preserve"><tspan xml:space="preserve" fill="#16c60c">  Status:  ok</tspan><tspan xml:space="preserve"/></text><text x="50.00px" y="143.40px" xml:space="preserve"><tspan xml:space="preserve">  Session     18%  Resets 7:50pm Europe/Berlin</tspan></text><text x="50.00px" y="163.00px" xml:space="preserve"><tspan xml:space="preserve">  Week        42%  Resets Apr 28, 9am Europe/Berlin</tspan></text>
 </g>
 <svg x="20.00px" y="20.00px"><circle cx="13.50" cy="12.00" r="5.50" fill="#FF5A54"/><circle cx="32.50" cy="12.00" r="5.50" fill="#E6BF29"/><circle cx="51.50" cy="12.00" r="5.50" fill="#52C12B"/></svg></svg>
