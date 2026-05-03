@@ -34,8 +34,8 @@ Describe 'switch_claude_account' {
 
             Test-Path -LiteralPath $script:FakeProfilePath | Should -BeTrue
             $content = Get-Content -LiteralPath $script:FakeProfilePath -Raw
-            $content | Should -Match '# === Claude Account Switcher ==='
-            $content | Should -Match '# === End Claude Account Switcher ==='
+            $content | Should -Match '# === Switch Claude Account ==='
+            $content | Should -Match '# === End Switch Claude Account ==='
             $content | Should -Match 'switch_claude_account_caller'
             $content | Should -Match 'Set-Alias -Name sca'
             $content | Should -Match 'Set-Alias -Name switch-claude-account'
@@ -49,7 +49,7 @@ Describe 'switch_claude_account' {
             Add-To-Profile 6>$null
 
             $content = Get-Content -LiteralPath $script:FakeProfilePath -Raw
-            $content | Should -Match "existing'\r?\n\r?\n# === Claude Account Switcher ==="
+            $content | Should -Match "existing'\r?\n\r?\n# === Switch Claude Account ==="
         }
 
         It 'install is byte-idempotent (two runs produce identical files)' {
@@ -117,7 +117,7 @@ Describe 'switch_claude_account' {
 
             $post = Get-Content -LiteralPath $script:FakeProfilePath -Encoding unicode -Raw
             $post | Should -Match 'ä ö ü'
-            $post | Should -Not -Match 'Claude Account Switcher'
+            $post | Should -Not -Match 'Switch Claude Account'
         }
 
         It 'install + uninstall round-trip preserves UTF-8 with BOM' {
@@ -134,11 +134,11 @@ Describe 'switch_claude_account' {
 
             $post = Get-Content -LiteralPath $script:FakeProfilePath -Raw
             $post | Should -Match 'bom test'
-            $post | Should -Not -Match 'Claude Account Switcher'
+            $post | Should -Not -Match 'Switch Claude Account'
         }
 
         It 'uninstall throws and leaves file byte-identical when only start marker is present' {
-            $orphan = "# stuff`r`n# === Claude Account Switcher ===`r`nWrite-Host 'dangling'`r`n"
+            $orphan = "# stuff`r`n# === Switch Claude Account ===`r`nWrite-Host 'dangling'`r`n"
             Set-Content -LiteralPath $script:FakeProfilePath -Value $orphan -Encoding utf8NoBOM -NoNewline
             $before = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
 
@@ -149,7 +149,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'uninstall throws when only end marker is present' {
-            $orphan = "# stuff`r`n# === End Claude Account Switcher ===`r`nWrite-Host 'x'`r`n"
+            $orphan = "# stuff`r`n# === End Switch Claude Account ===`r`nWrite-Host 'x'`r`n"
             Set-Content -LiteralPath $script:FakeProfilePath -Value $orphan -Encoding utf8NoBOM -NoNewline
 
             { Remove-From-Profile 6>$null } | Should -Throw -ExpectedMessage '*orphan*'

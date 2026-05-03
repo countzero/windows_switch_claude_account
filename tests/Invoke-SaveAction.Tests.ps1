@@ -171,9 +171,64 @@ Describe 'switch_claude_account' {
             # an invisible (sidecar-less) slot behind.
             Mock Write-Sidecar -MockWith { throw [System.Exception]::new('disk full') }
 
-            { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Failed to write sidecar*'
+            { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Save failed for slot*previous slot state*'
 
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json') | Should -BeFalse
+        }
+
+        # Re-saving an existing slot whose account has changed: the old
+        # labeled pair must be restored on sidecar-write failure so the
+        # user is never left without a slot for this name. Regression
+        # guard for the "delete-before-write" bug.
+        It 'restores the pre-existing labeled pair when sidecar write fails (different-email re-save)' {
+            $oldSlotPath    = Join-Path $script:CredDirPath '.credentials.work(old@example.com).json'
+            $oldSidecarPath = Join-Path $script:CredDirPath '.credentials.work(old@example.com).account.json'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'old@example.com' -Content 'OLDBYTES' | Out-Null
+            $oldSlotBytes    = [System.IO.File]::ReadAllBytes($oldSlotPath)
+            $oldSidecarBytes = [System.IO.File]::ReadAllBytes($oldSidecarPath)
+
+            # ~/.claude.json says alice@example.com (the default fixture).
+            Set-Content -LiteralPath $script:CredFilePath -Value 'NEWBYTES' -NoNewline
+
+            Mock Write-Sidecar -MockWith { throw [System.Exception]::new('disk full') }
+
+            { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Save failed for slot*previous slot state*'
+
+            # Old pair restored byte-equal.
+            Test-Path -LiteralPath $oldSlotPath    | Should -BeTrue
+            Test-Path -LiteralPath $oldSidecarPath | Should -BeTrue
+            [System.IO.File]::ReadAllBytes($oldSlotPath)    | Should -Be $oldSlotBytes
+            [System.IO.File]::ReadAllBytes($oldSidecarPath) | Should -Be $oldSidecarBytes
+
+            # New-email pair absent.
+            Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json')         | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).account.json') | Should -BeFalse
+        }
+
+        # Re-saving an existing slot for the SAME account (the typical
+        # token-refresh capture case): finalSlotPath coincides with the
+        # snapshot path, so the atomic Replace overwrites the old bytes
+        # in place. On sidecar failure we must restore those bytes from
+        # the in-memory snapshot, not just delete the new tokens file.
+        It 'restores the pre-existing pair byte-equal when sidecar write fails (same-email re-save)' {
+            $slotPath    = Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json'
+            $sidecarPath = Join-Path $script:CredDirPath '.credentials.work(alice@example.com).account.json'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'OLD' | Out-Null
+            $oldSlotBytes    = [System.IO.File]::ReadAllBytes($slotPath)
+            $oldSidecarBytes = [System.IO.File]::ReadAllBytes($sidecarPath)
+
+            Set-Content -LiteralPath $script:CredFilePath -Value 'NEW' -NoNewline
+
+            Mock Write-Sidecar -MockWith { throw [System.Exception]::new('disk full') }
+
+            { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Save failed for slot*previous slot state*'
+
+            # Tokens at the path reverted to OLD bytes (atomic Replace
+            # already overwrote them; restore put them back).
+            Test-Path -LiteralPath $slotPath    | Should -BeTrue
+            Test-Path -LiteralPath $sidecarPath | Should -BeTrue
+            [System.IO.File]::ReadAllBytes($slotPath)    | Should -Be $oldSlotBytes
+            [System.IO.File]::ReadAllBytes($sidecarPath) | Should -Be $oldSidecarBytes
         }
     }
 

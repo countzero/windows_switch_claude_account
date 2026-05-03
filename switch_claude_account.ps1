@@ -1,4 +1,5 @@
 #Requires -Version 7.2
+# SPDX-License-Identifier: MIT
 
 <#
 .SYNOPSIS
@@ -119,8 +120,8 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
 # a single source of truth.
-$MarkerStart = "# === Claude Account Switcher ==="
-$MarkerEnd   = "# === End Claude Account Switcher ==="
+$MarkerStart = "# === Switch Claude Account ==="
+$MarkerEnd   = "# === End Switch Claude Account ==="
 
 # --- Unofficial /api/oauth/usage constants ---
 #
@@ -766,7 +767,7 @@ function Show-Help {
 
     $lines = @(
         "",
-        "Claude Account Switcher - manage multiple Claude Code logins on Windows.",
+        "Switch Claude Account - manage multiple Claude Code logins on Windows.",
         "",
         "USAGE",
         "  $cmd <action> [name]",
@@ -1015,17 +1016,8 @@ function Get-SlotFileName {
 # No automated migration; legacy slots from pre-v2.1.0 simply become
 # invisible until re-saved.
 #
-# As a side effect, this function performs a one-time sweep to delete any
-# leftover .credentials.*.profile.json sidecar files from an earlier
-# version of the tool that used on-disk profile caching. The email is now
-# encoded directly in the slot filename (see Get-SlotFileInfo) so those
-# sidecars are dead weight; removing them prevents stale emails from
-# lingering in the directory. Swallowed errors: if the cleanup can't
-# remove a file (lock / permissions) we leave it and move on; it is
-# cosmetic, not functional.
-#
-# Returns an object with:
-#   Slots : array of { Name, Email, Path, IsActive, Sidecar }
+# Returns an array of slot objects { Name, Email, Path, IsActive, Sidecar },
+# sorted alphabetically by Name. Empty array when no slots saved.
 #
 # Sidecar is the parsed sidecar object (not raw JSON), which Invoke-
 # SwitchAction needs to restore ~/.claude.json. Carrying it inline
@@ -1039,18 +1031,6 @@ function Get-SlotFileName {
 # that want a true offline read should call Get-Slots without first
 # reconciling.
 function Get-Slots {
-    # One-time sidecar cleanup. Cheap (fires only when legacy sidecars
-    # exist). The `.profile.json` shape is from a pre-v1 implementation
-    # entirely separate from the post-v2.1.0 `.account.json` sidecar
-    # that this function actively requires.
-    $orphans = Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.profile.json' -ErrorAction SilentlyContinue
-    foreach ($o in $orphans) {
-        Remove-Item -LiteralPath $o.FullName -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath (Join-Path $CredDir '.credentials.profile.json')) {
-        Remove-Item -LiteralPath (Join-Path $CredDir '.credentials.profile.json') -Force -ErrorAction SilentlyContinue
-    }
-
     # Filter out sidecar files (`.credentials.*.account.json`) themselves
     # so they don't get parsed as slot credentials. The wildcard
     # `.credentials.*.json` would otherwise match them.
@@ -1083,9 +1063,11 @@ function Get-Slots {
         }
     }
 
-    return [pscustomobject]@{
-        Slots = @($slots)
-    }
+    # `foreach` assignment yields $null / scalar / Object[] for 0 / 1 / N
+    # iterations; PowerShell's pipeline unrolls on emit, so callers that
+    # wrap with `@(Get-Slots)` or pipe through Where-Object / ForEach-Object
+    # see the right shape across all three cases.
+    $slots
 }
 
 # Find a slot file by its parsed slot-name, regardless of whether the
@@ -1097,8 +1079,7 @@ function Get-Slots {
 function Find-SlotByName {
     Param ([String] $Name)
 
-    $info = Get-Slots
-    return $info.Slots | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    return Get-Slots | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
 }
 
 # We are determining which slot should become active when `switch` is
@@ -1115,8 +1096,7 @@ function Find-SlotByName {
 # re-looking-up the slot. Active-slot identification reads $StateFile
 # (slot.IsActive populated by Get-Slots from state); no content hashing.
 function Get-NextSlotName {
-    $info  = Get-Slots
-    $slots = @($info.Slots)
+    $slots = @(Get-Slots)
 
     if ($slots.Count -eq 0) {
         throw "No slots saved. Use: sca save <name>"
@@ -1210,7 +1190,7 @@ function Remove-From-Profile {
 
     if (-not $hasStart -and -not $hasEnd) {
         if (-not $Quiet) {
-            Write-Color "[Uninstall] No Claude Account Switcher block found; profile unchanged." 'Yellow'
+            Write-Color "[Uninstall] No Switch Claude Account block found; profile unchanged." 'Yellow'
         }
         return
     }
@@ -1500,37 +1480,102 @@ function Invoke-SaveAction {
     $finalSlotPath = Join-Path $CredDir $finalSlotName
 
     # Find any pre-existing slot files / sidecars for this slot name
-    # (labeled or unlabeled, possibly with stale email). Delete them so
-    # the save is idempotent even when the stored account has changed.
-    # Get-Slots filters out sidecar-less slots, so we enumerate the raw
-    # file system here to also catch invisible legacy slots that share
-    # this slot name.
+    # (labeled or unlabeled, possibly with stale email) and SNAPSHOT
+    # their bytes into memory before any disk mutation. The snapshot is
+    # the rollback source for the catch path: if either the tokens or
+    # sidecar write fails, we restore from these buffers so a transient
+    # failure on a re-save cannot leave the user with no slot for this
+    # name. Get-Slots filters out sidecar-less slots, so we enumerate
+    # the raw file system here to also catch invisible legacy slots
+    # that share this slot name.
+    $snapshots = @()
     $rawFiles = @(
         Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
     )
     foreach ($rf in $rawFiles) {
         $parsed = Get-SlotFileInfo -FileName $rf.Name
-        if ($parsed -and $parsed.Name -eq $safeName -and $rf.FullName -ne $finalSlotPath) {
-            Remove-Item -LiteralPath $rf.FullName -Force -ErrorAction SilentlyContinue
-            Remove-Sidecar -SlotPath $rf.FullName
+        if (-not $parsed -or $parsed.Name -ne $safeName) { continue }
+
+        $snap = [pscustomobject]@{
+            Path         = $rf.FullName
+            Bytes        = $null
+            SidecarPath  = Get-SidecarPath -SlotPath $rf.FullName
+            SidecarBytes = $null
         }
+        try {
+            $snap.Bytes = [System.IO.File]::ReadAllBytes($rf.FullName)
+        }
+        catch {
+            # Read failure (file locked / unreadable). Mark non-restorable
+            # but proceed with the save: refusing on a stale file the
+            # user is explicitly overwriting would be surprising.
+            Write-Color "[Save] WARNING: could not snapshot $($rf.FullName) ($($_.Exception.Message)); rollback for this path will be skipped." 'Yellow'
+        }
+        if (Test-Path -LiteralPath $snap.SidecarPath) {
+            try {
+                $snap.SidecarBytes = [System.IO.File]::ReadAllBytes($snap.SidecarPath)
+            }
+            catch {
+                Write-Color "[Save] WARNING: could not snapshot $($snap.SidecarPath) ($($_.Exception.Message)); rollback for this path will be skipped." 'Yellow'
+            }
+        }
+        $snapshots += $snap
     }
 
-    # Write tokens, then sidecar. Order matters for atomic-pair semantics:
-    # if the tokens write succeeds but the sidecar write fails, we delete
-    # the tokens file in the catch so a half-saved slot doesn't appear
-    # invisible-but-present (it would be present on disk but hidden by
-    # Get-Slots' sidecar filter). Conversely, an orphan sidecar without
-    # a matching tokens file is harmless; Get-Slots only iterates
-    # tokens files; sidecars are looked up by-path.
-    Set-CredentialFileAtomic -Path $finalSlotPath -Bytes $bytes
+    # Write tokens, then sidecar. Order matters for atomic-pair semantics.
+    # On any failure we clear partial new state at $finalSlotPath, then
+    # restore each snapshot's bytes (tokens AND sidecar) so the slot
+    # returns to its pre-save state. An orphan sidecar without a matching
+    # tokens file is harmless; Get-Slots only iterates tokens files,
+    # sidecars are looked up by-path.
     try {
+        Set-CredentialFileAtomic -Path $finalSlotPath -Bytes $bytes
         Write-Sidecar -SlotPath $finalSlotPath -OAuthAccount $accountInfo -Source $sourceLabel
     }
     catch {
+        $innerMsg = $_.Exception.Message
+
+        # Clear any partial new pair we wrote. If $finalSlotPath happened
+        # to coincide with a snapshot path (same-email re-save), this
+        # also wipes the just-overwritten old bytes; the restore loop
+        # below puts them back.
         Remove-Item -LiteralPath $finalSlotPath -Force -ErrorAction SilentlyContinue
-        throw "Failed to write sidecar for slot '$safeName' ($($_.Exception.Message)); slot rolled back."
+        Remove-Sidecar -SlotPath $finalSlotPath
+
+        # Restore each snapshot. Per-snapshot try/catch so one restore
+        # failure does not abort the others.
+        foreach ($snap in $snapshots) {
+            if ($null -ne $snap.Bytes) {
+                try {
+                    Set-CredentialFileAtomic -Path $snap.Path -Bytes $snap.Bytes
+                }
+                catch {
+                    Write-Color "[Save] WARNING: could not restore $($snap.Path) ($($_.Exception.Message))." 'Yellow'
+                }
+            }
+            if ($null -ne $snap.SidecarBytes) {
+                try {
+                    Set-CredentialFileAtomic -Path $snap.SidecarPath -Bytes $snap.SidecarBytes
+                }
+                catch {
+                    Write-Color "[Save] WARNING: could not restore $($snap.SidecarPath) ($($_.Exception.Message))." 'Yellow'
+                }
+            }
+        }
+
+        throw "Save failed for slot '$safeName' ($innerMsg); attempted to restore previous slot state."
+    }
+
+    # New pair is durable. Delete obsolete siblings (any snapshot whose
+    # path differs from $finalSlotPath). Same-path snapshots were
+    # overwritten in place by the atomic Replace above and need no
+    # further action.
+    foreach ($snap in $snapshots) {
+        if ($snap.Path -ne $finalSlotPath) {
+            Remove-Item -LiteralPath $snap.Path -Force -ErrorAction SilentlyContinue
+            Remove-Sidecar -SlotPath $snap.Path
+        }
     }
 
     # Update state: this slot is now the active one, and its bytes match
@@ -1540,9 +1585,8 @@ function Invoke-SaveAction {
     $hash = Get-SHA256Hex -Bytes $bytes
     Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
 
-    $displayEmail = if ($email -and $safeName.ToLowerInvariant() -ne $email.ToLowerInvariant()) { " ($email)" } else { '' }
-    $sourceTail   = if ($sourceLabel -eq 'api_profile') { ' [identity from /api/oauth/profile]' } else { '' }
-    Write-Color "[Save] Saved as '$safeName'$displayEmail$sourceTail" 'Green'
+    $sourceTail = if ($sourceLabel -eq 'api_profile') { ' [identity from /api/oauth/profile]' } else { '' }
+    Write-Color "[Save] Saved as $(Format-SlotIdentity -Name $safeName -Email $email)$sourceTail" 'Green'
 }
 
 function Invoke-SwitchAction {
@@ -1643,8 +1687,7 @@ function Invoke-SwitchAction {
     # weight low; the `[Switch]` line above is enough of a section
     # header.
     Write-Host ''
-    $postSwitchInfo = Get-Slots
-    Format-ListTable -Slots @($postSwitchInfo.Slots) -SuppressHeader
+    Format-ListTable -Slots @(Get-Slots) -SuppressHeader
 
     # Cyan `[Info]` apply hint, last line beneath the table. With the
     # ~/.claude.json oauthAccount swap above, starting Claude Code
@@ -1666,7 +1709,7 @@ function Invoke-ListAction {
     # in Invoke-SwitchAction / Invoke-UsageAction.
     Invoke-Reconcile | Out-Null
 
-    $slots = @((Get-Slots).Slots)
+    $slots = @(Get-Slots)
 
     if ($slots.Count -eq 0) {
         Write-Color "[List] No slots saved yet. Use: sca save <name>" 'Yellow'
@@ -1904,6 +1947,36 @@ function Update-SlotTokens {
                 # Code reading the stale .credentials.json could fail its
                 # own next refresh and require re-login.
                 Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
+            }
+        }
+        elseif (-not $activeSlot) {
+            # state.active_slot is set but Find-SlotByName returned $null,
+            # so the tracked active slot has no valid sidecar and Get-Slots
+            # filtered it out. If the slot we just refreshed IS that
+            # sidecar-hidden active slot, the rotated tokens are now
+            # orphaned in the slot file: .credentials.json still holds
+            # the old refresh_token Anthropic just rotated away. Without
+            # this branch the user gets no signal until Claude Code's own
+            # next refresh fails and forces a re-login. The yellow
+            # advisory in the catch above only covers the write-failure
+            # path, not the "active slot was filtered out" path.
+            #
+            # Deliberate: do NOT auto-propagate. Sidecar absence is the
+            # visibility-gate signal documented in CLAUDE.md ("Slots
+            # without a valid sidecar are HIDDEN from list / usage /
+            # rotation"); silently writing to .credentials.json for a
+            # hidden slot would violate the contract enforced by
+            # Get-Slots. Escalate to the user instead.
+            #
+            # Invariant: state.active_slot and last_sync_hash stay as-is.
+            # .credentials.json is unchanged, so its bytes still hash to
+            # last_sync_hash and the next Invoke-Reconcile no-ops cleanly
+            # (no spurious cross-account swap detection) until the user
+            # runs `sca save <name>` (recapture sidecar) or `sca switch
+            # <name>` (force propagation).
+            $parsed = Get-SlotFileInfo -FileName ([System.IO.Path]::GetFileName($SlotPath))
+            if ($parsed -and $parsed.Name -eq $state.active_slot) {
+                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but its identity sidecar is missing, so propagation to .credentials.json was skipped. Run 'sca save $($state.active_slot)' to recapture the sidecar, or 'sca switch $($state.active_slot)' to force propagation now; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
             }
         }
     }
@@ -2160,6 +2233,26 @@ function Get-SlotProfile {
     return [pscustomobject]@{ Status = 'ok'; Email = $email }
 }
 
+# Coerce a reset-timestamp value (ISO-8601 string, DateTime, DateTimeOffset,
+# or null/empty) to a [DateTimeOffset], or $null on missing / unparseable
+# input. Centralizes the parser shared by Format-ResetDelta /
+# Format-ResetAbsolute so both renderers cannot drift on accepted input
+# shapes. ISO-8601 strings come from live /api/oauth/usage; DateTime /
+# DateTimeOffset values come from tests passing pre-parsed timestamps.
+function ConvertTo-DateTimeOffsetOrNull {
+    Param ($Value)
+
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    try {
+        if ($Value -is [DateTimeOffset]) { return $Value }
+        if ($Value -is [DateTime])       { return [DateTimeOffset]$Value }
+        return [DateTimeOffset]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
+    }
+    catch {
+        return $null
+    }
+}
+
 # Render an ISO-8601 reset timestamp as a compact relative delta for the
 # summary table column. Verified shape from live /api/oauth/usage:
 #   "resets_at": "2026-04-24T19:50:00.027299+02:00"  (ISO with tz offset)
@@ -2173,23 +2266,8 @@ function Get-SlotProfile {
 function Format-ResetDelta {
     Param ($ResetsAt)
 
-    if ($null -eq $ResetsAt -or $ResetsAt -eq '') { return '—' }
-
-    $target = $null
-    try {
-        # Accept both ISO-8601 strings (live API) and DateTimeOffset/DateTime
-        # (tests may pass pre-parsed values).
-        if ($ResetsAt -is [DateTimeOffset]) {
-            $target = $ResetsAt
-        } elseif ($ResetsAt -is [DateTime]) {
-            $target = [DateTimeOffset]$ResetsAt
-        } else {
-            $target = [DateTimeOffset]::Parse([string]$ResetsAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
-        }
-    }
-    catch {
-        return '—'
-    }
+    $target = ConvertTo-DateTimeOffsetOrNull $ResetsAt
+    if ($null -eq $target) { return '—' }
 
     $delta = $target - [DateTimeOffset]::UtcNow
     if ($delta.TotalSeconds -le 0) { return 'now' }
@@ -2216,21 +2294,8 @@ function Format-ResetDelta {
 function Format-ResetAbsolute {
     Param ($ResetsAt)
 
-    if ($null -eq $ResetsAt -or $ResetsAt -eq '') { return '—' }
-
-    $target = $null
-    try {
-        if ($ResetsAt -is [DateTimeOffset]) {
-            $target = $ResetsAt
-        } elseif ($ResetsAt -is [DateTime]) {
-            $target = [DateTimeOffset]$ResetsAt
-        } else {
-            $target = [DateTimeOffset]::Parse([string]$ResetsAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
-        }
-    }
-    catch {
-        return '—'
-    }
+    $target = ConvertTo-DateTimeOffsetOrNull $ResetsAt
+    if ($null -eq $target) { return '—' }
 
     $localTz   = [TimeZoneInfo]::Local
     $localTime = [TimeZoneInfo]::ConvertTime($target, $localTz).DateTime
@@ -2810,8 +2875,7 @@ function Format-UsageVerbose {
 function Get-UsageSnapshot {
     Param ([String] $Name)
 
-    $info  = Get-Slots
-    $slots = @($info.Slots)
+    $slots = @(Get-Slots)
 
     if ($slots.Count -eq 0) {
         return [pscustomobject]@{

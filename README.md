@@ -1,6 +1,8 @@
-# Claude Account Switcher
+# Switch Claude Account
 
 A zero-dependency PowerShell tool for managing multiple Claude Code accounts on Windows. Save, switch, and watch live plan usage across all your slots; single self-contained `.ps1`, no companion files.
+
+> **Unofficial tool.** Not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic PBC, used here descriptively. Use only with Anthropic accounts you personally own; this tool does not enable sharing one account among multiple people. Anthropic's [Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) and [Usage Policy](https://www.anthropic.com/legal/aup) govern your accounts independently of this repo's MIT license.
 
 ## Features
 
@@ -12,7 +14,7 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 - **Named slots with rotation**: unlimited accounts under any name (Windows-invalid characters auto-sanitized); `sca switch` with no name cycles through them alphabetically
 - **Zero dependencies**: pure PowerShell 7.2+, no external packages, no companion assets
 
-## What `sca usage -Watch` looks like
+## Live plan-usage dashboard (`sca usage -Watch`)
 
 ![sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer](docs/images/usage-watch.svg)
 
@@ -142,7 +144,7 @@ sca usage work
 `list`, `switch`, and `usage` run a quiet **reconcile** pass before doing their work: if `.credentials.json` has changed since the last sync (Claude Code refreshed a token, or you logged into a different account inside Claude Code), the new bytes are captured into the tracked slot, or auto-saved under `auto-<UTC-timestamp>(<email>).json` if the email differs.
 
 > [!WARNING]
-> **Unofficial API.** `sca usage` calls `api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` uses internally. Undocumented by Anthropic and may break on Claude Code upgrades; when that happens, see the extraction recipe at the top of `switch_claude_account.ps1` to re-pin the constants.
+> **Unofficial API.** `sca usage` calls `api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` uses internally. Undocumented by Anthropic and may break on Claude Code upgrades; when that happens, see the extraction recipe at the top of `switch_claude_account.ps1` to re-pin the constants. The endpoint is not a public API and may be changed or withdrawn at Anthropic's discretion; use accordingly.
 
 > [!NOTE]
 > **Token refresh.** If a slot's access token has expired (default TTL ~1h), `sca usage` transparently refreshes it against `platform.claude.com/v1/oauth/token` and mirrors the new tokens back into both the slot file and `.credentials.json` via atomic rename so the active session keeps working.
@@ -209,3 +211,18 @@ pwsh -NoProfile -File tests/Invoke-Tests.ps1
 ```
 
 Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer runs in advisory mode if installed. Each test sandboxes `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` to Pester's `$TestDrive` so your real `.claude\` directory and PowerShell profile are never touched. Exit code follows Pester: `0` on pass, non-zero on any failure.
+
+## License
+
+[MIT](LICENSE). Copyright (c) 2026 Finn Kumkar.
+
+The script interacts with Anthropic's `~/.claude.json` config and the undocumented `/api/oauth/usage` endpoint as a third-party tool; usage is subject to Anthropic's own Terms of Service in addition to this repo's MIT terms.
+
+## Support
+
+Switch Claude Account is maintained on personal time. If it saves you a hassle, consider supporting future work; especially patches for when Claude Code upgrades drift the unofficial `/api/oauth/usage` constants.
+
+- [GitHub Sponsors](https://github.com/sponsors/countzero): 0% fee, surfaces as the native Sponsor button on this repo.
+- [Ko-fi](https://ko-fi.com/finnkumkar): one-time tip, no signup required for supporters.
+
+<a href="https://ko-fi.com/finnkumkar"><img src="https://storage.ko-fi.com/cdn/kofi2.png?v=6" alt="Support on Ko-fi" width="180"></a>
