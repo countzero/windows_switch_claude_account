@@ -47,7 +47,10 @@ The terminal-tab title is updated on every poll so the watch is useful even when
 
 ### Download
 
-[Download latest switch_claude_account.ps1](https://github.com/countzero/windows_switch_claude_account/releases/latest/download/switch_claude_account.ps1) and place it anywhere on disk. Check the [releases page](https://github.com/countzero/windows_switch_claude_account/releases) for older versions.
+[Download latest switch_claude_account.ps1](https://github.com/countzero/windows_switch_claude_account/releases/latest/download/switch_claude_account.ps1) and place it anywhere on disk.
+
+> [!TIP]
+> Check the [releases page](https://github.com/countzero/windows_switch_claude_account/releases) for older versions.
 
 ### Manual (run once)
 
