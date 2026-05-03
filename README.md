@@ -36,22 +36,18 @@ The terminal-tab title is updated on every poll so the watch is useful even when
 
     22% | 62% | Switch Claude Account
 
-The numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
-
-> Bar color: green &lt;50%, yellow ≥50%, red ≥90%. Row color tracks slot status: green for the active+`ok` slot (including the `*` marker), gray for healthy inactive slots, yellow for `near limit` (≥90%), red for `limited 5h` / `limited 7d` (≥100%).
+> [!NOTE]
+> The numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
 ## Installation
 
-> **Requires PowerShell 7.2+.** Stock Windows ships PowerShell 5.1, which is not supported. Install PS 7 via `winget install Microsoft.PowerShell`, then run from `pwsh`.
+### Requisite
+
+**Requires PowerShell 7.2+.** Stock Windows ships PowerShell 5.1, which is not supported. Install PS 7 via `winget install Microsoft.PowerShell`, then run from `pwsh`.
 
 ### Download
 
-[Download `switch_claude_account.ps1`](https://github.com/countzero/windows_switch_claude_account/releases/latest/download/switch_claude_account.ps1)
-(latest release; single self-contained file, no companion assets).
-Place it anywhere on disk.
-
-For older versions or release notes, see the
-[releases page](https://github.com/countzero/windows_switch_claude_account/releases).
+[Download latest switch_claude_account.ps1](https://github.com/countzero/windows_switch_claude_account/releases/latest/download/switch_claude_account.ps1) and place it anywhere on disk. Check the [releases page](https://github.com/countzero/windows_switch_claude_account/releases) for older versions.
 
 ### Manual (run once)
 
@@ -175,8 +171,10 @@ sca usage work
 
 `list`, `switch`, and `usage` run a quiet **reconcile** pass before doing their work: if `.credentials.json` has changed since the last sync (Claude Code refreshed a token, or you logged into a different account inside Claude Code), the new bytes are captured into the tracked slot, or auto-saved under `auto-<UTC-timestamp>(<email>).json` if the email differs.
 
+> [!WARNING]
 > **Unofficial API.** `sca usage` calls `api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` uses internally. Undocumented by Anthropic and may break on Claude Code upgrades; when that happens, see the extraction recipe at the top of `switch_claude_account.ps1` to re-pin the constants.
 
+> [!NOTE]
 > **Token refresh.** If a slot's access token has expired (default TTL ~1h), `sca usage` transparently refreshes it against `platform.claude.com/v1/oauth/token` and mirrors the new tokens back into both the slot file and `.credentials.json` via atomic rename so the active session keeps working.
 
 ### Install / uninstall alias
@@ -241,7 +239,3 @@ pwsh -NoProfile -File tests/Invoke-Tests.ps1
 ```
 
 Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer runs in advisory mode if installed. Each test sandboxes `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` to Pester's `$TestDrive` so your real `.claude\` directory and PowerShell profile are never touched. Exit code follows Pester: `0` on pass, non-zero on any failure.
-
----
-
-For the architecture (state file, sidecar invariants, `~/.claude.json` ownership, unofficial API constants), see [`CLAUDE.md`](./CLAUDE.md).
