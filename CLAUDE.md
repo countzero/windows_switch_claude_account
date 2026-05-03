@@ -95,8 +95,6 @@ A slot's identity is captured ONCE at save time and frozen in two paired files:
 
 **Atomic-pair invariant**: tokens file is written first, then the sidecar. If the sidecar write fails, the tokens file is rolled back so a half-saved slot can never appear invisible-but-present.
 
-**On-disk cleanup from v1**: `Get-Slots` silently removes any leftover `.credentials.*.profile.json` cache sidecars from the cache-based v1 implementation on each enumeration (different filename pattern from the current `.account.json` sidecar; cleanup is cheap and idempotent).
-
 ## `~/.claude.json` ownership
 
 `~/.claude.json` is Claude Code's persistent config: `oauthAccount` at the top level alongside ~50 other fields (project history, mcp configs, statsig gates, settings). `sca` interacts with it minimally and surgically:
