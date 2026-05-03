@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Profile-installer block markers renamed from `# === Claude Account Switcher ===` to `# === Switch Claude Account ===`. Existing installs: re-run `sca install` on the new version, then manually remove the leftover old-marker block from `$PROFILE`.
+
 ## [2.0.1] - 2026-05-03
 
 ### Added

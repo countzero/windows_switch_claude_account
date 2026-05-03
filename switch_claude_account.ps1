@@ -120,8 +120,8 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
 # a single source of truth.
-$MarkerStart = "# === Claude Account Switcher ==="
-$MarkerEnd   = "# === End Claude Account Switcher ==="
+$MarkerStart = "# === Switch Claude Account ==="
+$MarkerEnd   = "# === End Switch Claude Account ==="
 
 # --- Unofficial /api/oauth/usage constants ---
 #
@@ -767,7 +767,7 @@ function Show-Help {
 
     $lines = @(
         "",
-        "Claude Account Switcher - manage multiple Claude Code logins on Windows.",
+        "Switch Claude Account - manage multiple Claude Code logins on Windows.",
         "",
         "USAGE",
         "  $cmd <action> [name]",
@@ -1190,7 +1190,7 @@ function Remove-From-Profile {
 
     if (-not $hasStart -and -not $hasEnd) {
         if (-not $Quiet) {
-            Write-Color "[Uninstall] No Claude Account Switcher block found; profile unchanged." 'Yellow'
+            Write-Color "[Uninstall] No Switch Claude Account block found; profile unchanged." 'Yellow'
         }
         return
     }

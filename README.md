@@ -1,4 +1,4 @@
-# Windows Switch Claude Account
+# Switch Claude Account
 
 A zero-dependency PowerShell tool for managing multiple Claude Code accounts on Windows. Save, switch, and watch live plan usage across all your slots; single self-contained `.ps1`, no companion files.
 

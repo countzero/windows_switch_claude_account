@@ -29,7 +29,7 @@ Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`. Te
 - **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled, only for the dedup case where slot name equals email).
 - **Identity sidecars**: `.credentials.<name>(<email>).account.json` alongside each slot file. JSON snapshot of the slot's `oauthAccount` (whitelisted: accountUuid, emailAddress, organizationUuid, displayName, organizationName) captured at save time. Restored to `~/.claude.json` on `sca switch`. **Slots without a valid sidecar are HIDDEN from `list` / `usage` / rotation and refused by `switch`**; re-running `sca save <name>` while that slot is active recaptures the sidecar.
 - **PS version**: Requires PowerShell 7.2+ (`#Requires -Version 7.2`). Uses `$PROFILE.CurrentUserAllHosts` for the install target. The 7.2 floor is the version that introduced `$PSStyle.OutputRendering`, used by no-color mode.
-- **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block (`# === Claude Account Switcher ===`).
+- **Alias installer**: `sca` and `switch-claude-account` added to PowerShell profile via marker-delimited block (`# === Switch Claude Account ===`).
 
 ## Windows-specific gotchas
 
@@ -55,7 +55,7 @@ Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`. Te
 
 ## Editing the script
 
-The profile install/uninstall uses marker comments (`# === Claude Account Switcher ===`) to isolate its block. When modifying `Add-To-Profile` or `Remove-From-Profile`, keep these markers intact.
+The profile install/uninstall uses marker comments (`# === Switch Claude Account ===`) to isolate its block. When modifying `Add-To-Profile` or `Remove-From-Profile`, keep these markers intact.
 
 The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }` so tests can dot-source the script without triggering a live run. Each action body is extracted into an `Invoke-*Action` function so tests can call it directly. New actions: put the body in `Invoke-<Action>Action`, add a one-line dispatch to `Invoke-Main`.
 
