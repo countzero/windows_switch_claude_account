@@ -1016,17 +1016,8 @@ function Get-SlotFileName {
 # No automated migration; legacy slots from pre-v2.1.0 simply become
 # invisible until re-saved.
 #
-# As a side effect, this function performs a one-time sweep to delete any
-# leftover .credentials.*.profile.json sidecar files from an earlier
-# version of the tool that used on-disk profile caching. The email is now
-# encoded directly in the slot filename (see Get-SlotFileInfo) so those
-# sidecars are dead weight; removing them prevents stale emails from
-# lingering in the directory. Swallowed errors: if the cleanup can't
-# remove a file (lock / permissions) we leave it and move on; it is
-# cosmetic, not functional.
-#
-# Returns an object with:
-#   Slots : array of { Name, Email, Path, IsActive, Sidecar }
+# Returns an array of slot objects { Name, Email, Path, IsActive, Sidecar },
+# sorted alphabetically by Name. Empty array when no slots saved.
 #
 # Sidecar is the parsed sidecar object (not raw JSON), which Invoke-
 # SwitchAction needs to restore ~/.claude.json. Carrying it inline
@@ -1040,18 +1031,6 @@ function Get-SlotFileName {
 # that want a true offline read should call Get-Slots without first
 # reconciling.
 function Get-Slots {
-    # One-time sidecar cleanup. Cheap (fires only when legacy sidecars
-    # exist). The `.profile.json` shape is from a pre-v1 implementation
-    # entirely separate from the post-v2.1.0 `.account.json` sidecar
-    # that this function actively requires.
-    $orphans = Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.profile.json' -ErrorAction SilentlyContinue
-    foreach ($o in $orphans) {
-        Remove-Item -LiteralPath $o.FullName -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath (Join-Path $CredDir '.credentials.profile.json')) {
-        Remove-Item -LiteralPath (Join-Path $CredDir '.credentials.profile.json') -Force -ErrorAction SilentlyContinue
-    }
-
     # Filter out sidecar files (`.credentials.*.account.json`) themselves
     # so they don't get parsed as slot credentials. The wildcard
     # `.credentials.*.json` would otherwise match them.
@@ -1084,9 +1063,11 @@ function Get-Slots {
         }
     }
 
-    return [pscustomobject]@{
-        Slots = @($slots)
-    }
+    # `foreach` assignment yields $null / scalar / Object[] for 0 / 1 / N
+    # iterations; PowerShell's pipeline unrolls on emit, so callers that
+    # wrap with `@(Get-Slots)` or pipe through Where-Object / ForEach-Object
+    # see the right shape across all three cases.
+    $slots
 }
 
 # Find a slot file by its parsed slot-name, regardless of whether the
@@ -1098,8 +1079,7 @@ function Get-Slots {
 function Find-SlotByName {
     Param ([String] $Name)
 
-    $info = Get-Slots
-    return $info.Slots | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    return Get-Slots | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
 }
 
 # We are determining which slot should become active when `switch` is
@@ -1116,8 +1096,7 @@ function Find-SlotByName {
 # re-looking-up the slot. Active-slot identification reads $StateFile
 # (slot.IsActive populated by Get-Slots from state); no content hashing.
 function Get-NextSlotName {
-    $info  = Get-Slots
-    $slots = @($info.Slots)
+    $slots = @(Get-Slots)
 
     if ($slots.Count -eq 0) {
         throw "No slots saved. Use: sca save <name>"
@@ -1541,9 +1520,8 @@ function Invoke-SaveAction {
     $hash = Get-SHA256Hex -Bytes $bytes
     Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
 
-    $displayEmail = if ($email -and $safeName.ToLowerInvariant() -ne $email.ToLowerInvariant()) { " ($email)" } else { '' }
-    $sourceTail   = if ($sourceLabel -eq 'api_profile') { ' [identity from /api/oauth/profile]' } else { '' }
-    Write-Color "[Save] Saved as '$safeName'$displayEmail$sourceTail" 'Green'
+    $sourceTail = if ($sourceLabel -eq 'api_profile') { ' [identity from /api/oauth/profile]' } else { '' }
+    Write-Color "[Save] Saved as $(Format-SlotIdentity -Name $safeName -Email $email)$sourceTail" 'Green'
 }
 
 function Invoke-SwitchAction {
@@ -1644,8 +1622,7 @@ function Invoke-SwitchAction {
     # weight low; the `[Switch]` line above is enough of a section
     # header.
     Write-Host ''
-    $postSwitchInfo = Get-Slots
-    Format-ListTable -Slots @($postSwitchInfo.Slots) -SuppressHeader
+    Format-ListTable -Slots @(Get-Slots) -SuppressHeader
 
     # Cyan `[Info]` apply hint, last line beneath the table. With the
     # ~/.claude.json oauthAccount swap above, starting Claude Code
@@ -1667,7 +1644,7 @@ function Invoke-ListAction {
     # in Invoke-SwitchAction / Invoke-UsageAction.
     Invoke-Reconcile | Out-Null
 
-    $slots = @((Get-Slots).Slots)
+    $slots = @(Get-Slots)
 
     if ($slots.Count -eq 0) {
         Write-Color "[List] No slots saved yet. Use: sca save <name>" 'Yellow'
@@ -2161,6 +2138,26 @@ function Get-SlotProfile {
     return [pscustomobject]@{ Status = 'ok'; Email = $email }
 }
 
+# Coerce a reset-timestamp value (ISO-8601 string, DateTime, DateTimeOffset,
+# or null/empty) to a [DateTimeOffset], or $null on missing / unparseable
+# input. Centralizes the parser shared by Format-ResetDelta /
+# Format-ResetAbsolute so both renderers cannot drift on accepted input
+# shapes. ISO-8601 strings come from live /api/oauth/usage; DateTime /
+# DateTimeOffset values come from tests passing pre-parsed timestamps.
+function ConvertTo-DateTimeOffsetOrNull {
+    Param ($Value)
+
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    try {
+        if ($Value -is [DateTimeOffset]) { return $Value }
+        if ($Value -is [DateTime])       { return [DateTimeOffset]$Value }
+        return [DateTimeOffset]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
+    }
+    catch {
+        return $null
+    }
+}
+
 # Render an ISO-8601 reset timestamp as a compact relative delta for the
 # summary table column. Verified shape from live /api/oauth/usage:
 #   "resets_at": "2026-04-24T19:50:00.027299+02:00"  (ISO with tz offset)
@@ -2174,23 +2171,8 @@ function Get-SlotProfile {
 function Format-ResetDelta {
     Param ($ResetsAt)
 
-    if ($null -eq $ResetsAt -or $ResetsAt -eq '') { return '—' }
-
-    $target = $null
-    try {
-        # Accept both ISO-8601 strings (live API) and DateTimeOffset/DateTime
-        # (tests may pass pre-parsed values).
-        if ($ResetsAt -is [DateTimeOffset]) {
-            $target = $ResetsAt
-        } elseif ($ResetsAt -is [DateTime]) {
-            $target = [DateTimeOffset]$ResetsAt
-        } else {
-            $target = [DateTimeOffset]::Parse([string]$ResetsAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
-        }
-    }
-    catch {
-        return '—'
-    }
+    $target = ConvertTo-DateTimeOffsetOrNull $ResetsAt
+    if ($null -eq $target) { return '—' }
 
     $delta = $target - [DateTimeOffset]::UtcNow
     if ($delta.TotalSeconds -le 0) { return 'now' }
@@ -2217,21 +2199,8 @@ function Format-ResetDelta {
 function Format-ResetAbsolute {
     Param ($ResetsAt)
 
-    if ($null -eq $ResetsAt -or $ResetsAt -eq '') { return '—' }
-
-    $target = $null
-    try {
-        if ($ResetsAt -is [DateTimeOffset]) {
-            $target = $ResetsAt
-        } elseif ($ResetsAt -is [DateTime]) {
-            $target = [DateTimeOffset]$ResetsAt
-        } else {
-            $target = [DateTimeOffset]::Parse([string]$ResetsAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
-        }
-    }
-    catch {
-        return '—'
-    }
+    $target = ConvertTo-DateTimeOffsetOrNull $ResetsAt
+    if ($null -eq $target) { return '—' }
 
     $localTz   = [TimeZoneInfo]::Local
     $localTime = [TimeZoneInfo]::ConvertTime($target, $localTz).DateTime
@@ -2811,8 +2780,7 @@ function Format-UsageVerbose {
 function Get-UsageSnapshot {
     Param ([String] $Name)
 
-    $info  = Get-Slots
-    $slots = @($info.Slots)
+    $slots = @(Get-Slots)
 
     if ($slots.Count -eq 0) {
         return [pscustomobject]@{

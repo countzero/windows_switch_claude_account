@@ -121,32 +121,10 @@ Describe 'switch_claude_account' {
             New-SlotPair -CredDir $credDir -Name 'foo[bar]' -Content 'BR' | Out-Null
             Set-Content -LiteralPath (Join-Path $credDir '.credentials.json') -Value 'BR' -NoNewline
 
-            $info   = Get-Slots
-            $active = @($info.Slots | Where-Object { $_.IsActive })
+            $active = @(Get-Slots | Where-Object { $_.IsActive })
 
             $active.Count    | Should -Be 1
             $active[0].Name  | Should -Be 'foo[bar]'
-        }
-
-        # One-time migration from the pre-filename-encoding version:
-        # Get-Slots opportunistically sweeps away any leftover
-        # `.credentials.*.profile.json` sidecar files from the previous
-        # cache-based implementation. Runs on every call but is cheap
-        # once the directory is clean.
-        It 'silently removes orphan .profile.json sidecars on first enumeration' {
-            $credDir = Join-Path $script:SandboxHome '.claude'
-            New-SlotPair -CredDir $credDir -Name 'work' -Content 'W' | Out-Null
-            Set-Content -LiteralPath (Join-Path $credDir '.credentials.work.profile.json') -Value '{"email":"w@x"}' -NoNewline
-            Set-Content -LiteralPath (Join-Path $credDir '.credentials.profile.json')      -Value '{"email":"a@x"}' -NoNewline
-
-            $info  = Get-Slots
-            $names = @($info.Slots | ForEach-Object Name)
-
-            # Saved slot is enumerated (unlabeled form).
-            $names | Should -Be @('work')
-            # Sidecars have been silently removed during enumeration.
-            Test-Path -LiteralPath (Join-Path $credDir '.credentials.work.profile.json') | Should -BeFalse
-            Test-Path -LiteralPath (Join-Path $credDir '.credentials.profile.json')      | Should -BeFalse
         }
 
         # Labeled filename support: Get-Slots parses the parenthesized
@@ -159,7 +137,7 @@ Describe 'switch_claude_account' {
             New-SlotPair -CredDir $credDir -Name 'work' -Email 'alice@example.com' -Content 'W' | Out-Null
             New-SlotPair -CredDir $credDir -Name 'solo' -Content 'S' | Out-Null
 
-            $slots = @((Get-Slots).Slots)
+            $slots = @(Get-Slots)
             $bySlotName = @{}
             foreach ($s in $slots) { $bySlotName[$s.Name] = $s }
 
@@ -178,7 +156,7 @@ Describe 'switch_claude_account' {
             # Properly paired slot; visible.
             New-SlotPair -CredDir $credDir -Name 'modern' -Content 'M' | Out-Null
 
-            $names = @((Get-Slots).Slots | ForEach-Object Name)
+            $names = @(Get-Slots | ForEach-Object Name)
             $names | Should -Be @('modern')
             $names | Should -Not -Contain 'legacy'
         }
@@ -188,7 +166,7 @@ Describe 'switch_claude_account' {
             $credDir = Join-Path $script:SandboxHome '.claude'
             New-SlotPair -CredDir $credDir -Name 'work' -Content 'W' | Out-Null
 
-            $names = @((Get-Slots).Slots | ForEach-Object Name)
+            $names = @(Get-Slots | ForEach-Object Name)
             $names | Should -Be @('work')
             # No phantom slot whose name ends in '.account' (would mean
             # the sidecar leaked into Get-SlotFileInfo's parser).
