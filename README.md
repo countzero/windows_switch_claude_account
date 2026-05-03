@@ -46,19 +46,12 @@ The numbers come from the **active** slot (or the slot named in `sca usage <name
 
 ### Download
 
-Grab `switch_claude_account.ps1` from the
-[repository on GitHub](https://github.com/countzero/windows_switch_claude_account)
-and place it anywhere on disk; it is a single self-contained file with no
-companion assets. From PowerShell:
+[Download `switch_claude_account.ps1`](https://github.com/countzero/windows_switch_claude_account/releases/latest/download/switch_claude_account.ps1)
+(latest release; single self-contained file, no companion assets).
+Place it anywhere on disk.
 
-```powershell
-$url = 'https://raw.githubusercontent.com/countzero/windows_switch_claude_account/main/switch_claude_account.ps1'
-Invoke-WebRequest $url -OutFile switch_claude_account.ps1
-```
-
-For a tagged release, replace `main` with the tag (e.g. `v1.1.0`); see the
-[releases page](https://github.com/countzero/windows_switch_claude_account/releases)
-for the version list and changelog.
+For older versions or release notes, see the
+[releases page](https://github.com/countzero/windows_switch_claude_account/releases).
 
 ### Manual (run once)
 
