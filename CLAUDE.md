@@ -133,6 +133,10 @@ The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnal
 
 Per-function complexity diagnostic (advisory, on-demand): `pwsh -NoProfile -File tests/Measure-Complexity.ps1`, an AST walker reporting LOC, McCabe CC, max nesting per function. Rows with CC ≥ 10 or nest ≥ 4 flagged.
 
+## README image regeneration
+
+Three SVG terminal-output examples in `docs/images/` (`usage-watch`, `usage-table`, `usage-verbose`) are rendered by `tools/Render-ReadmeImages.ps1` via [`charmbracelet/freeze`](https://github.com/charmbracelet/freeze) (install: `winget install charmbracelet.freeze`). The harness is **hand-authored ANSI matching the README literally**; it does NOT call `Format-UsageFrame`. Colors are emitted as **truecolor SGR** (`ESC[38;2;R;G;Bm`) targeting Microsoft's Campbell palette (Windows Terminal default), so the rendered SVGs match what users see in default `pwsh.exe` rather than freeze's hardcoded charm palette (`freeze/ansi.go`'s `ansiPalette` map can't be overridden via flag/config; truecolor passes through verbatim as `fill="#RRGGBB"`). Background is set to Campbell's `#0C0C0C` for the same reason. Re-run when: (a) README example numbers / emails change, (b) `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mappings change in `switch_claude_account.ps1`, or (c) Microsoft ships a new Campbell — edit the truecolor constants at `tools/Render-ReadmeImages.ps1:137-142` and run: `pwsh -NoProfile -File tools/Render-ReadmeImages.ps1`. JetBrains Mono is embedded in each SVG (~360 KB) for pixel-identical rendering across viewers.
+
 ## Default Change Workflow
 
 When asked to make a change, always follow these steps in order:

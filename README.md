@@ -14,44 +14,27 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 
 ## What `sca usage -Watch` looks like
 
-```
-[Usage] Plan usage
-
-  Session [█████████████                                                ]  22%
-
-  Week    [██████████████████████████████████████                       ]  62%
-
-    Slot         Account                Session        Week         Status
-    -----------  ---------------------  -------------  -----------  ------
- *  work         alex@acme.io            18% (2h 11m)   42% (102h)  ok
-    personal     alex.dev@gmail.com       3% (4h 02m)    7% (146h)  ok
-    dev          alex@startup.dev         9% (3h 41m)   34% (118h)  ok
-    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit
-    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d
-
-[Watch] Last poll: 14:32:07
-```
+![sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer](docs/images/usage-watch.svg)
 
 The terminal-tab title is updated on every poll so the watch is useful even when the window is in the background:
 
     22% | 62% | Switch Claude Account
 
-The numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
-
-> Bar color: green &lt;50%, yellow ≥50%, red ≥90%. Row color tracks slot status: green for the active+`ok` slot (including the `*` marker), gray for healthy inactive slots, yellow for `near limit` (≥90%), red for `limited 5h` / `limited 7d` (≥100%).
+> [!NOTE]
+> The numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
 ## Installation
 
-> **Requires PowerShell 7.2+.** Stock Windows ships PowerShell 5.1, which is not supported. Install PS 7 via `winget install Microsoft.PowerShell`, then run from `pwsh`.
+### Requisite
+
+**Requires PowerShell 7.2+.** Stock Windows ships PowerShell 5.1, which is not supported. Install PS 7 via `winget install Microsoft.PowerShell`, then run from `pwsh`.
 
 ### Download
 
-[Download `switch_claude_account.ps1`](https://github.com/countzero/windows_switch_claude_account/releases/latest/download/switch_claude_account.ps1)
-(latest release; single self-contained file, no companion assets).
-Place it anywhere on disk.
+[Download latest switch_claude_account.ps1](https://github.com/countzero/windows_switch_claude_account/releases/latest/download/switch_claude_account.ps1) and place it anywhere on disk.
 
-For older versions or release notes, see the
-[releases page](https://github.com/countzero/windows_switch_claude_account/releases).
+> [!TIP]
+> Check the [releases page](https://github.com/countzero/windows_switch_claude_account/releases) for older versions.
 
 ### Manual (run once)
 
@@ -138,18 +121,7 @@ sca usage -NoColor                # strip ANSI color (also: $env:NO_COLOR='1')
 
 `-NoColor` works under `-Watch` too; body color is stripped while the alt-buffer / synchronized-output rendering remains flicker-free. The output shows the 5-hour session limit (`Session` column, "Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit (`Week` column, "Current week (all models)") as percentages of each account's Claude.ai subscription:
 
-```
-[Usage] Plan usage
-
-  Session [█████                                              ]  10%
-
-  Week    [████████████                                       ]  24%
-
-    Slot      Account             Session        Week         Status
-    --------  ------------------  -------------  -----------  ------
- *  work      alex@acme.io         18% (2h 11m)   42% (102h)  ok
-    personal  alex.dev@gmail.com    3% (4h 02m)    7% (146h)  ok
-```
+![sca usage one-shot: green pool-aggregate Session bar at 10% and Week bar at 24%, then a two-row table showing active 'work' (green) and inactive 'personal' (gray)](docs/images/usage-table.svg)
 
 Decoding the output:
 
@@ -165,18 +137,14 @@ Drill into a single slot for absolute reset times in your local timezone:
 sca usage work
 ```
 
-```
-[Usage] Slot 'work' (active)
-  Account: alex@acme.io
-  Status:  ok
-  Session     18%  Resets 7:50pm Europe/Berlin
-  Week        42%  Resets Apr 28, 9am Europe/Berlin
-```
+![sca usage work: yellow [Usage] header, dim Account line, green Status: ok, then Session and Week rows with absolute reset times in Europe/Berlin](docs/images/usage-verbose.svg)
 
 `list`, `switch`, and `usage` run a quiet **reconcile** pass before doing their work: if `.credentials.json` has changed since the last sync (Claude Code refreshed a token, or you logged into a different account inside Claude Code), the new bytes are captured into the tracked slot, or auto-saved under `auto-<UTC-timestamp>(<email>).json` if the email differs.
 
+> [!WARNING]
 > **Unofficial API.** `sca usage` calls `api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` uses internally. Undocumented by Anthropic and may break on Claude Code upgrades; when that happens, see the extraction recipe at the top of `switch_claude_account.ps1` to re-pin the constants.
 
+> [!NOTE]
 > **Token refresh.** If a slot's access token has expired (default TTL ~1h), `sca usage` transparently refreshes it against `platform.claude.com/v1/oauth/token` and mirrors the new tokens back into both the slot file and `.credentials.json` via atomic rename so the active session keeps working.
 
 ### Install / uninstall alias
@@ -241,7 +209,3 @@ pwsh -NoProfile -File tests/Invoke-Tests.ps1
 ```
 
 Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer runs in advisory mode if installed. Each test sandboxes `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` to Pester's `$TestDrive` so your real `.claude\` directory and PowerShell profile are never touched. Exit code follows Pester: `0` on pass, non-zero on any failure.
-
----
-
-For the architecture (state file, sidecar invariants, `~/.claude.json` ownership, unofficial API constants), see [`CLAUDE.md`](./CLAUDE.md).
