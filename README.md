@@ -14,23 +14,7 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 
 ## What `sca usage -Watch` looks like
 
-```
-[Usage] Plan usage
-
-  Session [█████████████                                                ]  22%
-
-  Week    [██████████████████████████████████████                       ]  62%
-
-    Slot         Account                Session        Week         Status
-    -----------  ---------------------  -------------  -----------  ------
- *  work         alex@acme.io            18% (2h 11m)   42% (102h)  ok
-    personal     alex.dev@gmail.com       3% (4h 02m)    7% (146h)  ok
-    dev          alex@startup.dev         9% (3h 41m)   34% (118h)  ok
-    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit
-    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d
-
-[Watch] Last poll: 14:32:07
-```
+![sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer](docs/images/usage-watch.svg)
 
 The terminal-tab title is updated on every poll so the watch is useful even when the window is in the background:
 
@@ -137,18 +121,7 @@ sca usage -NoColor                # strip ANSI color (also: $env:NO_COLOR='1')
 
 `-NoColor` works under `-Watch` too; body color is stripped while the alt-buffer / synchronized-output rendering remains flicker-free. The output shows the 5-hour session limit (`Session` column, "Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit (`Week` column, "Current week (all models)") as percentages of each account's Claude.ai subscription:
 
-```
-[Usage] Plan usage
-
-  Session [█████                                              ]  10%
-
-  Week    [████████████                                       ]  24%
-
-    Slot      Account             Session        Week         Status
-    --------  ------------------  -------------  -----------  ------
- *  work      alex@acme.io         18% (2h 11m)   42% (102h)  ok
-    personal  alex.dev@gmail.com    3% (4h 02m)    7% (146h)  ok
-```
+![sca usage one-shot: green pool-aggregate Session bar at 10% and Week bar at 24%, then a two-row table showing active 'work' (green) and inactive 'personal' (gray)](docs/images/usage-table.svg)
 
 Decoding the output:
 
@@ -164,13 +137,7 @@ Drill into a single slot for absolute reset times in your local timezone:
 sca usage work
 ```
 
-```
-[Usage] Slot 'work' (active)
-  Account: alex@acme.io
-  Status:  ok
-  Session     18%  Resets 7:50pm Europe/Berlin
-  Week        42%  Resets Apr 28, 9am Europe/Berlin
-```
+![sca usage work: yellow [Usage] header, dim Account line, green Status: ok, then Session and Week rows with absolute reset times in Europe/Berlin](docs/images/usage-verbose.svg)
 
 `list`, `switch`, and `usage` run a quiet **reconcile** pass before doing their work: if `.credentials.json` has changed since the last sync (Claude Code refreshed a token, or you logged into a different account inside Claude Code), the new bytes are captured into the tracked slot, or auto-saved under `auto-<UTC-timestamp>(<email>).json` if the email differs.
 

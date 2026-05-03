@@ -133,6 +133,10 @@ The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnal
 
 Per-function complexity diagnostic (advisory, on-demand): `pwsh -NoProfile -File tests/Measure-Complexity.ps1`, an AST walker reporting LOC, McCabe CC, max nesting per function. Rows with CC ≥ 10 or nest ≥ 4 flagged.
 
+## README image regeneration
+
+Three SVG terminal-output examples in `docs/images/` (`usage-watch`, `usage-table`, `usage-verbose`) are rendered by `tools/Render-ReadmeImages.ps1` via [`charmbracelet/freeze`](https://github.com/charmbracelet/freeze) (install: `winget install charmbracelet.freeze`). The harness is **hand-authored ANSI matching the README literally**; it does NOT call `Format-UsageFrame`. If the README's example numbers / emails change, OR `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` SGR mappings change in `switch_claude_account.ps1`, edit the here-strings in the harness and re-run: `pwsh -NoProfile -File tools/Render-ReadmeImages.ps1`. JetBrains Mono is embedded in each SVG (~360 KB) for pixel-identical rendering across viewers.
+
 ## Default Change Workflow
 
 When asked to make a change, always follow these steps in order:
