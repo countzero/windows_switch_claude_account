@@ -5,7 +5,16 @@
 - Hard ceiling: 200 lines (Anthropic guideline; longer files reduce adherence).
 - Describe the **current** shape only. Rationale, design history, and "why not the alternative" prose belong in commit messages.
 - When you remove a design from the code, remove its references here too.
-- Per-script-only details live in `.claude/rules/script-internals.md`; test-writing conventions in `.claude/rules/tests.md`. Both are path-scoped; they auto-load only when Claude reads matching files.
+- Per-script-only details live in `.claude/rules/script-internals.md`; test-writing conventions in `.claude/rules/tests.md`. Both are path-scoped; load triggers in "Path-scoped rule files" below.
+
+## Path-scoped rule files
+
+Two extra rule files live under `.claude/rules/` and apply only to specific paths. Lazy-load them with the Read tool when (and only when) the trigger condition holds; do NOT preemptively load both at session start.
+
+- Reading or editing `switch_claude_account.ps1` → also read @.claude/rules/script-internals.md (color/output, table layout, watch-mode, `/api/oauth/usage` schema, `Set-OAuthAccountInClaudeJson` regex details).
+- Reading, editing, or creating files under `tests/` → also read @.claude/rules/tests.md (test-writing conventions).
+
+Treat the loaded content as mandatory for the current task. Claude Code auto-loads these via native path-scoping; the explicit instruction here is what makes OpenCode pick them up too.
 
 ## Repo structure
 
@@ -52,7 +61,7 @@ The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvo
 
 `switch`, `usage`, and `list` call `Invoke-Reconcile` first (`switch` / `usage` need a fresh slot file; `list` needs an accurate active-slot marker after a possible cross-account swap). `save` skips reconcile (the explicit save IS the capture) and `remove` skips it too. New actions follow the same rule: reconcile when the action's output or downstream writes depend on a fresh slot file or accurate `state.active_slot`.
 
-For color/output, table layout, watch-mode, and `/api/oauth/usage` schema details, see `.claude/rules/script-internals.md` (auto-loads when reading the script).
+For color/output, table layout, watch-mode, and `/api/oauth/usage` schema details, see @.claude/rules/script-internals.md.
 
 ## Unofficial endpoints (`usage` action)
 
@@ -67,7 +76,7 @@ The `usage` action and the reconcile / save identity-fallback path depend on six
 
 **Undocumented and unsupported by Anthropic.** When the call starts returning 4xx after a Claude Code upgrade, re-extract from `$(Get-Command claude).Source` using the grep recipe in the script header comment, bump the constants, and re-run `tests/Invoke-Tests.ps1`. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only; they will not catch the constants drifting out of date.
 
-Response schema summary: `five_hour` and `seven_day` (rendered as *Session* / *Week*) carry `{ utilization: 0..100, resets_at: ISO-8601|null }`. Plus `seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal buckets that round-trip via `-Json` but are not rendered. Full schema: `.claude/rules/script-internals.md`.
+Response schema summary: `five_hour` and `seven_day` (rendered as *Session* / *Week*) carry `{ utilization: 0..100, resets_at: ISO-8601|null }`. Plus `seven_day_opus`, `seven_day_sonnet`, `extra_usage`, and internal buckets that round-trip via `-Json` but are not rendered. Full schema: @.claude/rules/script-internals.md.
 
 ## Identity capture: filename + sidecar
 
@@ -93,7 +102,7 @@ A slot's identity is captured ONCE at save time and frozen in two paired files:
 `~/.claude.json` is Claude Code's persistent config: `oauthAccount` at the top level alongside ~50 other fields (project history, mcp configs, statsig gates, settings). `sca` interacts with it minimally and surgically:
 
 - **Read** (`Get-OAuthAccountFromClaudeJson`): full JSON parse via `ConvertFrom-Json`, extract whitelisted fields. Failure modes (missing, parse error, no oauthAccount, empty emailAddress) all return `$null` so callers fall through to `/api/oauth/profile` or refuse. Used by `Invoke-SaveAction` (primary identity source) and `Invoke-Reconcile` (identity probe).
-- **Write** (`Set-OAuthAccountInClaudeJson`): targeted regex substitution within the `"oauthAccount": { ... }` block, NOT a full JSON round-trip. Whitelisted fields substituted via `[regex]::Replace` with a `MatchEvaluator`. Every other byte preserved. Null-valued whitelisted fields on the source `$OAuthAccount` are skipped; they preserve the existing `~/.claude.json` value rather than overwriting with `null`. The asymmetry is deliberate: `null` → real (upgrading a previously-null cached field) still works because the substituted value is non-null; real → `null` (which would wipe Claude Code's cached identity when an `/api/oauth/profile`-fallback sidecar carries the four non-email defaults as `null`) is blocked. Tests assert byte-equal preservation of unrelated top-level fields AND the null-skip preservation. Implementation details in `.claude/rules/script-internals.md`. Used only by `Invoke-SwitchAction`.
+- **Write** (`Set-OAuthAccountInClaudeJson`): targeted regex substitution within the `"oauthAccount": { ... }` block, NOT a full JSON round-trip. Whitelisted fields substituted via `[regex]::Replace` with a `MatchEvaluator`. Every other byte preserved. Null-valued whitelisted fields on the source `$OAuthAccount` are skipped; they preserve the existing `~/.claude.json` value rather than overwriting with `null`. The asymmetry is deliberate: `null` → real (upgrading a previously-null cached field) still works because the substituted value is non-null; real → `null` (which would wipe Claude Code's cached identity when an `/api/oauth/profile`-fallback sidecar carries the four non-email defaults as `null`) is blocked. Tests assert byte-equal preservation of unrelated top-level fields AND the null-skip preservation. Implementation details in @.claude/rules/script-internals.md. Used only by `Invoke-SwitchAction`.
 - **Lock contract**: there is **no** lockfile. Claude Code uses `proper-lockfile` to serialize its own writes via `~/.claude.json.lock`; `sca` deliberately does NOT participate. Instead, `sca save` and `sca switch` refuse to operate when Claude Code is running (`Test-ClaudeRunning`). Stronger guarantee than locking: zero possibility of a stale in-memory cache, because Claude Code is not running to hold one.
 - **Backup recovery**: Claude Code maintains rolling timestamped backups at `~/.claude.json.backup.<unix-ms>` (last 5, throttled to ≥1 minute apart). If a `sca` write ever corrupts `~/.claude.json`, restore from the latest backup. `sca` itself does NOT create backups.
 - **Failure mode**: if `Set-OAuthAccountInClaudeJson` throws, `Invoke-SwitchAction` catches, prints a yellow advisory, and proceeds. The credentials swap has already happened; only the email-display update fails. Re-run the switch once the issue is fixed.
@@ -120,7 +129,7 @@ Run a single test or context (`-FullNameFilter` is wildcard/regex against full `
 pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pester -Path tests/ -FullNameFilter '*Get-SafeName*' -Output Detailed"
 ```
 
-The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode. Tests sandbox `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`. Test-writing conventions: `.claude/rules/tests.md`.
+The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode. Tests sandbox `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`. Test-writing conventions: @.claude/rules/tests.md.
 
 Per-function complexity diagnostic (advisory, on-demand): `pwsh -NoProfile -File tests/Measure-Complexity.ps1`, an AST walker reporting LOC, McCabe CC, max nesting per function. Rows with CC ≥ 10 or nest ≥ 4 flagged.
 
