@@ -6,8 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-05-03
+
+### Added
+- MIT license.
+- GitHub Sponsors and Ko-fi funding via `.github/FUNDING.yml`.
+- Unofficial-tool disclaimer and Anthropic-ToS discretion note in README.
+
 ### Changed
-- Profile-installer block markers renamed from `# === Claude Account Switcher ===` to `# === Switch Claude Account ===`. Existing installs: re-run `sca install` on the new version, then manually remove the leftover old-marker block from `$PROFILE`.
+- Project canonically renamed to "Switch Claude Account". Profile-installer block markers renamed from `# === Claude Account Switcher ===` to `# === Switch Claude Account ===`. Existing installs: re-run `sca install` on the new version, then manually remove the leftover old-marker block from `$PROFILE`.
+
+### Fixed
+- `sca save` rolls back to the pre-existing slot pair when the sidecar write fails after the tokens-file write. The previous behaviour (delete-then-write) could leave the user with no slot for a name on a transient AV / disk-full / share-violation persisting past the 3-attempt retry on `Set-CredentialFileAtomic`.
+- `sca usage` emits a yellow advisory pointing at `sca save` / `sca switch` when an OAuth refresh rotates tokens for the active slot but the slot's `.account.json` sidecar is missing (so `Find-SlotByName` returns null and `.credentials.json` is not updated). Previously the rotation silently desynchronised, forcing a Claude Code re-login on its next own-refresh.
 
 ## [2.0.1] - 2026-05-03
 
