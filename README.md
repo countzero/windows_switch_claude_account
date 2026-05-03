@@ -223,4 +223,4 @@ The script interacts with Anthropic's `~/.claude.json` config and the undocument
 - [GitHub Sponsors](https://github.com/sponsors/countzero): 0% fee, surfaces as the native Sponsor button on this repo.
 - [Ko-fi](https://ko-fi.com/finnkumkar): one-time tip, no signup required for supporters.
 
-[![Support on Ko-fi](https://storage.ko-fi.com/cdn/kofi2.png?v=6)](https://ko-fi.com/finnkumkar)
+<a href="https://ko-fi.com/finnkumkar"><img src="https://storage.ko-fi.com/cdn/kofi2.png?v=6" alt="Support on Ko-fi" width="180"></a>
