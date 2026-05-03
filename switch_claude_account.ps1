@@ -1,4 +1,5 @@
 #Requires -Version 7.2
+# SPDX-License-Identifier: MIT
 
 <#
 .SYNOPSIS

@@ -210,6 +210,12 @@ pwsh -NoProfile -File tests/Invoke-Tests.ps1
 
 Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer runs in advisory mode if installed. Each test sandboxes `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` to Pester's `$TestDrive` so your real `.claude\` directory and PowerShell profile are never touched. Exit code follows Pester: `0` on pass, non-zero on any failure.
 
+## License
+
+[MIT](LICENSE). Copyright (c) 2026 Finn Kumkar.
+
+The script interacts with Anthropic's `~/.claude.json` config and the undocumented `/api/oauth/usage` endpoint as a third-party tool; usage is subject to Anthropic's own Terms of Service in addition to this repo's MIT terms.
+
 ## Support
 
 `sca` is maintained on personal time. If it saves you a hassle, consider supporting future work; especially patches for when Claude Code upgrades drift the unofficial `/api/oauth/usage` constants.
