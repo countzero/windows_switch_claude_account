@@ -14,7 +14,7 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 - **Named slots with rotation**: unlimited accounts under any name (Windows-invalid characters auto-sanitized); `sca switch` with no name cycles through them alphabetically
 - **Zero dependencies**: pure PowerShell 7.2+, no external packages, no companion assets
 
-## What `sca usage -Watch` looks like
+## Live plan-usage dashboard (`sca usage -Watch`)
 
 ![sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer](docs/images/usage-watch.svg)
 
