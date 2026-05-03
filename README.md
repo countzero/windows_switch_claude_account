@@ -52,9 +52,8 @@ and place it anywhere on disk; it is a single self-contained file with no
 companion assets. From PowerShell:
 
 ```powershell
-Invoke-WebRequest `
-    https://raw.githubusercontent.com/countzero/windows_switch_claude_account/main/switch_claude_account.ps1 `
-    -OutFile switch_claude_account.ps1
+$url = 'https://raw.githubusercontent.com/countzero/windows_switch_claude_account/main/switch_claude_account.ps1'
+Invoke-WebRequest $url -OutFile switch_claude_account.ps1
 ```
 
 For a tagged release, replace `main` with the tag (e.g. `v1.1.0`); see the
