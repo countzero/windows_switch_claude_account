@@ -1884,6 +1884,36 @@ function Update-SlotTokens {
                 Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
             }
         }
+        elseif (-not $activeSlot) {
+            # state.active_slot is set but Find-SlotByName returned $null,
+            # so the tracked active slot has no valid sidecar and Get-Slots
+            # filtered it out. If the slot we just refreshed IS that
+            # sidecar-hidden active slot, the rotated tokens are now
+            # orphaned in the slot file: .credentials.json still holds
+            # the old refresh_token Anthropic just rotated away. Without
+            # this branch the user gets no signal until Claude Code's own
+            # next refresh fails and forces a re-login. The yellow
+            # advisory in the catch above only covers the write-failure
+            # path, not the "active slot was filtered out" path.
+            #
+            # Deliberate: do NOT auto-propagate. Sidecar absence is the
+            # visibility-gate signal documented in CLAUDE.md ("Slots
+            # without a valid sidecar are HIDDEN from list / usage /
+            # rotation"); silently writing to .credentials.json for a
+            # hidden slot would violate the contract enforced by
+            # Get-Slots. Escalate to the user instead.
+            #
+            # Invariant: state.active_slot and last_sync_hash stay as-is.
+            # .credentials.json is unchanged, so its bytes still hash to
+            # last_sync_hash and the next Invoke-Reconcile no-ops cleanly
+            # (no spurious cross-account swap detection) until the user
+            # runs `sca save <name>` (recapture sidecar) or `sca switch
+            # <name>` (force propagation).
+            $parsed = Get-SlotFileInfo -FileName ([System.IO.Path]::GetFileName($SlotPath))
+            if ($parsed -and $parsed.Name -eq $state.active_slot) {
+                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but its identity sidecar is missing, so propagation to .credentials.json was skipped. Run 'sca save $($state.active_slot)' to recapture the sidecar, or 'sca switch $($state.active_slot)' to force propagation now; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
+            }
+        }
     }
 
     return $newAccess

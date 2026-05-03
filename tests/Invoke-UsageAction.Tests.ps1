@@ -611,6 +611,112 @@ Describe 'switch_claude_account' {
                 Should -Be (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
         }
 
+        # When state.active_slot points at a slot whose sidecar is
+        # missing (legacy install, lost sidecar from a failed save's
+        # rollback, or a sidecar-less auto-save), Find-SlotByName
+        # filters that slot out of Get-Slots and returns $null. The
+        # naive guard `if ($activeSlot -and $activeSlot.Path -eq ...)`
+        # would silently skip propagation, leaving .credentials.json
+        # with the old refresh_token Anthropic just rotated away --
+        # Claude Code's next refresh would then 4xx and force re-login.
+        # Update-SlotTokens detects this case (active_slot set but
+        # Find-SlotByName null AND the parsed slot-name from $SlotPath
+        # equals state.active_slot) and emits a yellow advisory
+        # pointing at `sca save` / `sca switch` for recovery, without
+        # auto-propagating (sidecar absence is the visibility gate).
+        #
+        # Driven through Update-SlotTokens directly: Invoke-UsageAction
+        # cannot reach the new branch because Get-UsageSnapshot ->
+        # Get-Slots filters sidecar-less slots out before Get-SlotUsage
+        # would call Update-SlotTokens, so the function is exercised
+        # here as a unit.
+        It 'refresh on sidecar-less active slot warns and does NOT propagate' {
+            $slotPath = New-Slot -Name 'activeStale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
+
+            # Delete the sidecar so Find-SlotByName('activeStale')
+            # returns $null while state still tracks it as active.
+            $sidecarPath = $slotPath -replace '\.json$', '.account.json'
+            Remove-Item -LiteralPath $sidecarPath -Force
+
+            # Mirror slot bytes to .credentials.json and seed state.
+            Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
+            $hash = (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
+            Update-ScaState -ActiveSlot 'activeStale' -LastSyncHash $hash | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{
+                    access_token  = 'sk-ant-oat-NEW'
+                    refresh_token = 'sk-ant-ort-NEW'
+                    expires_in    = 3600
+                }
+            }
+
+            # 6>&1 merges the Write-Color information stream into the
+            # success stream alongside Update-SlotTokens' return value
+            # (the new access token); Out-String stringifies both so a
+            # single Should -Match can probe for the advisory wording.
+            $out = Update-SlotTokens -SlotPath $slotPath 6>&1 | Out-String
+
+            # Advisory fired with sidecar-specific wording and the
+            # slot-name baked into the recovery command.
+            $out | Should -Match 'identity sidecar is missing'
+            $out | Should -Match 'sca save activeStale'
+
+            # Slot file got the new tokens (rotation reached the slot
+            # file via Update-SlotTokens' first atomic write).
+            $slotJson = Get-Content -LiteralPath $slotPath -Raw | ConvertFrom-Json
+            $slotJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
+
+            # .credentials.json STILL has the old token: the elseif
+            # branch deliberately does not propagate.
+            $credJson = Get-Content -LiteralPath $script:CredFilePath -Raw | ConvertFrom-Json
+            $credJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-OLD'
+
+            # state.last_sync_hash unchanged so the next reconcile
+            # still hash-match-noops (no spurious cross-account swap
+            # detection until the user runs `sca save` / `sca switch`).
+            (Read-ScaState).last_sync_hash | Should -Be $hash
+        }
+
+        # Pin the name-comparison guard inside the new elseif: when
+        # the tracked active slot is sidecar-hidden BUT we are
+        # refreshing some OTHER slot, the advisory must NOT fire
+        # (otherwise every refresh on any slot would print a
+        # false-positive warning while a hidden active exists, and the
+        # advisory text "Token refreshed in slot '<active>'" would be
+        # factually wrong about which slot was just refreshed).
+        It 'refresh on unrelated slot when active is sidecar-hidden does NOT print sidecar advisory' {
+            $activeSlot   = New-Slot -Name 'active'   -AccessToken 'sk-ant-oat-ACTIVE'
+            $inactiveSlot = New-Slot -Name 'inactive' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
+
+            # Hide the active slot's sidecar so Find-SlotByName('active')
+            # returns $null and the elseif branch fires.
+            $activeSidecar = $activeSlot -replace '\.json$', '.account.json'
+            Remove-Item -LiteralPath $activeSidecar -Force
+
+            Copy-Item -LiteralPath $activeSlot -Destination $script:CredFilePath -Force
+            $hash = (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
+            Update-ScaState -ActiveSlot 'active' -LastSyncHash $hash | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{
+                    access_token  = 'sk-ant-oat-NEW'
+                    refresh_token = 'sk-ant-ort-NEW'
+                    expires_in    = 3600
+                }
+            }
+
+            $beforeCred = Get-Content -LiteralPath $script:CredFilePath -Raw
+            $out = Update-SlotTokens -SlotPath $inactiveSlot 6>&1 | Out-String
+            $afterCred = Get-Content -LiteralPath $script:CredFilePath -Raw
+
+            # .credentials.json untouched: refresh hit 'inactive', and
+            # the elseif's name comparison ($parsed.Name -eq
+            # state.active_slot) rejects the false-positive case.
+            $afterCred | Should -Be $beforeCred
+            $out | Should -Not -Match 'identity sidecar is missing'
+        }
+
         # Refresh on a slot that is NOT the tracked active slot must
         # only write to the slot file, leaving .credentials.json alone.
         # Without this guard, sca usage on inactive slots would clobber
