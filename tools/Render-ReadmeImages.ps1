@@ -121,17 +121,17 @@ $GRAY   = "$ESC[37m"   # Gray        (inactive+ok rows)
 $watchLines = @(
     "$DKYEL[Usage] Plan usage$RESET",
     "",
-    "$GREEN  Session [█████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  22%$RESET",
+    "$GREEN  Session [█████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  22%$RESET",
     "",
-    "$YELLO  Week    [██████████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%$RESET",
+    "$YELLO  Week    [███████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%$RESET",
     "",
     "    Slot         Account                Session        Week         Status",
     "    -----------  ---------------------  -------------  -----------  ------",
-    "$GREEN *  work         alex@acme.io            18% (2h 11m)   42% (102h)  ok$RESET",
-    "$GRAY     personal     alex.dev@gmail.com       3% (4h 02m)    7% (146h)  ok$RESET",
-    "$GRAY     dev          alex@startup.dev         9% (3h 41m)   34% (118h)  ok$RESET",
-    "$YELLO     client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit$RESET",
-    "$RED     legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d$RESET",
+    "$GREEN  * work         alex@acme.io            18% (2h 11m)   42% (102h)  ok$RESET",
+    "$GRAY    personal     alex.dev@gmail.com       3% (4h 02m)    7% (146h)  ok$RESET",
+    "$GRAY    dev          alex@startup.dev         9% (3h 41m)   34% (118h)  ok$RESET",
+    "$YELLO    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit$RESET",
+    "$RED    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d$RESET",
     "",
     "$DKGRY[Watch] Last poll: 14:32:07$RESET"
 )
@@ -141,14 +141,14 @@ $watchLines = @(
 $tableLines = @(
     "$DKYEL[Usage] Plan usage$RESET",
     "",
-    "$GREEN  Session [█████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  10%$RESET",
+    "$GREEN  Session [█████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  10%$RESET",
     "",
-    "$GREEN  Week    [████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  24%$RESET",
+    "$GREEN  Week    [████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  24%$RESET",
     "",
     "    Slot      Account             Session        Week         Status",
     "    --------  ------------------  -------------  -----------  ------",
-    "$GREEN *  work      alex@acme.io         18% (2h 11m)   42% (102h)  ok$RESET",
-    "$GRAY     personal  alex.dev@gmail.com    3% (4h 02m)    7% (146h)  ok$RESET"
+    "$GREEN  * work      alex@acme.io         18% (2h 11m)   42% (102h)  ok$RESET",
+    "$GRAY    personal  alex.dev@gmail.com    3% (4h 02m)    7% (146h)  ok$RESET"
 )
 
 # --- Block 3: usage <name> verbose (README ~lines 167-172) -----------------
