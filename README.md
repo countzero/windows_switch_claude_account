@@ -1,4 +1,4 @@
-# Claude Account Switcher
+# Windows Switch Claude Account
 
 A zero-dependency PowerShell tool for managing multiple Claude Code accounts on Windows. Save, switch, and watch live plan usage across all your slots; single self-contained `.ps1`, no companion files.
 
@@ -218,7 +218,7 @@ The script interacts with Anthropic's `~/.claude.json` config and the undocument
 
 ## Support
 
-`sca` is maintained on personal time. If it saves you a hassle, consider supporting future work; especially patches for when Claude Code upgrades drift the unofficial `/api/oauth/usage` constants.
+Switch Claude Account is maintained on personal time. If it saves you a hassle, consider supporting future work; especially patches for when Claude Code upgrades drift the unofficial `/api/oauth/usage` constants.
 
 - [GitHub Sponsors](https://github.com/sponsors/countzero): 0% fee, surfaces as the native Sponsor button on this repo.
 - [Ko-fi](https://ko-fi.com/finnkumkar): one-time tip, no signup required for supporters.
