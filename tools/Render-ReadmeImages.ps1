@@ -206,17 +206,25 @@ $scenarios = @(
 #                          <img width="100%"> to scale up
 #   --width 720          : forced canvas width (px) shared by all three
 #                          renders so they scale identically when the README
-#                          displays them at the same `max-width:900px`.
-#                          Without this, freeze auto-sizes each canvas to
-#                          its longest line, which gives usage-verbose
-#                          (51 chars) a much smaller intrinsic width than
-#                          usage-watch (74 chars) and the README would render
-#                          its monospace text ~46% larger. 720px is one px
-#                          above the watch panel's auto-size width so the
-#                          widest content still fits without cropping. The
-#                          shorter blocks (table, verbose) gain empty dark
-#                          space on the right; that's the deliberate cost
-#                          of uniform on-screen sizing.
+#                          displays them. Without this, freeze auto-sizes
+#                          each canvas to its longest line, which gives
+#                          usage-verbose (51 chars) a much smaller intrinsic
+#                          width than usage-watch (74 chars) and the README
+#                          would render its monospace text ~46% larger.
+#                          720px is one px above the watch panel's auto-size
+#                          width so the widest content still fits without
+#                          cropping. The shorter blocks (table, verbose)
+#                          gain empty dark space on the right; that's the
+#                          deliberate cost of uniform on-screen sizing.
+#
+#                          README contract: the four <img> refs in README.md
+#                          cap upscale at this width (style="max-width:720px",
+#                          1x intrinsic). If you change --width here in
+#                          either direction, change the four max-width
+#                          values in README.md to match: max-width below
+#                          --width crops the panel; max-width above --width
+#                          re-introduces blurry upscaling of the embedded
+#                          monospace text. Keep the two numbers equal.
 #   --font.size 14       : default; readable in README at GitHub's render width
 #   --line-height 1.4    : avoids cramped vertical spacing
 # Font defaults to JetBrains Mono and is embedded as a base64 woff2 in the
