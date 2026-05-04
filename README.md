@@ -1,8 +1,12 @@
 # Switch Claude Account
 
-A zero-dependency PowerShell tool for managing multiple Claude Code accounts on Windows. Save, switch, and watch live plan usage across all your slots; single self-contained `.ps1`, no companion files.
+[![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.2+](https://img.shields.io/badge/PowerShell-7.2%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
 
-> **Unofficial tool.** Not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic PBC, used here descriptively. Use only with Anthropic accounts you personally own; this tool does not enable sharing one account among multiple people. Anthropic's [Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) and [Usage Policy](https://www.anthropic.com/legal/aup) govern your accounts independently of this repo's MIT license.
+A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usage dashboard** across multiple accounts, plus safe save / switch / rotate. Single self-contained `.ps1`, no companion files.
+
+<p align="center">
+  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
+</p>
 
 ## Features
 
@@ -13,17 +17,6 @@ A zero-dependency PowerShell tool for managing multiple Claude Code accounts on 
 - **Atomic-safe writes**: slot-file updates survive a running Claude Code via `MoveFileEx` with retry; `save` / `switch` still refuse to run while it's open (single source of truth on `~/.claude.json`)
 - **Named slots with rotation**: unlimited accounts under any name (Windows-invalid characters auto-sanitized); `sca switch` with no name cycles through them alphabetically
 - **Zero dependencies**: pure PowerShell 7.2+, no external packages, no companion assets
-
-## Live plan-usage dashboard (`sca usage -Watch`)
-
-![sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer](docs/images/usage-watch.svg)
-
-The terminal-tab title is updated on every poll so the watch is useful even when the window is in the background:
-
-    22% | 62% | Switch Claude Account
-
-> [!NOTE]
-> The numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
 ## Installation
 
@@ -115,15 +108,15 @@ When the slot name already equals the OAuth email, the filename is deduplicated 
 ```powershell
 sca usage                         # one-shot table for every slot
 sca usage work                    # verbose single-slot block (opus / sonnet / overage)
-sca usage -Watch                  # live, self-refreshing view; Ctrl-C to quit
-sca usage -Watch -Interval 300    # slower poll cadence (60s floor)
 sca usage -Json                   # machine-readable per-slot output
 sca usage -NoColor                # strip ANSI color (also: $env:NO_COLOR='1')
 ```
 
-`-NoColor` works under `-Watch` too; body color is stripped while the alt-buffer / synchronized-output rendering remains flicker-free. The output shows the 5-hour session limit (`Session` column, "Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit (`Week` column, "Current week (all models)") as percentages of each account's Claude.ai subscription:
+The output shows the 5-hour session limit (`Session` column, "Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit (`Week` column, "Current week (all models)") as percentages of each account's Claude.ai subscription:
 
-![sca usage one-shot: green pool-aggregate Session bar at 10% and Week bar at 24%, then a two-row table showing active 'work' (green) and inactive 'personal' (gray)](docs/images/usage-table.svg)
+<p align="center">
+  <img src="docs/images/usage-table.svg" alt="sca usage one-shot: green pool-aggregate Session bar at 10% and Week bar at 24%, then a two-row table showing active 'work' (green) and inactive 'personal' (gray)" width="720">
+</p>
 
 Decoding the output:
 
@@ -139,7 +132,9 @@ Drill into a single slot for absolute reset times in your local timezone:
 sca usage work
 ```
 
-![sca usage work: yellow [Usage] header, dim Account line, green Status: ok, then Session and Week rows with absolute reset times in Europe/Berlin](docs/images/usage-verbose.svg)
+<p align="center">
+  <img src="docs/images/usage-verbose.svg" alt="sca usage work: yellow [Usage] header, dim Account line, green Status: ok, then Session and Week rows with absolute reset times in Europe/Berlin" width="720">
+</p>
 
 `list`, `switch`, and `usage` run a quiet **reconcile** pass before doing their work: if `.credentials.json` has changed since the last sync (Claude Code refreshed a token, or you logged into a different account inside Claude Code), the new bytes are captured into the tracked slot, or auto-saved under `auto-<UTC-timestamp>(<email>).json` if the email differs.
 
@@ -148,6 +143,28 @@ sca usage work
 
 > [!NOTE]
 > **Token refresh.** If a slot's access token has expired (default TTL ~1h), `sca usage` transparently refreshes it against `platform.claude.com/v1/oauth/token` and mirrors the new tokens back into both the slot file and `.credentials.json` via atomic rename so the active session keeps working.
+
+### Watch plan usage live
+
+Execute `sca usage -Watch` to enable the live dashboard:
+
+```powershell
+sca usage -Watch                  # live, self-refreshing view; Ctrl-C to quit
+sca usage work -Watch             # follow a single slot
+sca usage -Watch -Interval 300    # slower poll cadence (60s floor)
+sca usage -Watch -NoColor         # strip ANSI color
+```
+
+The terminal-tab title is updated on every poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab:
+
+    22% | 62% | Switch Claude Account
+
+<p align="center">
+  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
+</p>
+
+> [!NOTE]
+> The title's numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
 ### Install / uninstall alias
 
@@ -212,17 +229,17 @@ pwsh -NoProfile -File tests/Invoke-Tests.ps1
 
 Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer runs in advisory mode if installed. Each test sandboxes `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` to Pester's `$TestDrive` so your real `.claude\` directory and PowerShell profile are never touched. Exit code follows Pester: `0` on pass, non-zero on any failure.
 
-## License
+## License & Disclaimer
 
 [MIT](LICENSE). Copyright (c) 2026 Finn Kumkar.
 
-The script interacts with Anthropic's `~/.claude.json` config and the undocumented `/api/oauth/usage` endpoint as a third-party tool; usage is subject to Anthropic's own Terms of Service in addition to this repo's MIT terms.
+> **Unofficial tool.** Not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic PBC, used here descriptively. The script interacts with Anthropic's `~/.claude.json` config and the undocumented `/api/oauth/usage` endpoint as a third-party tool; usage is subject to Anthropic's [Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) and [Usage Policy](https://www.anthropic.com/legal/aup) in addition to this repo's MIT terms. Use only with Anthropic accounts you personally own; this tool does not enable sharing one account among multiple people.
 
 ## Support
 
-Switch Claude Account is maintained on personal time. If it saves you a hassle, consider supporting future work; especially patches for when Claude Code upgrades drift the unofficial `/api/oauth/usage` constants.
+If `sca` saves you a hassle, consider supporting future work:
 
-- [GitHub Sponsors](https://github.com/sponsors/countzero): 0% fee, surfaces as the native Sponsor button on this repo.
-- [Ko-fi](https://ko-fi.com/finnkumkar): one-time tip, no signup required for supporters.
+- [GitHub Sponsors](https://github.com/sponsors/countzero): recurring or one-time.
+- [Ko-fi](https://ko-fi.com/finnkumkar): one-time tip, no signup required.
 
 <a href="https://ko-fi.com/finnkumkar"><img src="https://storage.ko-fi.com/cdn/kofi2.png?v=6" alt="Support on Ko-fi" width="180"></a>
