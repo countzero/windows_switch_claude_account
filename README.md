@@ -16,15 +16,6 @@ A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usag
 - **Named slots with rotation**: unlimited accounts under any name (Windows-invalid characters auto-sanitized); `sca switch` with no name cycles through them alphabetically
 - **Zero dependencies**: pure PowerShell 7.2+, no external packages, no companion assets
 
-## Live plan-usage dashboard (`sca usage -Watch`)
-
-The terminal-tab title is updated on every poll so the watch is useful even when the window is in the background:
-
-    22% | 62% | Switch Claude Account
-
-> [!NOTE]
-> The numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
-
 ## Installation
 
 ### Requisite
@@ -115,13 +106,11 @@ When the slot name already equals the OAuth email, the filename is deduplicated 
 ```powershell
 sca usage                         # one-shot table for every slot
 sca usage work                    # verbose single-slot block (opus / sonnet / overage)
-sca usage -Watch                  # live, self-refreshing view; Ctrl-C to quit
-sca usage -Watch -Interval 300    # slower poll cadence (60s floor)
 sca usage -Json                   # machine-readable per-slot output
 sca usage -NoColor                # strip ANSI color (also: $env:NO_COLOR='1')
 ```
 
-`-NoColor` works under `-Watch` too; body color is stripped while the alt-buffer / synchronized-output rendering remains flicker-free. The output shows the 5-hour session limit (`Session` column, "Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit (`Week` column, "Current week (all models)") as percentages of each account's Claude.ai subscription:
+The output shows the 5-hour session limit (`Session` column, "Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit (`Week` column, "Current week (all models)") as percentages of each account's Claude.ai subscription:
 
 ![sca usage one-shot: green pool-aggregate Session bar at 10% and Week bar at 24%, then a two-row table showing active 'work' (green) and inactive 'personal' (gray)](docs/images/usage-table.svg)
 
@@ -148,6 +137,26 @@ sca usage work
 
 > [!NOTE]
 > **Token refresh.** If a slot's access token has expired (default TTL ~1h), `sca usage` transparently refreshes it against `platform.claude.com/v1/oauth/token` and mirrors the new tokens back into both the slot file and `.credentials.json` via atomic rename so the active session keeps working.
+
+### Watch plan usage live
+
+Execute `sca usage -Watch` to enable the live dashboard:
+
+```powershell
+sca usage -Watch                  # live, self-refreshing view; Ctrl-C to quit
+sca usage work -Watch             # follow a single slot
+sca usage -Watch -Interval 300    # slower poll cadence (60s floor)
+sca usage -Watch -NoColor         # strip ANSI color
+```
+
+The terminal-tab title is updated on every poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab:
+
+    22% | 62% | Switch Claude Account
+
+![sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer](docs/images/usage-watch.svg)
+
+> [!NOTE]
+> The title's numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
 ### Install / uninstall alias
 
