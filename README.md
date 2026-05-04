@@ -1,6 +1,8 @@
 # Switch Claude Account
 
-A zero-dependency PowerShell tool for managing multiple Claude Code accounts on Windows. Save, switch, and watch live plan usage across all your slots; single self-contained `.ps1`, no companion files.
+[![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.2+](https://img.shields.io/badge/PowerShell-7.2%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
+
+A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usage dashboard** across multiple accounts, plus safe save / switch / rotate. Single self-contained `.ps1`, no companion files.
 
 > **Unofficial tool.** Not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic PBC, used here descriptively. Use only with Anthropic accounts you personally own; this tool does not enable sharing one account among multiple people. Anthropic's [Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) and [Usage Policy](https://www.anthropic.com/legal/aup) govern your accounts independently of this repo's MIT license.
 
@@ -220,7 +222,7 @@ The script interacts with Anthropic's `~/.claude.json` config and the undocument
 
 ## Support
 
-Switch Claude Account is maintained on personal time. If it saves you a hassle, consider supporting future work; especially patches for when Claude Code upgrades drift the unofficial `/api/oauth/usage` constants.
+Switch Claude Account is maintained on personal time. If it saves you a hassle, consider supporting future work.
 
 - [GitHub Sponsors](https://github.com/sponsors/countzero): 0% fee, surfaces as the native Sponsor button on this repo.
 - [Ko-fi](https://ko-fi.com/finnkumkar): one-time tip, no signup required for supporters.
