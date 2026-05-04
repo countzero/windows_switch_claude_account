@@ -201,7 +201,22 @@ $scenarios = @(
 #   --background #0C0C0C : Campbell terminal background; pairs with the Campbell
 #                          truecolor palette burned into the SGR helpers above
 #   --padding 30         : breathing room inside the window
-#   --margin 20          : drop-shadow space around the window
+#   --margin 0           : flush panel edge so the SVG fills the README
+#                          column with no transparent gutter; README uses
+#                          <img width="100%"> to scale up
+#   --width 720          : forced canvas width (px) shared by all three
+#                          renders so they scale identically when the README
+#                          displays them at the same `max-width:900px`.
+#                          Without this, freeze auto-sizes each canvas to
+#                          its longest line, which gives usage-verbose
+#                          (51 chars) a much smaller intrinsic width than
+#                          usage-watch (74 chars) and the README would render
+#                          its monospace text ~46% larger. 720px is one px
+#                          above the watch panel's auto-size width so the
+#                          widest content still fits without cropping. The
+#                          shorter blocks (table, verbose) gain empty dark
+#                          space on the right; that's the deliberate cost
+#                          of uniform on-screen sizing.
 #   --font.size 14       : default; readable in README at GitHub's render width
 #   --line-height 1.4    : avoids cramped vertical spacing
 # Font defaults to JetBrains Mono and is embedded as a base64 woff2 in the
@@ -223,7 +238,8 @@ foreach ($s in $scenarios) {
         --window `
         --background  '#0C0C0C' `
         --padding     30 `
-        --margin      20 `
+        --margin      0 `
+        --width       720 `
         --font.size   14 `
         --line-height 1.4 `
         --output      $svgPath `
