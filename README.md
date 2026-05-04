@@ -4,7 +4,7 @@
 
 A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usage dashboard** across multiple accounts, plus safe save / switch / rotate. Single self-contained `.ps1`, no companion files.
 
-> **Unofficial tool.** Not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic PBC, used here descriptively. Use only with Anthropic accounts you personally own; this tool does not enable sharing one account among multiple people. Anthropic's [Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) and [Usage Policy](https://www.anthropic.com/legal/aup) govern your accounts independently of this repo's MIT license.
+![sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer](docs/images/usage-watch.svg)
 
 ## Features
 
@@ -17,8 +17,6 @@ A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usag
 - **Zero dependencies**: pure PowerShell 7.2+, no external packages, no companion assets
 
 ## Live plan-usage dashboard (`sca usage -Watch`)
-
-![sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer](docs/images/usage-watch.svg)
 
 The terminal-tab title is updated on every poll so the watch is useful even when the window is in the background:
 
@@ -214,11 +212,11 @@ pwsh -NoProfile -File tests/Invoke-Tests.ps1
 
 Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer runs in advisory mode if installed. Each test sandboxes `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` to Pester's `$TestDrive` so your real `.claude\` directory and PowerShell profile are never touched. Exit code follows Pester: `0` on pass, non-zero on any failure.
 
-## License
+## License & Disclaimer
 
 [MIT](LICENSE). Copyright (c) 2026 Finn Kumkar.
 
-The script interacts with Anthropic's `~/.claude.json` config and the undocumented `/api/oauth/usage` endpoint as a third-party tool; usage is subject to Anthropic's own Terms of Service in addition to this repo's MIT terms.
+**Unofficial tool.** Not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic PBC, used here descriptively. The script interacts with Anthropic's `~/.claude.json` config and the undocumented `/api/oauth/usage` endpoint as a third-party tool; usage is subject to Anthropic's [Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) and [Usage Policy](https://www.anthropic.com/legal/aup) in addition to this repo's MIT terms. Use only with Anthropic accounts you personally own; this tool does not enable sharing one account among multiple people.
 
 ## Support
 
