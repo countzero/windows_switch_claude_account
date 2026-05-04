@@ -202,8 +202,8 @@ $scenarios = @(
 #                          truecolor palette burned into the SGR helpers above
 #   --padding 30         : breathing room inside the window
 #   --margin 0           : flush panel edge so the SVG fills the README
-#                          column with no transparent gutter; README uses
-#                          <img width="100%"> to scale up
+#                          column with no transparent gutter; README pins
+#                          rendering at 1x via <img width="720">
 #   --width 720          : forced canvas width (px) shared by all three
 #                          renders so they scale identically when the README
 #                          displays them. Without this, freeze auto-sizes
@@ -218,13 +218,13 @@ $scenarios = @(
 #                          deliberate cost of uniform on-screen sizing.
 #
 #                          README contract: the four <img> refs in README.md
-#                          cap upscale at this width (style="max-width:720px",
-#                          1x intrinsic). If you change --width here in
-#                          either direction, change the four max-width
-#                          values in README.md to match: max-width below
-#                          --width crops the panel; max-width above --width
-#                          re-introduces blurry upscaling of the embedded
-#                          monospace text. Keep the two numbers equal.
+#                          cap rendering at this width (width="720" HTML
+#                          attribute, 1x intrinsic). If you change --width
+#                          here in either direction, change the four width
+#                          values in README.md to match: width below --width
+#                          crops the panel; width above --width re-introduces
+#                          blurry upscaling of the embedded monospace text.
+#                          Keep the two numbers equal.
 #   --font.size 14       : default; readable in README at GitHub's render width
 #   --line-height 1.4    : avoids cramped vertical spacing
 # Font defaults to JetBrains Mono and is embedded as a base64 woff2 in the

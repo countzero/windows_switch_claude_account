@@ -5,7 +5,7 @@
 A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usage dashboard** across multiple accounts, plus safe save / switch / rotate. Single self-contained `.ps1`, no companion files.
 
 <p align="center">
-  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="100%" style="max-width:720px">
+  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
 </p>
 
 ## Features
@@ -115,7 +115,7 @@ sca usage -NoColor                # strip ANSI color (also: $env:NO_COLOR='1')
 The output shows the 5-hour session limit (`Session` column, "Current session" in Claude Code's `/usage`) and the 7-day weekly all-models limit (`Week` column, "Current week (all models)") as percentages of each account's Claude.ai subscription:
 
 <p align="center">
-  <img src="docs/images/usage-table.svg" alt="sca usage one-shot: green pool-aggregate Session bar at 10% and Week bar at 24%, then a two-row table showing active 'work' (green) and inactive 'personal' (gray)" width="100%" style="max-width:720px">
+  <img src="docs/images/usage-table.svg" alt="sca usage one-shot: green pool-aggregate Session bar at 10% and Week bar at 24%, then a two-row table showing active 'work' (green) and inactive 'personal' (gray)" width="720">
 </p>
 
 Decoding the output:
@@ -133,7 +133,7 @@ sca usage work
 ```
 
 <p align="center">
-  <img src="docs/images/usage-verbose.svg" alt="sca usage work: yellow [Usage] header, dim Account line, green Status: ok, then Session and Week rows with absolute reset times in Europe/Berlin" width="100%" style="max-width:720px">
+  <img src="docs/images/usage-verbose.svg" alt="sca usage work: yellow [Usage] header, dim Account line, green Status: ok, then Session and Week rows with absolute reset times in Europe/Berlin" width="720">
 </p>
 
 `list`, `switch`, and `usage` run a quiet **reconcile** pass before doing their work: if `.credentials.json` has changed since the last sync (Claude Code refreshed a token, or you logged into a different account inside Claude Code), the new bytes are captured into the tracked slot, or auto-saved under `auto-<UTC-timestamp>(<email>).json` if the email differs.
@@ -160,7 +160,7 @@ The terminal-tab title is updated on every poll so a backgrounded watch is glanc
     22% | 62% | Switch Claude Account
 
 <p align="center">
-  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="100%" style="max-width:720px">
+  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
 </p>
 
 > [!NOTE]
