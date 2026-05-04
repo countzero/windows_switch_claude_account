@@ -229,9 +229,9 @@ Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer
 
 ## Support
 
-Switch Claude Account is maintained on personal time. If it saves you a hassle, consider supporting future work.
+If `sca` saves you a hassle, consider supporting future work:
 
-- [GitHub Sponsors](https://github.com/sponsors/countzero): 0% fee, surfaces as the native Sponsor button on this repo.
-- [Ko-fi](https://ko-fi.com/finnkumkar): one-time tip, no signup required for supporters.
+- [GitHub Sponsors](https://github.com/sponsors/countzero): recurring or one-time.
+- [Ko-fi](https://ko-fi.com/finnkumkar): one-time tip, no signup required.
 
 <a href="https://ko-fi.com/finnkumkar"><img src="https://storage.ko-fi.com/cdn/kofi2.png?v=6" alt="Support on Ko-fi" width="180"></a>
