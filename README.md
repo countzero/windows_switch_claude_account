@@ -225,7 +225,7 @@ Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer
 
 [MIT](LICENSE). Copyright (c) 2026 Finn Kumkar.
 
-**Unofficial tool.** Not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic PBC, used here descriptively. The script interacts with Anthropic's `~/.claude.json` config and the undocumented `/api/oauth/usage` endpoint as a third-party tool; usage is subject to Anthropic's [Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) and [Usage Policy](https://www.anthropic.com/legal/aup) in addition to this repo's MIT terms. Use only with Anthropic accounts you personally own; this tool does not enable sharing one account among multiple people.
+> **Unofficial tool.** Not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic PBC, used here descriptively. The script interacts with Anthropic's `~/.claude.json` config and the undocumented `/api/oauth/usage` endpoint as a third-party tool; usage is subject to Anthropic's [Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) and [Usage Policy](https://www.anthropic.com/legal/aup) in addition to this repo's MIT terms. Use only with Anthropic accounts you personally own; this tool does not enable sharing one account among multiple people.
 
 ## Support
 
