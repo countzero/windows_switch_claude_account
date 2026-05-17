@@ -1688,11 +1688,6 @@ function Invoke-SwitchAction {
     # header.
     Write-Host ''
     Format-ListTable -Slots @(Get-Slots) -SuppressHeader
-
-    # Cyan `[Info]` apply hint, last line beneath the table. With the
-    # ~/.claude.json oauthAccount swap above, starting Claude Code
-    # fresh will show the new slot's email immediately on /status.
-    Write-Color "[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped)." 'Cyan'
     Write-Host ''
 }
 

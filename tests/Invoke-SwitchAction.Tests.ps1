@@ -250,30 +250,25 @@ Describe 'switch_claude_account' {
             $out | Should -Match "Switched to 'work' \(alice@example\.com\)(?!\.)"
         }
 
-        It "[Info] hint appears beneath the table" {
+        It "table appears beneath the [Switch] header" {
             New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
             New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Content 'B' | Out-Null
 
             $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
 
-            # New wording: "Start Claude Code to apply the new identity";
-            # both the email-in-status and the tokens are now swapped
-            # together, so on next start /status reflects the new slot
-            # immediately. Also assert the previous "Restart Claude
-            # Code…running sessions" wording is gone, since the in-memory
-            # cache problem no longer applies.
-            $out | Should -Match '\[Info\] Start Claude Code to apply'
+            # The retired [Info] apply hint must not reappear; the previous
+            # "Restart Claude Code…running sessions" wording from before
+            # the refuse-while-running guard is also gone.
+            $out | Should -Not -Match '\[Info\] Start'
             $out | Should -Not -Match 'running sessions may continue'
 
-            # Ordering check: [Switch] header < table row < [Info] hint.
+            # Ordering check: [Switch] header < active table row.
             $switchIdx = $out.IndexOf('[Switch] Switched')
             $rowIdx    = ($out | Select-String -Pattern '(?m)^\s+\*\s+alpha\s').Matches[0].Index
-            $infoIdx   = $out.IndexOf('[Info] Start')
             $switchIdx | Should -BeLessThan $rowIdx
-            $rowIdx    | Should -BeLessThan $infoIdx
         }
 
-        It "single-slot no-op suppresses the [Info] hint" {
+        It "single-slot no-op skips the success line and table" {
             New-SlotPair -CredDir $script:CredDirPath -Name 'only' -Content 'X' | Out-Null
             Set-Content -LiteralPath $script:CredFilePath -Value 'X' -NoNewline
 
@@ -281,7 +276,6 @@ Describe 'switch_claude_account' {
 
             $out | Should -Match 'Only one slot'
             $out | Should -Match 'already active'
-            $out | Should -Not -Match '\[Info\] Start'
             $out | Should -Not -Match 'Switched to'
         }
     }
