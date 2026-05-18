@@ -212,6 +212,11 @@ $verboseLines = @(
 #   3. Latched '[Auto] Rotated from "<from>" to "<to>" at HH:mm:ss'
 #      footer line above the '[Watch] Last poll' line. Wording matches
 #      Invoke-AutoRotationStep at switch_claude_account.ps1:3607.
+#      Narrative: the active slot in the table (marked with '*') is
+#      the rotation DESTINATION; the rotation SOURCE is the row at
+#      100% utilization. With the body rows below 'work' is active
+#      (the destination) and 'legacy' is at the 100% Week limit (the
+#      source).
 #
 # Body rows identical to $watchLines so the two SVGs diff visually as
 # auto-mode-on vs. auto-mode-off with no other deltas.
@@ -233,7 +238,7 @@ $watchAutoLines = @(
     "$YELLO    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit$RESET",
     "$RED    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d$RESET",
     "",
-    "$DKGRY[Auto] Rotated from `"client-acme`" to `"personal`" at 14:31:58$RESET",
+    "$DKGRY[Auto] Rotated from `"legacy`" to `"work`" at 14:31:58$RESET",
     "$DKGRY[Watch] Last poll at 14:32:07$RESET"
 )
 
