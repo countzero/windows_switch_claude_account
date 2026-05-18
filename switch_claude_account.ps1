@@ -99,12 +99,13 @@ Param (
     # -Threshold: utilization percentage at or above which -Auto rotates.
     # Applied to max(five_hour.utilization, seven_day.utilization) on the
     # active slot; null bucket counts as 0%. Bound to the 'Watch' set so
-    # the binder rejects it without -Watch. Range [1, 100]; default 100
-    # matches the issue's literal "reached a usage limit" wording so the
-    # tool never burns a slot prematurely. Ignored when -Auto is absent.
+    # the binder rejects it without -Watch. Range [1, 100]; default 95
+    # leaves a small safety margin because /api/oauth/usage reporting
+    # lags real consumption; rotating exactly at 100 risks overshooting
+    # before the next poll lands. Ignored when -Auto is absent.
     [Parameter(ParameterSetName = 'Watch')]
     [ValidateRange(1, 100)]
-    [int] $Threshold = 100,
+    [int] $Threshold = 95,
 
     # -NoColor: suppress all ANSI color output for this invocation. We
     # implement no-color via two cooperating pieces:
@@ -816,8 +817,8 @@ function Show-Help {
         "  $cmd usage                             # show Session + Week usage for every slot",
         "  $cmd usage -Watch                      # live refresh; 60s polls; Ctrl-C to quit",
         "  $cmd usage -Watch -Interval 300        # slower refresh (floor is 60s)",
-        "  $cmd usage -Watch -Auto                # auto-rotate when active slot hits 100% (OpenCode only)",
-        "  $cmd usage -Watch -Auto -Threshold 95  # rotate at 95% on either bucket",
+        "  $cmd usage -Watch -Auto                # auto-rotate when active slot hits 95% (OpenCode only)",
+        "  $cmd usage -Watch -Auto -Threshold 90  # rotate earlier (default is 95%)",
         "  $cmd usage -Json                       # emit usage as JSON for scripting",
         "  $cmd usage -NoColor                    # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
         "",
@@ -3253,9 +3254,10 @@ function Invoke-UsageAction {
         # (notably the test suite) that bypass the top-level Param.
         [switch] $Auto,
         # -Threshold: percentage at or above which -Auto rotates. Default
-        # 100 (matches the issue's literal "reached a usage limit"); range
-        # enforced by [ValidateRange(1,100)] on the top-level Param block.
-        [int]    $Threshold = 100
+        # 95 leaves a small safety margin because /api/oauth/usage
+        # reporting lags real consumption; range enforced by
+        # [ValidateRange(1,100)] on the top-level Param block.
+        [int]    $Threshold = 95
     )
 
     # The top-level Param block enforces -Json/-Watch mutual exclusion via
@@ -3690,7 +3692,7 @@ function Invoke-UsageWatch {
         [switch] $Auto,
         # -Threshold: utilization percentage (1..100) at or above which
         # -Auto fires a rotation. Ignored when -Auto is absent.
-        [int]    $Threshold = 100
+        [int]    $Threshold = 95
     )
 
     # Pre-loop Claude Code guard for -Auto. The credentials swap inside

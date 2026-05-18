@@ -171,8 +171,8 @@ The terminal-tab title is updated on every poll so a backgrounded watch is glanc
 Add `-Auto` to the watch loop to auto-rotate to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold:
 
 ```powershell
-sca usage -Watch -Auto                  # rotate when active slot hits 100%
-sca usage -Watch -Auto -Threshold 95    # rotate at 95% on either bucket
+sca usage -Watch -Auto                  # rotate when active slot hits 95% (default)
+sca usage -Watch -Auto -Threshold 90    # rotate earlier on either bucket
 ```
 
 Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Auto] No free slot available! Cooling down for 1h 12m.`. Auto-mode is indicated on every frame by a right-aligned `⏵⏵ switching slot at N%` header indicator plus a latched `[Auto] …` footer line (`Enabled` / `Rotated from "A" to "B" at HH:mm:ss` / `No free slot available! Cooling down for X` / `Rotation refused! Claude Code is running.` / `Rotation failed! <message>`).

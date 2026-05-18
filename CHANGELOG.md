@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `sca usage -Watch -Auto` default `-Threshold` lowered from 100 to 95 to absorb `/api/oauth/usage` reporting lag. Pass `-Threshold 100` to restore previous behavior.
+
 ## [2.0.2] - 2026-05-03
 
 ### Added
