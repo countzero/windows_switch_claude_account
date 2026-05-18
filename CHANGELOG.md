@@ -4,10 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.1.0] - 2026-05-18
+
+### Added
+- `sca usage -Watch -Auto [-Threshold <1..100>]` auto-rotates to the next eligible slot when the active slot's utilization reaches the threshold (default 95).
+- Right-aligned `▶ switching slot at N%` header indicator and latched `[Auto] …` footer line on the watch frame when `-Auto` is set.
+- `Invoke-SlotSwap` extracted from `Invoke-SwitchAction` as the shared atomic swap primitive used by `sca switch` and the auto-rotation step.
+- `docs/images/usage-watch-auto.svg` rendered example for the auto-mode watch frame; promoted to the README hero image.
 
 ### Changed
-- `sca usage -Watch -Auto` default `-Threshold` lowered from 100 to 95 to absorb `/api/oauth/usage` reporting lag. Pass `-Threshold 100` to restore previous behavior.
+- `sca switch` output no longer ends with the cyan `[Info]` apply hint.
+- README restructured: dashboard hoisted above the fold, watch content relocated into the Usage subsection, disclaimer blockquote-styled, Support section reframed.
+- README usage screenshots rendered at a uniform 720px canvas and pinned to 1× intrinsic width via the HTML `width` attribute.
 
 ## [2.0.2] - 2026-05-03
 
