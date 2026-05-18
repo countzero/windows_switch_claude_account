@@ -175,7 +175,11 @@ sca usage -Watch -Auto                  # rotate when active slot hits 95% (defa
 sca usage -Watch -Auto -Threshold 90    # rotate earlier on either bucket
 ```
 
-Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Auto] No free slot available! Cooling down for 1h 12m.`. Auto-mode is indicated on every frame by a right-aligned `⏵⏵ switching slot at N%` header indicator plus a latched `[Auto] …` footer line (`Enabled` / `Rotated from "A" to "B" at HH:mm:ss` / `No free slot available! Cooling down for X` / `Rotation refused! Claude Code is running.` / `Rotation failed! <message>`).
+Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Auto] No free slot available! Cooling down for 1h 12m.`. Auto-mode is indicated on every frame by a right-aligned `⏵⏵ switching slot at N%` header indicator plus a latched `[Auto] …` footer line.
+
+<p align="center">
+  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: same five-row slot table as the watch view, with a right-aligned '⏵⏵ switching slot at 95%' header indicator and a '[Auto] Rotated from \"client-acme\" to \"personal\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+</p>
 
 > [!IMPORTANT]
 > **OpenCode-scoped feature.** Requires [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, which re-reads `~/.claude/.credentials.json` on cache miss so a swap propagates to a running OpenCode process without restart. **Claude Code itself is NOT supported**: its in-memory `~/.claude.json` cache would race the swap, so `sca usage -Auto` refuses to start (and to rotate mid-watch) while `claude.exe` is running. Close Claude Code before enabling `-Auto`; OpenCode can keep running.
