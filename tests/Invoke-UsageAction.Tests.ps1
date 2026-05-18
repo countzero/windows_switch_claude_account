@@ -1628,6 +1628,39 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Invoke-UsageAction -Auto integration' {
+        # These exercise Invoke-UsageAction's own -Auto plumbing (not the
+        # watch loop, which requires an interactive terminal). The watch
+        # loop's auto-rotation step is unit-tested in
+        # Invoke-AutoRotation.Tests.ps1; here we cover the action-level
+        # contract: param mutual-exclusion guards and the Claude-Code
+        # running startup refusal that fires inside Invoke-UsageWatch.
+
+        It '-Auto without -Watch is rejected by the runtime guard' {
+            { Invoke-UsageAction -Auto 6>$null } | Should -Throw -ExpectedMessage '*-Auto requires -Watch*'
+        }
+
+        It '-Watch -Auto with Claude Code running throws at startup before entering the alt-screen buffer' {
+            # [Console]::IsOutputRedirected is true under Pester, so the
+            # watch loop normally short-circuits with "requires an
+            # interactive terminal". The Claude-Code guard fires AFTER
+            # that one, so we mock IsOutputRedirected away here. The
+            # cleanest path is to verify the guard via a direct call to
+            # Invoke-UsageWatch with Test-ClaudeRunning mocked $true; the
+            # IsOutputRedirected check would short-circuit it otherwise.
+            Mock Test-ClaudeRunning -MockWith { $true }
+
+            { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*sca usage -Auto*'
+        }
+
+        It '-Watch -Auto with Claude Code NOT running passes the startup guard and short-circuits on IsOutputRedirected' {
+            # Test-ClaudeRunning's default mock returns $false. The guard
+            # silently passes; the alt-screen / IsOutputRedirected guard
+            # throws next because Pester's stdout is redirected.
+            { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
+        }
+    }
+
     AfterAll {
         $env:USERPROFILE = $script:OriginalUserProfile
         $global:PROFILE  = $script:OriginalProfile

@@ -188,10 +188,60 @@ $verboseLines = @(
     "  Week        42%  Resets Apr 28, 9am Europe/Berlin"
 )
 
+# --- Block 4: usage -Watch -Auto -------------------------------------------
+# Same five-row watch frame as Block 1, plus the two auto-mode artifacts:
+#
+#   1. Right-aligned header indicator '▶ switching slot at 95%'. Glyph
+#      in Gray (white-ish, high-contrast lozenge); text in DarkGray
+#      (matches footer ambient-metadata weight). See Format-UsageTable in
+#      switch_claude_account.ps1 around line 2779-2810 for the runtime's
+#      three-segment Write-Color composition we are imitating here.
+#
+#      Pad count math (right-edge alignment): widest body row in the
+#      watch frame is 78 cols (e.g. the 'legacy' row). Header
+#      '[Usage] Plan usage' = 18 chars. Indicator '▶ switching slot at
+#      95%' = 23 chars ('▶' = 1 by .Length, matching the runtime which
+#      also uses .Length for its width math). Pad = 78 - 18 - 23 = 37.
+#      Result: indicator's right edge lines up with the right edge of
+#      the table's Status column.
+#
+#   2. Extra blank line under the header (the '$AutoThreshold -gt 0'
+#      branch in Format-UsageTable, switch_claude_account.ps1:2816-2818)
+#      to balance the visually busier right-aligned indicator.
+#
+#   3. Latched '[Auto] Rotated from "<from>" to "<to>" at HH:mm:ss'
+#      footer line above the '[Watch] Last poll' line. Wording matches
+#      Invoke-AutoRotationStep at switch_claude_account.ps1:3607.
+#
+# Body rows identical to $watchLines so the two SVGs diff visually as
+# auto-mode-on vs. auto-mode-off with no other deltas.
+$autoHeaderPad   = ' ' * 37
+$autoGlyph       = "$([char]0x25B6)"
+$watchAutoLines = @(
+    "$DKYEL[Usage] Plan usage$RESET$autoHeaderPad$GRAY$autoGlyph$RESET$DKGRY switching slot at 95%$RESET",
+    "",
+    "",
+    "$GREEN  Session [█████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  22%$RESET",
+    "",
+    "$YELLO  Week    [███████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%$RESET",
+    "",
+    "    Slot         Account                Session        Week         Status",
+    "    -----------  ---------------------  -------------  -----------  ------",
+    "$GREEN  * work         alex@acme.io            18% (2h 11m)   42% (102h)  ok$RESET",
+    "$GRAY    personal     alex.dev@gmail.com       3% (4h 02m)    7% (146h)  ok$RESET",
+    "$GRAY    dev          alex@startup.dev         9% (3h 41m)   34% (118h)  ok$RESET",
+    "$YELLO    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit$RESET",
+    "$RED    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d$RESET",
+    "",
+    "$DKGRY[Auto] Rotated from `"client-acme`" to `"personal`" at 14:31:58$RESET",
+    "$DKGRY[Watch] Last poll at 14:32:07$RESET"
+)
+
 $scenarios = @(
-    [pscustomobject]@{ Name = 'usage-watch';   Lines = $watchLines   },
-    [pscustomobject]@{ Name = 'usage-table';   Lines = $tableLines   },
-    [pscustomobject]@{ Name = 'usage-verbose'; Lines = $verboseLines }
+    [pscustomobject]@{ Name = 'usage-watch';      Lines = $watchLines     },
+    [pscustomobject]@{ Name = 'usage-table';      Lines = $tableLines     },
+    [pscustomobject]@{ Name = 'usage-verbose';    Lines = $verboseLines   },
+    [pscustomobject]@{ Name = 'usage-watch-auto'; Lines = $watchAutoLines }
 )
 
 # --- Render -----------------------------------------------------------------

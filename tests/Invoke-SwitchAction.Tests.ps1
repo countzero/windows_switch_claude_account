@@ -250,30 +250,25 @@ Describe 'switch_claude_account' {
             $out | Should -Match "Switched to 'work' \(alice@example\.com\)(?!\.)"
         }
 
-        It "[Info] hint appears beneath the table" {
+        It "table appears beneath the [Switch] header" {
             New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
             New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Content 'B' | Out-Null
 
             $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
 
-            # New wording: "Start Claude Code to apply the new identity";
-            # both the email-in-status and the tokens are now swapped
-            # together, so on next start /status reflects the new slot
-            # immediately. Also assert the previous "Restart Claude
-            # Code…running sessions" wording is gone, since the in-memory
-            # cache problem no longer applies.
-            $out | Should -Match '\[Info\] Start Claude Code to apply'
+            # The retired [Info] apply hint must not reappear; the previous
+            # "Restart Claude Code…running sessions" wording from before
+            # the refuse-while-running guard is also gone.
+            $out | Should -Not -Match '\[Info\] Start'
             $out | Should -Not -Match 'running sessions may continue'
 
-            # Ordering check: [Switch] header < table row < [Info] hint.
+            # Ordering check: [Switch] header < active table row.
             $switchIdx = $out.IndexOf('[Switch] Switched')
             $rowIdx    = ($out | Select-String -Pattern '(?m)^\s+\*\s+alpha\s').Matches[0].Index
-            $infoIdx   = $out.IndexOf('[Info] Start')
             $switchIdx | Should -BeLessThan $rowIdx
-            $rowIdx    | Should -BeLessThan $infoIdx
         }
 
-        It "single-slot no-op suppresses the [Info] hint" {
+        It "single-slot no-op skips the success line and table" {
             New-SlotPair -CredDir $script:CredDirPath -Name 'only' -Content 'X' | Out-Null
             Set-Content -LiteralPath $script:CredFilePath -Value 'X' -NoNewline
 
@@ -281,7 +276,6 @@ Describe 'switch_claude_account' {
 
             $out | Should -Match 'Only one slot'
             $out | Should -Match 'already active'
-            $out | Should -Not -Match '\[Info\] Start'
             $out | Should -Not -Match 'Switched to'
         }
     }
@@ -500,6 +494,69 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $oldSlot              -Raw | Should -Be 'REFRESHED'
             Get-Content -LiteralPath $script:CredFilePath  -Raw | Should -Be 'NEW_TARGET'
             (Read-ScaState).active_slot | Should -Be 'new'
+        }
+    }
+
+    Context 'Invoke-SlotSwap' {
+        # Direct tests for the swap helper extracted from
+        # Invoke-SwitchAction; the watch loop's -Auto path calls
+        # Invoke-SlotSwap directly without going through
+        # Invoke-SwitchAction's reconcile + name resolution, so the
+        # helper's invariants need their own coverage.
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:CredFilePath = Join-Path $script:CredDirPath '.credentials.json'
+            Set-SandboxClaudeJson -Email 'baseline@example.com'
+        }
+
+        It 'writes the slot bytes into .credentials.json' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content ([byte[]](0xC0,0xDE,0x01)) | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            Invoke-SlotSwap -Slot $slot 6>$null
+
+            [System.IO.File]::ReadAllBytes($script:CredFilePath) | Should -Be ([byte[]](0xC0,0xDE,0x01))
+        }
+
+        It 'updates state.active_slot to the swapped-in slot name' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            Invoke-SlotSwap -Slot $slot 6>$null
+
+            (Read-ScaState).active_slot | Should -Be 'work'
+        }
+
+        It "substitutes the slot's oauthAccount email into ~/.claude.json" {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            Invoke-SlotSwap -Slot $slot 6>$null
+
+            $claudeJson = Get-Content -LiteralPath $ClaudeJsonPath -Raw
+            $claudeJson | Should -Match '"emailAddress"\s*:\s*"alice@example\.com"'
+            # Pre-swap email is gone.
+            $claudeJson | Should -Not -Match '"emailAddress"\s*:\s*"baseline@example\.com"'
+        }
+
+        It 'does NOT print the [Switch] header line (Invoke-SwitchAction owns that, not Invoke-SlotSwap)' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            $out = Invoke-SlotSwap -Slot $slot 6>&1 | Out-String
+
+            $out | Should -Not -Match '\[Switch\] Switched to'
+        }
+
+        It 'does NOT call Test-ClaudeRunning itself (caller is responsible for that guard)' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            Mock Test-ClaudeRunning -MockWith { $true }
+
+            { Invoke-SlotSwap -Slot $slot 6>$null } | Should -Not -Throw
+            Should -Invoke Test-ClaudeRunning -Times 0
         }
     }
 

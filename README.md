@@ -2,10 +2,10 @@
 
 [![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.2+](https://img.shields.io/badge/PowerShell-7.2%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
 
-A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usage dashboard** across multiple accounts, plus safe save / switch / rotate. Single self-contained `.ps1`, no companion files.
+A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usage dashboard** across multiple accounts with optional **auto-rotation** when a slot hits its limit, plus safe save / switch / rotate. Single self-contained `.ps1`, no companion files.
 
 <p align="center">
-  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
+  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Auto] Rotated from \"client-acme\" to \"personal\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 ## Features
@@ -165,6 +165,24 @@ The terminal-tab title is updated on every poll so a backgrounded watch is glanc
 
 > [!NOTE]
 > The title's numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
+
+### Auto-rotate on usage limit (OpenCode only)
+
+Add `-Auto` to the watch loop to auto-rotate to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold:
+
+```powershell
+sca usage -Watch -Auto                  # rotate when active slot hits 95% (default)
+sca usage -Watch -Auto -Threshold 90    # rotate earlier on either bucket
+```
+
+Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Auto] No free slot available! Cooling down for 1h 12m.`. Auto-mode is indicated on every frame by a right-aligned `▶ switching slot at N%` header indicator plus a latched `[Auto] …` footer line.
+
+<p align="center">
+  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: same five-row slot table as the watch view, with a right-aligned '▶ switching slot at 95%' header indicator and a '[Auto] Rotated from \"client-acme\" to \"personal\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+</p>
+
+> [!IMPORTANT]
+> **OpenCode-scoped feature.** Requires [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, which re-reads `~/.claude/.credentials.json` on cache miss so a swap propagates to a running OpenCode process without restart. **Claude Code itself is NOT supported**: its in-memory `~/.claude.json` cache would race the swap, so `sca usage -Auto` refuses to start (and to rotate mid-watch) while `claude.exe` is running. Close Claude Code before enabling `-Auto`; OpenCode can keep running.
 
 ### Install / uninstall alias
 

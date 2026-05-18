@@ -28,7 +28,6 @@ The `try/finally` scope is per-`Invoke-Main`, NOT global. Tests dot-source the s
 - **Yellow**: advisories / warnings (rate-limit, reconcile auto-save, no-active-slot rotation, profile-fetch failure, `-Interval` clamping). "Attention required", never a header.
 - **Green**: success on side-effect actions (`[Save] Saved …`, `[Install] Installed!`).
 - **Red**: destructive completion (`[Remove] Removed …`, `[Uninstall] Uninstalled.`).
-- **Cyan**: info hints (`[Info] Start Claude Code …` under `switch`).
 - **DarkGray**: dimmed metadata (verbose-view account row, "no plan-usage data" fallback, watch footer).
 
 ## Summary table (`Format-UsageTable`)
@@ -101,7 +100,7 @@ the README to `▓`; the divergence is deliberate.
 
 ## Switch action output
 
-Header line + table + cyan `[Info]` hint:
+Header line + table:
 
 ```
 [Switch] Switched to 'slot-1' (ada.lovelace@arpa.net)
@@ -110,18 +109,15 @@ Header line + table + cyan `[Info]` hint:
     ------  ---------------------
   * slot-1  ada.lovelace@arpa.net
     slot-2  ada@arpa.net
-
-[Info] Start Claude Code to apply the new identity (Email + tokens are both swapped).
 ```
 
 - **Success line**: DarkYellow header, no trailing period (it's a header, not a sentence).
 - **Table**: `Format-ListTable -Slots <fresh-slots> -SuppressHeader`. Slot list re-enumerated post-switch so `*` reflects the just-updated `state.active_slot`.
-- **`[Info]` hint**: cyan, last line. Reflects post-v2.1.0 design: switch updates BOTH `.credentials.json` (tokens) AND `~/.claude.json`'s `oauthAccount` (email shown by `/status`). Suppressed for single-slot no-op.
 - **`~/.claude.json` write failure**: yellow advisory `[Switch] Tokens swapped to '<name>' but ~/.claude.json oauthAccount update failed: <reason>` followed by `Claude Code's /status email may not reflect the new slot until you fix and re-run.`
 - **Yellow advisory branches** above the success line:
   - **Reconcile advisories** (auto-save / identity-change), emitted by `Invoke-Reconcile` itself.
   - **No active slot detected** (rotation only): `[Switch] No currently active slot detected. Rotating to <ident>.` Rotation still proceeds.
-  - **Single-slot-already-active no-op** (rotation only): `[Switch] Only one slot (<ident>) and it is already active. Nothing to do.` Skips success line, table, hint. Emitted by `Get-NextSlotName` itself; returns `$null` so caller exits early.
+  - **Single-slot-already-active no-op** (rotation only): `[Switch] Only one slot (<ident>) and it is already active. Nothing to do.` Skips success line and table. Emitted by `Get-NextSlotName` itself; returns `$null` so caller exits early.
 
 `Format-SlotIdentity` is the single source of truth for dedup logic: `'<slot>' (<email>)` for labeled slots whose email differs from the slot name, `'<slot>'` (no parens) for unlabeled or dedup-form slots. Same rules as `Format-AccountCell`.
 
