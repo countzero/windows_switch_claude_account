@@ -191,7 +191,7 @@ $verboseLines = @(
 # --- Block 4: usage -Watch -Auto -------------------------------------------
 # Same five-row watch frame as Block 1, plus the two auto-mode artifacts:
 #
-#   1. Right-aligned header indicator '⏵⏵ switching slot at 95%'. Glyph
+#   1. Right-aligned header indicator '▶ switching slot at 95%'. Glyph
 #      in Gray (white-ish, high-contrast lozenge); text in DarkGray
 #      (matches footer ambient-metadata weight). See Format-UsageTable in
 #      switch_claude_account.ps1 around line 2779-2810 for the runtime's
@@ -199,9 +199,9 @@ $verboseLines = @(
 #
 #      Pad count math (right-edge alignment): widest body row in the
 #      watch frame is 78 cols (e.g. the 'legacy' row). Header
-#      '[Usage] Plan usage' = 18 chars. Indicator '⏵⏵ switching slot at
-#      95%' = 24 chars ('⏵⏵' = 2 by .Length, matching the runtime which
-#      also uses .Length for its width math). Pad = 78 - 18 - 24 = 36.
+#      '[Usage] Plan usage' = 18 chars. Indicator '▶ switching slot at
+#      95%' = 23 chars ('▶' = 1 by .Length, matching the runtime which
+#      also uses .Length for its width math). Pad = 78 - 18 - 23 = 37.
 #      Result: indicator's right edge lines up with the right edge of
 #      the table's Status column.
 #
@@ -215,8 +215,8 @@ $verboseLines = @(
 #
 # Body rows identical to $watchLines so the two SVGs diff visually as
 # auto-mode-on vs. auto-mode-off with no other deltas.
-$autoHeaderPad   = ' ' * 36
-$autoGlyph       = "$([char]0x23F5)$([char]0x23F5)"
+$autoHeaderPad   = ' ' * 37
+$autoGlyph       = "$([char]0x25B6)"
 $watchAutoLines = @(
     "$DKYEL[Usage] Plan usage$RESET$autoHeaderPad$GRAY$autoGlyph$RESET$DKGRY switching slot at 95%$RESET",
     "",

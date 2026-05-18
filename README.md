@@ -5,7 +5,7 @@
 A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usage dashboard** across multiple accounts with optional **auto-rotation** when a slot hits its limit, plus safe save / switch / rotate. Single self-contained `.ps1`, no companion files.
 
 <p align="center">
-  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '⏵⏵ switching slot at 95%' header indicator, and a '[Auto] Rotated from \"client-acme\" to \"personal\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Auto] Rotated from \"client-acme\" to \"personal\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 ## Features
@@ -175,10 +175,10 @@ sca usage -Watch -Auto                  # rotate when active slot hits 95% (defa
 sca usage -Watch -Auto -Threshold 90    # rotate earlier on either bucket
 ```
 
-Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Auto] No free slot available! Cooling down for 1h 12m.`. Auto-mode is indicated on every frame by a right-aligned `⏵⏵ switching slot at N%` header indicator plus a latched `[Auto] …` footer line.
+Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Auto] No free slot available! Cooling down for 1h 12m.`. Auto-mode is indicated on every frame by a right-aligned `▶ switching slot at N%` header indicator plus a latched `[Auto] …` footer line.
 
 <p align="center">
-  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: same five-row slot table as the watch view, with a right-aligned '⏵⏵ switching slot at 95%' header indicator and a '[Auto] Rotated from \"client-acme\" to \"personal\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: same five-row slot table as the watch view, with a right-aligned '▶ switching slot at 95%' header indicator and a '[Auto] Rotated from \"client-acme\" to \"personal\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 > [!IMPORTANT]

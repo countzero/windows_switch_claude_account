@@ -2675,7 +2675,7 @@ function Format-UsageTable {
     Param (
         [object[]] $Results,
         [switch]   $IncludeAggregateBars,
-        # When > 0, append a right-aligned '⏵⏵ switching slot at N%'
+        # When > 0, append a right-aligned '▶ switching slot at N%'
         # indicator to the '[Usage] Plan usage' header line. Used by
         # the watch loop's -Auto mode to indicate auto-rotation is
         # engaged. The indicator's right edge anchors to the terminal
@@ -2767,7 +2767,7 @@ function Format-UsageTable {
     # treat that as "narrow" and drop the indicator.
     #
     # Indicator visual: '<glyph><space><text>' where:
-    #   glyph = '⏵⏵' (U+23F5 U+23F5, "fast-forward / advance"), white
+    #   glyph = '▶' (U+25B6, "black right-pointing triangle"), white
     #           (high-contrast lozenge so the auto-mode signal pops
     #            against the dimmer header / footer text).
     #   text  = 'switching slot at N%', DarkGray (matches the footer
@@ -2781,7 +2781,7 @@ function Format-UsageTable {
     $autoText    = $null
     $autoPadding = $null
     if ($AutoThreshold -gt 0) {
-        $autoGlyph    = "$([char]0x23F5)$([char]0x23F5)"
+        $autoGlyph    = "$([char]0x25B6)"
         $autoText     = " switching slot at $AutoThreshold%"
         $indicatorLen = $autoGlyph.Length + $autoText.Length
         $termWidth    = try { [Console]::WindowWidth } catch { 0 }
@@ -3062,7 +3062,7 @@ function Get-UsageSnapshot {
 #                   strings are split and each line rendered in the
 #                   DarkGray information color.
 # -AutoThreshold  : when set (1..100), append a right-aligned
-#                   '⏵⏵ switching slot at N%' indicator to the
+#                   '▶ switching slot at N%' indicator to the
 #                   `[Usage] Plan usage` header. Used by `sca usage
 #                   -Watch -Auto` to indicate auto-rotation is engaged.
 #                   Width-aware: if the terminal is too narrow to fit
