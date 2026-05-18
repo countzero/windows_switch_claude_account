@@ -166,6 +166,20 @@ The terminal-tab title is updated on every poll so a backgrounded watch is glanc
 > [!NOTE]
 > The title's numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
+### Auto-rotate on usage limit (OpenCode only)
+
+Add `-Auto` to the watch loop to auto-rotate to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold:
+
+```powershell
+sca usage -Watch -Auto                  # rotate when active slot hits 100%
+sca usage -Watch -Auto -Threshold 95    # rotate at 95% on either bucket
+```
+
+Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Auto] No free slot available! Cooling down for 1h 12m.`. Auto-mode is indicated on every frame by a right-aligned `⏵⏵ switching slot at N%` header indicator plus a latched `[Auto] …` footer line (`Enabled` / `Rotated from "A" to "B" at HH:mm:ss` / `No free slot available! Cooling down for X` / `Rotation refused! Claude Code is running.` / `Rotation failed! <message>`).
+
+> [!IMPORTANT]
+> **OpenCode-scoped feature.** Requires [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, which re-reads `~/.claude/.credentials.json` on cache miss so a swap propagates to a running OpenCode process without restart. **Claude Code itself is NOT supported**: its in-memory `~/.claude.json` cache would race the swap, so `sca usage -Auto` refuses to start (and to rotate mid-watch) while `claude.exe` is running. Close Claude Code before enabling `-Auto`; OpenCode can keep running.
+
 ### Install / uninstall alias
 
 ```powershell

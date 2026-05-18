@@ -497,6 +497,69 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Invoke-SlotSwap' {
+        # Direct tests for the swap helper extracted from
+        # Invoke-SwitchAction; the watch loop's -Auto path calls
+        # Invoke-SlotSwap directly without going through
+        # Invoke-SwitchAction's reconcile + name resolution, so the
+        # helper's invariants need their own coverage.
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:CredFilePath = Join-Path $script:CredDirPath '.credentials.json'
+            Set-SandboxClaudeJson -Email 'baseline@example.com'
+        }
+
+        It 'writes the slot bytes into .credentials.json' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content ([byte[]](0xC0,0xDE,0x01)) | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            Invoke-SlotSwap -Slot $slot 6>$null
+
+            [System.IO.File]::ReadAllBytes($script:CredFilePath) | Should -Be ([byte[]](0xC0,0xDE,0x01))
+        }
+
+        It 'updates state.active_slot to the swapped-in slot name' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            Invoke-SlotSwap -Slot $slot 6>$null
+
+            (Read-ScaState).active_slot | Should -Be 'work'
+        }
+
+        It "substitutes the slot's oauthAccount email into ~/.claude.json" {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            Invoke-SlotSwap -Slot $slot 6>$null
+
+            $claudeJson = Get-Content -LiteralPath $ClaudeJsonPath -Raw
+            $claudeJson | Should -Match '"emailAddress"\s*:\s*"alice@example\.com"'
+            # Pre-swap email is gone.
+            $claudeJson | Should -Not -Match '"emailAddress"\s*:\s*"baseline@example\.com"'
+        }
+
+        It 'does NOT print the [Switch] header line (Invoke-SwitchAction owns that, not Invoke-SlotSwap)' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            $out = Invoke-SlotSwap -Slot $slot 6>&1 | Out-String
+
+            $out | Should -Not -Match '\[Switch\] Switched to'
+        }
+
+        It 'does NOT call Test-ClaudeRunning itself (caller is responsible for that guard)' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
+            $slot = Find-SlotByName -Name 'work'
+
+            Mock Test-ClaudeRunning -MockWith { $true }
+
+            { Invoke-SlotSwap -Slot $slot 6>$null } | Should -Not -Throw
+            Should -Invoke Test-ClaudeRunning -Times 0
+        }
+    }
+
     AfterAll {
         $env:USERPROFILE = $script:OriginalUserProfile
         $global:PROFILE  = $script:OriginalProfile

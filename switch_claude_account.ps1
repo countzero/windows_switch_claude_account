@@ -84,6 +84,28 @@ Param (
     [ValidateRange(1, [int]::MaxValue)]
     [int] $Interval = 60,
 
+    # -Auto: in `sca usage -Watch -Auto`, auto-rotate to the next eligible
+    # slot when the active slot's max(five_hour, seven_day) utilization
+    # reaches -Threshold. Bound to the 'Watch' parameter set so the
+    # binder rejects -Auto without -Watch. OpenCode-scoped (matches
+    # issue #8): the opencode-claude-auth plugin re-reads .credentials.json
+    # on cache miss (v1.5.4+), so rotation propagates without restarting
+    # OpenCode. Claude Code's in-memory ~/.claude.json cache makes the
+    # same rotation unsafe under a running Claude Code, so -Auto refuses
+    # to operate while claude.exe is running (same guard as `sca switch`).
+    [Parameter(ParameterSetName = 'Watch')]
+    [switch] $Auto,
+
+    # -Threshold: utilization percentage at or above which -Auto rotates.
+    # Applied to max(five_hour.utilization, seven_day.utilization) on the
+    # active slot; null bucket counts as 0%. Bound to the 'Watch' set so
+    # the binder rejects it without -Watch. Range [1, 100]; default 100
+    # matches the issue's literal "reached a usage limit" wording so the
+    # tool never burns a slot prematurely. Ignored when -Auto is absent.
+    [Parameter(ParameterSetName = 'Watch')]
+    [ValidateRange(1, 100)]
+    [int] $Threshold = 100,
+
     # -NoColor: suppress all ANSI color output for this invocation. We
     # implement no-color via two cooperating pieces:
     #   1. The `Write-Color` helper wraps every colored message string
@@ -786,16 +808,18 @@ function Show-Help {
         "  -NoColor         Suppress all ANSI color output (also: set NO_COLOR env var)",
         "",
         "EXAMPLES",
-        "  $cmd save slot-1                 # save current login as 'slot-1'",
-        "  $cmd switch slot-2               # activate the 'slot-2' slot",
-        "  $cmd switch                      # rotate to the next saved slot",
-        "  $cmd list                        # show all slots",
-        "  $cmd remove slot-1               # delete a slot",
-        "  $cmd usage                       # show Session + Week usage for every slot",
-        "  $cmd usage -Watch                # live refresh; 60s polls; Ctrl-C to quit",
-        "  $cmd usage -Watch -Interval 300  # slower refresh (floor is 60s)",
-        "  $cmd usage -Json                 # emit usage as JSON for scripting",
-        "  $cmd usage -NoColor              # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
+        "  $cmd save slot-1                       # save current login as 'slot-1'",
+        "  $cmd switch slot-2                     # activate the 'slot-2' slot",
+        "  $cmd switch                            # rotate to the next saved slot",
+        "  $cmd list                              # show all slots",
+        "  $cmd remove slot-1                     # delete a slot",
+        "  $cmd usage                             # show Session + Week usage for every slot",
+        "  $cmd usage -Watch                      # live refresh; 60s polls; Ctrl-C to quit",
+        "  $cmd usage -Watch -Interval 300        # slower refresh (floor is 60s)",
+        "  $cmd usage -Watch -Auto                # auto-rotate when active slot hits 100% (OpenCode only)",
+        "  $cmd usage -Watch -Auto -Threshold 95  # rotate at 95% on either bucket",
+        "  $cmd usage -Json                       # emit usage as JSON for scripting",
+        "  $cmd usage -NoColor                    # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
         "",
         "FILES",
         "  Active login : %USERPROFILE%\.claude\.credentials.json",
@@ -806,6 +830,10 @@ function Show-Help {
         "  * Close Claude Code / VS Code before 'save' or 'switch' (file locks).",
         "  * OAuth tokens expire after ~1h idle; stale slots need re-saving.",
         "  * Invalid Windows filename chars in <name> are replaced with '_'.",
+        "  * -Auto requires Claude Code to be closed (it writes ~/.claude.json's identity",
+        "    block; Claude Code caches it in memory). OpenCode + opencode-claude-auth",
+        "    >= 1.5.4 picks up the credentials swap from .credentials.json automatically;",
+        "    no OpenCode restart needed.",
         ""
     )
 
@@ -1589,6 +1617,64 @@ function Invoke-SaveAction {
     Write-Color "[Save] Saved as $(Format-SlotIdentity -Name $safeName -Email $email)$sourceTail" 'Green'
 }
 
+# Pure swap mechanism, factored out of Invoke-SwitchAction so the watch
+# loop's -Auto path can rotate without rendering the `[Switch]` header
+# or the saved-slot table that follows it in the user-facing switch
+# action. Side effects only:
+#
+#   1. Atomic-rename write the slot's bytes into .credentials.json.
+#   2. Substitute the destination slot's captured oauthAccount into
+#      ~/.claude.json's top-level oauthAccount block. Failure here is
+#      surfaced as a yellow advisory (NOT fatal): the credentials swap
+#      has already happened, so the user sees the partial-success state
+#      and can re-run once the ~/.claude.json issue clears.
+#   3. Update $StateFile so state.active_slot points at the destination
+#      and state.last_sync_hash matches the new credentials bytes.
+#
+# Preconditions (callers MUST enforce):
+#   * Test-ClaudeRunning returned $false. The ~/.claude.json write
+#     races Claude Code's in-memory oauthAccount cache; this helper
+#     does NOT recheck the running guard.
+#   * $Slot has a valid sidecar (the caller resolved it via
+#     Find-SlotByName / Get-Slots, both of which filter out
+#     sidecar-less slots).
+#
+# No reconcile prelude here either; the caller's higher-level workflow
+# already reconciled or has its own per-tick capture (the watch loop's
+# per-poll Invoke-Reconcile covers the -Auto case).
+function Invoke-SlotSwap {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Slot
+    )
+
+    # Atomic-rename copy: works even if Claude Code has .credentials.json
+    # open (it grants share-delete); but with the running guard enforced
+    # by the caller, this path normally only executes when Claude Code
+    # is closed. Bytes are read from the slot file once and reused for
+    # both the write and the state hash so the post-swap state.hash
+    # matches the bytes we just wrote (not a re-read that could race a
+    # concurrent refresh from another tool).
+    $slotBytes = [System.IO.File]::ReadAllBytes($Slot.Path)
+    Set-CredentialFileAtomic -Path $CredFile -Bytes $slotBytes
+
+    # Restore the captured oauthAccount into ~/.claude.json so Claude
+    # Code's /status display matches the active slot on next start.
+    # Failure to write ~/.claude.json (file locked, malformed,
+    # disappeared) is surfaced as an advisory; we do NOT rollback the
+    # credentials write because Claude Code (or the OpenCode plugin in
+    # the -Auto case) may have already started using the new tokens.
+    try {
+        Set-OAuthAccountInClaudeJson -OAuthAccount $Slot.Sidecar.oauthAccount
+    }
+    catch {
+        Write-Color "[Switch] Tokens swapped to '$($Slot.Name)' but ~/.claude.json oauthAccount update failed: $($_.Exception.Message)" 'Yellow'
+        Write-Color "[Switch] Claude Code's /status email may not reflect the new slot until you fix and re-run." 'Yellow'
+    }
+
+    $hash = Get-SHA256Hex -Bytes $slotBytes
+    Update-ScaState -ActiveSlot $Slot.Name -LastSyncHash $hash | Out-Null
+}
+
 function Invoke-SwitchAction {
     Param ([String] $Name)
 
@@ -1644,34 +1730,11 @@ function Invoke-SwitchAction {
         throw "Slot '$safeName' not found (or missing its identity sidecar; re-save while active to recapture)."
     }
 
-    # Atomic-rename copy: works even if Claude Code has .credentials.json
-    # open (it grants share-delete); but with the running guard above,
-    # this path normally only executes when Claude Code is closed.
-    # Bytes are read from the slot file once and reused for both the
-    # write and the state hash.
-    $slotBytes = [System.IO.File]::ReadAllBytes($slot.Path)
-    Set-CredentialFileAtomic -Path $CredFile -Bytes $slotBytes
-
-    # Restore the captured oauthAccount into ~/.claude.json so Claude
-    # Code's /status display matches the active slot on next start.
-    # The sidecar is guaranteed valid here (Get-Slots filtered out
-    # sidecar-less slots), so $slot.Sidecar.oauthAccount is populated.
-    # Failure to write ~/.claude.json (file locked, malformed,
-    # disappeared) bubbles up; the credentials swap has already
-    # happened, so the user sees the error and can rerun once the
-    # condition clears. We do NOT rollback the credentials write
-    # because Claude Code may have already started using the new
-    # tokens; rolling back would create more confusion.
-    try {
-        Set-OAuthAccountInClaudeJson -OAuthAccount $slot.Sidecar.oauthAccount
-    }
-    catch {
-        Write-Color "[Switch] Tokens swapped to '$safeName' but ~/.claude.json oauthAccount update failed: $($_.Exception.Message)" 'Yellow'
-        Write-Color "[Switch] Claude Code's /status email may not reflect the new slot until you fix and re-run." 'Yellow'
-    }
-
-    $hash = Get-SHA256Hex -Bytes $slotBytes
-    Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
+    # Perform the swap via the extracted pure-mechanism helper. Any
+    # ~/.claude.json write failure is surfaced as an advisory by the
+    # helper (yellow, not fatal) so the credentials swap is observable
+    # even when the identity update fails.
+    Invoke-SlotSwap -Slot $slot
 
     # DarkYellow header line; matches the `[List] Saved slots` /
     # `[Usage] Plan usage` convention so all three actions present a
@@ -2610,7 +2673,18 @@ function Format-AggregateBars {
 function Format-UsageTable {
     Param (
         [object[]] $Results,
-        [switch]   $IncludeAggregateBars
+        [switch]   $IncludeAggregateBars,
+        # When > 0, append a right-aligned '⏵⏵ switching slot at N%'
+        # indicator to the '[Usage] Plan usage' header line. Used by
+        # the watch loop's -Auto mode to indicate auto-rotation is
+        # engaged. The indicator's right edge anchors to the terminal
+        # width minus 1 (preserves a 1-char right margin); when the
+        # terminal is too narrow to fit the left header AND a 2-space
+        # gap AND the indicator, the indicator is silently dropped
+        # (the footer's [Auto] line still carries the state). When
+        # -Auto is set, an extra blank line is inserted under the
+        # header to balance the visually-busier right-aligned indicator.
+        [int]      $AutoThreshold = 0
     )
 
     if (-not $Results) { return }
@@ -2681,8 +2755,66 @@ function Format-UsageTable {
     # + 2 + statusW.
     $totalLineWidth = 2 + 1 + 1 + $nameW + 2 + $acctW + 2 + $fiveW + 2 + $sevenW + 2 + $statusW
 
-    Write-Color "[Usage] Plan usage" 'DarkYellow'
+    # Header: '[Usage] Plan usage' left-anchored, optional right-aligned
+    # auto-mode indicator. The indicator is computed against the terminal
+    # width ([Console]::WindowWidth) so it floats to the right edge with
+    # a 1-column right margin. Width-aware fallback: when the terminal
+    # is too narrow to fit both segments with a 2-space minimum gap, the
+    # indicator is silently dropped (the footer's [Auto] line still
+    # carries the state, so no information is lost). [Console]::WindowWidth
+    # can throw in non-interactive hosts (tests, ssh-tty absent); we
+    # treat that as "narrow" and drop the indicator.
+    #
+    # Indicator visual: '<glyph><space><text>' where:
+    #   glyph = '⏵⏵' (U+23F5 U+23F5, "fast-forward / advance"), white
+    #           (high-contrast lozenge so the auto-mode signal pops
+    #            against the dimmer header / footer text).
+    #   text  = 'switching slot at N%', DarkGray (matches the footer
+    #           '[Watch]' / '[Auto]' line color so the indicator recedes
+    #           into ambient-metadata weight).
+    # Rendered via three Write-Color calls with -NoNewline so each segment
+    # carries its own SGR color while the line is still a single logical
+    # row. The trailing un-piped Write-Host '' terminates the row.
+    $headerLeft  = '[Usage] Plan usage'
+    $autoGlyph   = $null
+    $autoText    = $null
+    $autoPadding = $null
+    if ($AutoThreshold -gt 0) {
+        $autoGlyph    = "$([char]0x23F5)$([char]0x23F5)"
+        $autoText     = " switching slot at $AutoThreshold%"
+        $indicatorLen = $autoGlyph.Length + $autoText.Length
+        $termWidth    = try { [Console]::WindowWidth } catch { 0 }
+        # Reserve 1 col right margin so the indicator isn't flush with
+        # the terminal edge. Need: leftLen + 2 (min gap) + indicatorLen
+        # + 1 (right margin) <= width.
+        if ($termWidth -lt ($headerLeft.Length + 2 + $indicatorLen + 1)) {
+            $autoGlyph = $null
+            $autoText  = $null
+        } else {
+            $padCount    = $termWidth - $headerLeft.Length - $indicatorLen - 1
+            $autoPadding = ' ' * $padCount
+        }
+    }
+    if ($autoGlyph) {
+        # Three-segment colored line: DarkYellow header + padding (no
+        # color) + white glyph (high-contrast lozenge) + DarkGray text
+        # (matches footer ambient-metadata color). -NoNewline chains
+        # them onto one logical row; final Write-Host '' below terminates.
+        Write-Color $headerLeft  'DarkYellow' -NoNewline
+        Write-Host  $autoPadding -NoNewline
+        Write-Color $autoGlyph   'Gray'       -NoNewline
+        Write-Color $autoText    'DarkGray'
+    } else {
+        Write-Color $headerLeft 'DarkYellow'
+    }
     Write-Host ''
+    # Extra breathing room under the header when -Auto is engaged: the
+    # right-side indicator makes the header row visually busier, so an
+    # additional blank balances the layout. Without -Auto the original
+    # one-blank cadence is preserved (matches existing screenshots / SVG).
+    if ($AutoThreshold -gt 0) {
+        Write-Host ''
+    }
     # Aggregate bars sit between the post-header blank and the column
     # header. Format-AggregateBars emits per bar: 'bar line' + blank,
     # so the caller's blank above acts as the leading padding. When
@@ -2921,19 +3053,29 @@ function Get-UsageSnapshot {
 # frame renders identically in either context so tests assert on the
 # frame shape without running the loop.
 #
-# -Name        : when set, selects the single-slot verbose view. Empty
-#                -> summary table.
-# -Snapshot    : output of Get-UsageSnapshot for this frame.
-# -Footer      : optional string printed below the table / verbose view
-#                for the watch-mode "Last poll" line. Multi-line
-#                strings are split and each line rendered in the
-#                DarkGray information color.
+# -Name           : when set, selects the single-slot verbose view. Empty
+#                   -> summary table.
+# -Snapshot       : output of Get-UsageSnapshot for this frame.
+# -Footer         : optional string printed below the table / verbose view
+#                   for the watch-mode "Last poll" line. Multi-line
+#                   strings are split and each line rendered in the
+#                   DarkGray information color.
+# -AutoThreshold  : when set (1..100), append a right-aligned
+#                   '⏵⏵ switching slot at N%' indicator to the
+#                   `[Usage] Plan usage` header. Used by `sca usage
+#                   -Watch -Auto` to indicate auto-rotation is engaged.
+#                   Width-aware: if the terminal is too narrow to fit
+#                   both the left header and the indicator with a
+#                   2-space gap, the indicator is silently dropped
+#                   (the footer's `[Auto]` line still
+#                   carries the state, so no info is lost).
 function Format-UsageFrame {
     Param (
         [String]                $Name,
         [pscustomobject]        $Snapshot,
         [AllowEmptyString()]
-        [AllowNull()] [String]  $Footer
+        [AllowNull()] [String]  $Footer,
+        [int]                   $AutoThreshold = 0
     )
 
     if (-not $Snapshot -or $Snapshot.NoSlots) {
@@ -2951,7 +3093,9 @@ function Format-UsageFrame {
         # non-ok fallback also calls Format-UsageTable but does NOT pass
         # this switch; bars are a pool-level summary and would be
         # off-topic on a single-slot drill-down.
-        Format-UsageTable -Results @($results) -IncludeAggregateBars
+        # -AutoThreshold is threaded through unchanged; the table is
+        # the layer that renders the [Usage] header where the tag goes.
+        Format-UsageTable -Results @($results) -IncludeAggregateBars -AutoThreshold $AutoThreshold
     }
 
     # Cache-fallback advisory: inform the user that data is stale because
@@ -2973,6 +3117,13 @@ function Format-UsageFrame {
 function Format-UsageFooter {
     Param ([String] $Footer)
 
+    # Two blank lines between the table and the footer: the first
+    # closes the table block (paired with `Format-UsageTable`'s output),
+    # the second adds breathing room so the footer doesn't visually
+    # touch the table's last row. This matters most under -Watch where
+    # the screen never scrolls and the table-to-footer gap is the
+    # user's main horizontal landmark.
+    Write-Host ""
     Write-Host ""
     foreach ($line in ($Footer -split "`r?`n")) {
         Write-Color $line 'DarkGray'
@@ -3093,7 +3244,18 @@ function Invoke-UsageAction {
         [string] $Name,
         [switch] $Json,
         [switch] $Watch,
-        [int]    $Interval = $Script:UsageWatchMinInterval
+        [int]    $Interval = $Script:UsageWatchMinInterval,
+        # -Auto: when set with -Watch, the watch loop auto-rotates to the
+        # next eligible slot when the active slot's max(five_hour,
+        # seven_day) utilization reaches -Threshold. Bound to the 'Watch'
+        # parameter set at the top of the script, so the binder rejects
+        # -Auto without -Watch; this runtime guard catches direct callers
+        # (notably the test suite) that bypass the top-level Param.
+        [switch] $Auto,
+        # -Threshold: percentage at or above which -Auto rotates. Default
+        # 100 (matches the issue's literal "reached a usage limit"); range
+        # enforced by [ValidateRange(1,100)] on the top-level Param block.
+        [int]    $Threshold = 100
     )
 
     # The top-level Param block enforces -Json/-Watch mutual exclusion via
@@ -3103,8 +3265,16 @@ function Invoke-UsageAction {
         throw "-Watch and -Json cannot be combined; -Watch is interactive, -Json is for scripting."
     }
 
+    # -Auto / -Threshold require -Watch. The top-level parameter set
+    # already enforces this for CLI invocations; the runtime guard
+    # catches test-suite direct calls. -Threshold defaults to 100 even
+    # when -Auto is absent, so the guard fires only on -Auto.
+    if ($Auto -and -not $Watch) {
+        throw "-Auto requires -Watch; auto-rotation runs as part of the watch loop."
+    }
+
     if ($Watch) {
-        Invoke-UsageWatch -Name $Name -Interval $Interval
+        Invoke-UsageWatch -Name $Name -Interval $Interval -Auto:$Auto -Threshold $Threshold
         return
     }
 
@@ -3162,6 +3332,306 @@ function Invoke-UsageAction {
     Format-UsageFrame -Name $Name -Snapshot $snapshot
 }
 
+# Decide whether the watch loop's -Auto mode should rotate, suggest a
+# cooldown, or do nothing this tick. Pure function: no IO, no rendering,
+# no state mutation. Inputs are a usage snapshot (Get-UsageSnapshot
+# output) and the integer threshold. The Invoke-UsageWatch loop
+# interprets the returned decision: 'rotate' triggers Invoke-SlotSwap,
+# 'no-eligible' renders the cooldown footer, 'noop' is the steady-state
+# case. Active-slot identification reads the snapshot's IsActive flag
+# (Get-Slots populates that from state.active_slot via Read-ScaState),
+# so the state file does NOT need to be passed in separately.
+#
+# Decision shape:
+#   @{
+#     Action            : 'rotate' | 'no-eligible' | 'noop'
+#     FromName          : <string>  # active slot name (when known); null otherwise
+#     ToName            : <string>  # destination slot name (Action='rotate')
+#     SuggestionName    : <string>  # slot whose bucket resets soonest (Action='no-eligible')
+#     SuggestionBucket  : 'Session' | 'Week'   # which bucket (Action='no-eligible')
+#     SuggestionResetsAt: <ISO-8601 string|DateTime|DateTimeOffset>  # the reset timestamp
+#   }
+#
+# Trigger semantics:
+#   * Active slot's max(five_hour.utilization, seven_day.utilization)
+#     is compared to $Threshold. Null bucket counts as 0% (matches
+#     Format-AggregateBars and the existing 'ok (no plan data)' tier).
+#   * Below threshold       -> 'noop'.
+#   * At or above threshold -> walk peer slots in alphabetical wrap
+#                              order (matches Get-NextSlotName), skip
+#                              any with non-ok HTTP status or whose own
+#                              max(util) is also at/above threshold.
+#                              First eligible candidate -> 'rotate'.
+#                              No candidate -> 'no-eligible' with the
+#                              soonest future reset across all slots
+#                              and both buckets as the cooldown
+#                              suggestion.
+#
+# Edge cases:
+#   * Empty snapshot, NoSlots snapshot, or no active row in the snapshot
+#     -> 'noop'. The watch loop's footer surfaces these out-of-band.
+#   * Active row HTTP-non-ok (expired / unauthorized / error /
+#     no-oauth / rate-limited): max(util) is undefined (treated as 0%),
+#     so 'noop' fires. The user already sees the HTTP-failure label
+#     in the table's Status column; auto-rotation does not act on
+#     transport-level failures.
+function Get-AutoRotationDecision {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Snapshot,
+        [Parameter(Mandatory)] [int]            $Threshold
+    )
+
+    $noop = [pscustomobject]@{
+        Action             = 'noop'
+        FromName           = $null
+        ToName             = $null
+        SuggestionName     = $null
+        SuggestionBucket   = $null
+        SuggestionResetsAt = $null
+    }
+
+    if (-not $Snapshot -or $Snapshot.NoSlots) { return $noop }
+
+    $results = @($Snapshot.Results)
+    if ($results.Count -eq 0) { return $noop }
+
+    # Identify the active row by the snapshot's IsActive flag. The
+    # snapshot is built from Get-Slots which populates IsActive from
+    # $StateFile via Read-ScaState, so this matches state.active_slot
+    # without re-reading the file.
+    $activeRow = $results | Where-Object { $_.IsActive } | Select-Object -First 1
+    if (-not $activeRow) { return $noop }
+
+    $activeMax = Get-RowMaxUtilization -Row $activeRow
+    if ($activeMax -lt $Threshold) {
+        # Steady state: active is below threshold; nothing to do.
+        return [pscustomobject]@{
+            Action             = 'noop'
+            FromName           = $activeRow.Name
+            ToName             = $null
+            SuggestionName     = $null
+            SuggestionBucket   = $null
+            SuggestionResetsAt = $null
+        }
+    }
+
+    # Active is at or above threshold. Walk peer slots in alphabetical
+    # wrap order starting AFTER the active slot. This mirrors
+    # Get-NextSlotName's ordering so -Auto and `sca switch` (no name)
+    # rotate in the same direction.
+    $sorted = @($results | Sort-Object -Property Name)
+    $activeIdx = -1
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        if ($sorted[$i].Name -eq $activeRow.Name) { $activeIdx = $i; break }
+    }
+
+    # Walk N-1 peers in wrap order (skip the active slot itself).
+    $eligible = $null
+    for ($offset = 1; $offset -lt $sorted.Count; $offset++) {
+        $candidate = $sorted[($activeIdx + $offset) % $sorted.Count]
+        if ($candidate.Status -ne 'ok')         { continue }
+        $candMax = Get-RowMaxUtilization -Row $candidate
+        if ($candMax -ge $Threshold)            { continue }
+        $eligible = $candidate
+        break
+    }
+
+    if ($eligible) {
+        return [pscustomobject]@{
+            Action             = 'rotate'
+            FromName           = $activeRow.Name
+            ToName             = $eligible.Name
+            SuggestionName     = $null
+            SuggestionBucket   = $null
+            SuggestionResetsAt = $null
+        }
+    }
+
+    # No eligible peer. Find the soonest FUTURE reset across all slots
+    # and both buckets; that is the moment at which auto-rotation can
+    # next return something other than 'no-eligible'. Used by the
+    # watch loop's "[Auto] No free slot available! Cooling down for
+    # <delta>" footer line.
+    $soonestSlot   = $null
+    $soonestBucket = $null
+    $soonestTime   = $null
+
+    $nowUtc = [DateTimeOffset]::UtcNow
+    foreach ($r in $results) {
+        if (-not $r.Data) { continue }
+        foreach ($pair in @(
+            @{ Key = 'five_hour'; Label = 'Session' },
+            @{ Key = 'seven_day'; Label = 'Week'    }
+        )) {
+            $bucket = $r.Data.($pair.Key)
+            if (-not $bucket -or -not $bucket.resets_at) { continue }
+            $t = ConvertTo-DateTimeOffsetOrNull $bucket.resets_at
+            if ($null -eq $t)        { continue }
+            if ($t -le $nowUtc)      { continue }
+            if ($null -eq $soonestTime -or $t -lt $soonestTime) {
+                $soonestTime   = $t
+                $soonestSlot   = $r.Name
+                $soonestBucket = $pair.Label
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Action             = 'no-eligible'
+        FromName           = $activeRow.Name
+        ToName             = $null
+        SuggestionName     = $soonestSlot
+        SuggestionBucket   = $soonestBucket
+        SuggestionResetsAt = if ($soonestTime) { $soonestTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture) } else { $null }
+    }
+}
+
+# Pull the max(five_hour, seven_day) utilization from a snapshot row.
+# Null/missing buckets count as 0% (matches Format-AggregateBars and
+# Get-PlanStatus's 'ok (no plan data)' tier; an account that has not
+# made a live API call yet is by definition not utilized). Non-ok HTTP
+# rows fall through to 0% because $Row.Data is unset in that case.
+# Extracted to keep Get-AutoRotationDecision readable; Format-WatchTitle
+# and Get-PlanStatus do their own bucket walking with slightly
+# different semantics (Format-WatchTitle preserves nulls for display),
+# so this helper is auto-rotation-specific by design.
+function Get-RowMaxUtilization {
+    Param ([Parameter(Mandatory)] [pscustomobject] $Row)
+
+    if ($Row.Status -ne 'ok' -or -not $Row.Data) { return 0.0 }
+
+    $five  = if ($Row.Data.five_hour -and $null -ne $Row.Data.five_hour.utilization) { [double]$Row.Data.five_hour.utilization } else { 0.0 }
+    $seven = if ($Row.Data.seven_day -and $null -ne $Row.Data.seven_day.utilization) { [double]$Row.Data.seven_day.utilization } else { 0.0 }
+    if ($five -ge $seven) { return $five }
+    return $seven
+}
+
+# Render a positive future reset duration as a compact "Xh Ym" / "Xm"
+# string for the [Auto] "Cooling down for <delta>" footer line. Uses
+# Format-ResetDelta's shape with the surrounding parentheses stripped
+# (parentheses are a table-cell convention; the footer reads as prose).
+#
+# Output (matches Format-ResetDelta's value semantics, minus the parens):
+#   null / parse fail               -> 'unknown'  (defensive; never throws)
+#   non-positive (already past)     -> 'less than a minute'
+#   < 1 hour                        -> '42m'
+#   >= 1 hour and < 24 hours        -> '2h 14m'
+#   >= 24 hours                     -> '42h'
+function Format-AutoCooldownDelta {
+    Param ($ResetsAt)
+
+    $target = ConvertTo-DateTimeOffsetOrNull $ResetsAt
+    if ($null -eq $target) { return 'unknown' }
+
+    $delta = $target - [DateTimeOffset]::UtcNow
+    if ($delta.TotalSeconds -le 0) { return 'less than a minute' }
+
+    if ($delta.TotalHours -ge 24) {
+        $h = [int][math]::Floor($delta.TotalHours)
+        return "${h}h"
+    }
+
+    $h = [int]$delta.Hours
+    $m = [int]$delta.Minutes
+    if ($h -gt 0) { return "${h}h ${m}m" }
+    return "${m}m"
+}
+
+# Per-poll auto-rotation step for the watch loop's -Auto mode. Wraps:
+#
+#   1. Get-AutoRotationDecision (pure) to classify the active slot's
+#      state against -Threshold.
+#   2. Re-check Test-ClaudeRunning before any rotation (covers the
+#      "Claude Code launched after -Auto started" race; the pre-loop
+#      guard in Invoke-UsageWatch only fires once at startup).
+#   3. Find-SlotByName + Invoke-SlotSwap when a peer is eligible.
+#   4. Map the outcome to a single-line latched footer string that
+#      Invoke-UsageWatch appends to every subsequent frame until the
+#      next state change.
+#
+# Returns the new footer-latch string. Never throws: any exception from
+# the swap path is caught and rendered as '[Auto] Rotation failed! …'
+# so the watch loop never aborts because of an auto-rotation issue.
+#
+# -CurrentLatch carries the previous frame's latched string. Used for
+# two distinct cases:
+#   * Decision 'noop' AND no prior rotation event: preserves the
+#     initial '[Auto] Automatic slot switching is enabled.' line (or
+#     whatever steady-state caller supplied).
+#   * Decision 'noop' AFTER a prior rotation: the 'Rotated …' line
+#     stays latched. The user choice (this conversation) was that
+#     transition lines stay visible until the next state change, not
+#     revert to the steady-state line on every tick.
+#
+# All [Auto] lines start with a capital letter per the user's locked
+# convention.
+function Invoke-AutoRotationStep {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Snapshot,
+        [Parameter(Mandatory)] [int]            $Threshold,
+        [AllowNull()] [AllowEmptyString()] [string] $CurrentLatch
+    )
+
+    $decision = Get-AutoRotationDecision -Snapshot $Snapshot -Threshold $Threshold
+
+    switch ($decision.Action) {
+        'noop' {
+            # No state change. Preserve whatever latch the caller had.
+            # On the very first tick that hits 'noop' the caller's
+            # initialiser ('[Auto] Enabled') is preserved; after a
+            # prior 'rotate' the 'Rotated A -> B at HH:mm:ss' string
+            # stays latched until the next state change.
+            return $CurrentLatch
+        }
+
+        'rotate' {
+            # Per-rotation Test-ClaudeRunning re-check. The pre-loop
+            # guard caught the startup case; this catches the "Claude
+            # Code launched mid-watch" race. Surface the refusal as
+            # a [Auto] line; the credentials swap does NOT happen.
+            if (Test-ClaudeRunning) {
+                return '[Auto] Rotation refused! Claude Code is running.'
+            }
+
+            try {
+                $slot = Find-SlotByName -Name $decision.ToName
+                if (-not $slot) {
+                    # Sidecar disappeared between snapshot and lookup.
+                    # Rare; surfaces as a 'Rotation failed' line.
+                    return "[Auto] Rotation failed! Slot '$($decision.ToName)' not found (or missing its identity sidecar)."
+                }
+                Invoke-SlotSwap -Slot $slot 6>$null
+                $ts = [DateTime]::Now.ToString('HH:mm:ss')
+                return ('[Auto] Rotated from "{0}" to "{1}" at {2}' -f $decision.FromName, $decision.ToName, $ts)
+            }
+            catch {
+                return "[Auto] Rotation failed! $($_.Exception.Message)"
+            }
+        }
+
+        'no-eligible' {
+            # All peers also at or above threshold. Suggest the soonest
+            # reset across all slots and buckets so the user has a
+            # concrete cooldown ETA.
+            if ($decision.SuggestionResetsAt) {
+                $delta = Format-AutoCooldownDelta $decision.SuggestionResetsAt
+                return ('[Auto] No free slot available! Cooling down for {0}.' -f $delta)
+            }
+            # No future reset across any slot is rare (would mean every
+            # bucket has resets_at=null, i.e. no slot has made a live
+            # API call yet). Give the user a short message rather than
+            # interpolating a useless 'unknown'.
+            return '[Auto] No free slot available! Waiting for the next poll.'
+        }
+
+        default {
+            # Unknown action label. Defensive; surface as a no-op so
+            # the loop keeps running.
+            return $CurrentLatch
+        }
+    }
+}
+
 # Minimum poll interval for -Watch. Matches the default so users can only
 # adjust the interval upward; the floor is the "polite" setting for the
 # unofficial endpoint and we refuse to go faster. Clamping up (rather
@@ -3212,8 +3682,31 @@ $Script:UsageWatchMinInterval = 60
 function Invoke-UsageWatch {
     Param (
         [String] $Name,
-        [int]    $Interval = $Script:UsageWatchMinInterval
+        [int]    $Interval = $Script:UsageWatchMinInterval,
+        # -Auto: auto-rotate to the next eligible slot when the active
+        # slot's max(five_hour, seven_day) utilization reaches -Threshold.
+        # See Get-AutoRotationDecision for the rotation logic and the
+        # comments inside the watch loop for the per-tick mechanics.
+        [switch] $Auto,
+        # -Threshold: utilization percentage (1..100) at or above which
+        # -Auto fires a rotation. Ignored when -Auto is absent.
+        [int]    $Threshold = 100
     )
+
+    # Pre-loop Claude Code guard for -Auto. The credentials swap inside
+    # the loop writes to ~/.claude.json's oauthAccount block (via
+    # Invoke-SlotSwap), which Claude Code keeps in an in-memory cache;
+    # racing its flush would clobber our update. Same guard / wording
+    # as Invoke-SwitchAction so the user sees a consistent message
+    # regardless of entry point. The watch loop additionally re-checks
+    # Test-ClaudeRunning before every rotation attempt to cover the
+    # "Claude Code launched mid-watch" race.
+    # Checked BEFORE the IsOutputRedirected guard so the user sees the
+    # more actionable "close Claude Code" message rather than the
+    # interactive-terminal one (which the test harness always hits).
+    if ($Auto -and (Test-ClaudeRunning)) {
+        throw "Claude Code is running. Close it before 'sca usage -Auto' so the credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
+    }
 
     if ([Console]::IsOutputRedirected) {
         throw "-Watch requires an interactive terminal; for scripted output use 'sca usage -Json'."
@@ -3246,6 +3739,13 @@ function Invoke-UsageWatch {
         $lastPoll      = [DateTime]::MinValue
         $lastPollError = $null
 
+        # -Auto footer-line latch. Updated at each poll boundary based on
+        # Get-AutoRotationDecision's verdict; the latched string is
+        # appended (in DarkGray, like the [Watch] lines) to every frame
+        # until the next state change. Initial value 'Enabled' shows the
+        # mode is engaged before the first rotation event.
+        $lastAutoFooter = if ($Auto) { '[Auto] Automatic slot switching is enabled.' } else { $null }
+
         while ($true) {
             $now = [DateTime]::Now
             $dueForPoll = ($null -eq $snapshot) -or (($now - $lastPoll).TotalSeconds -ge $Interval)
@@ -3273,6 +3773,19 @@ function Invoke-UsageWatch {
                     # OutputRendering=PlainText filter; see Write-VTSequence
                     # docblock).
                     Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot))
+
+                    # Auto-rotation decision happens after each successful
+                    # poll. The latched footer string is updated based on
+                    # the decision so it stays visible until the next
+                    # state change (the next 'rotate' / 'no-eligible'
+                    # outcome). Failures inside the swap are caught and
+                    # surfaced as 'Rotation failed!' / 'Rotation refused!'
+                    # lines; the loop never aborts because of an auto-
+                    # rotation issue (user can still quit with Ctrl-C
+                    # and inspect the table).
+                    if ($Auto) {
+                        $lastAutoFooter = Invoke-AutoRotationStep -Snapshot $snapshot -Threshold $Threshold -CurrentLatch $lastAutoFooter
+                    }
                 }
                 catch {
                     # Keep the previous snapshot visible. If the very first
@@ -3288,10 +3801,24 @@ function Invoke-UsageWatch {
             # poll boundaries (timestamp updates only on poll), but the
             # rebuild is a cheap concat and keeps the redraw path single-
             # branch. Multi-line only when the previous poll failed.
-            $footer = "[Watch] Last poll: $($lastPoll.ToString('HH:mm:ss'))"
+            # Order: [Auto] state (if -Auto) -> [Watch] Last poll ->
+            # [Watch] Last poll failed (if any). The [Auto] line leads
+            # the block so the user's eye finds the auto-mode state
+            # signal first; transport-level details (poll timestamp,
+            # failure tail) follow underneath.
+            $footer = ''
+            if ($lastAutoFooter) {
+                $footer = $lastAutoFooter + "`n"
+            }
+            $footer += "[Watch] Last poll at $($lastPoll.ToString('HH:mm:ss'))"
             if ($lastPollError) {
                 $footer += "`n[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next tick)"
             }
+
+            # Auto-mode threshold for the header tag. Passed only when
+            # -Auto is set; otherwise 0 (Format-UsageTable interprets
+            # 0 as "no tag").
+            $autoHeaderThreshold = if ($Auto) { $Threshold } else { 0 }
 
             # Atomic frame: begin sync update, clear screen, cursor home,
             # draw via the existing renderer, end sync update. All output
@@ -3304,9 +3831,14 @@ function Invoke-UsageWatch {
             # Clear-Host-style flicker; no regression.
             Write-VTSequence "`e[?2026h`e[2J`e[H"
             if ($null -ne $snapshot) {
-                Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer
+                Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
             } else {
                 # First poll failed and we have nothing to render yet.
+                # $footer already leads with the [Auto] line (when -Auto
+                # is set) via the composition above, so a single
+                # Format-UsageFooter call places auto-mode state above
+                # the 'Waiting...' advisory; no separate standalone
+                # print needed.
                 Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Yellow'
                 Format-UsageFooter $footer
             }
@@ -3386,7 +3918,7 @@ function Invoke-Main {
             "switch"    { Invoke-SwitchAction -Name $Name }
             "list"      { Invoke-ListAction }
             "remove"    { Invoke-RemoveAction -Name $Name }
-            "usage"     { Invoke-UsageAction  -Name $Name -Json:$Json -Watch:$Watch -Interval $Interval }
+            "usage"     { Invoke-UsageAction  -Name $Name -Json:$Json -Watch:$Watch -Interval $Interval -Auto:$Auto -Threshold $Threshold }
         }
     }
     finally {
