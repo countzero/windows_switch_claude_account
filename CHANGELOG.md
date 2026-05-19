@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-05-19
+
 ### Changed
 - `sca usage -Watch -Auto` terminal title now shows the pool mean across all HTTP-ok slots (matching the aggregate bars above the table) instead of the active slot's numbers. In `-Auto` mode the active slot moves under the user as the script rotates, so an active-slot title becomes a moving target; the pool view matches what `-Auto` is trending toward. Alarm prefix thresholds swap to `AggregateRedPct` (90, `[!]`) / `AggregateYellowPct` (50, `[~]`). Bare `sca usage -Watch` is unchanged.
 - Pool-mean math extracted into `Get-PoolMeanUtilization`, shared by `Format-AggregateBars` and `Format-WatchTitle -Aggregate` so the title number and the on-screen aggregate bar percentage are structurally locked together rather than coupled by copy-paste.
