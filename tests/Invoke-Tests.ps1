@@ -2,7 +2,16 @@
 
 # Local test runner. Auto-installs Pester 5 on first use, runs
 # PSScriptAnalyzer as an advisory pass (prints findings, never fails),
-# then invokes the Pester suite. Exit code follows Invoke-Pester.
+# then invokes the Pester suite. By default, code coverage is collected
+# on switch_claude_account.ps1 and a summary line is printed; use
+# -SkipCoverage for the fastest local iteration loop. Exit code is 1
+# if any test failed, 0 otherwise. A coverage gate is not yet wired
+# up; it lands in a follow-up step once we have the baseline.
+
+[CmdletBinding()]
+Param (
+    [switch] $SkipCoverage
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -35,4 +44,59 @@ if (Get-Module -ListAvailable PSScriptAnalyzer) {
 }
 
 # --- Pester suite ---
-Invoke-Pester -Path $PSScriptRoot -Output Detailed
+$config = New-PesterConfiguration
+$config.Run.Path         = $PSScriptRoot
+$config.Run.PassThru     = $true
+$config.Output.Verbosity = 'Detailed'
+
+if (-not $SkipCoverage) {
+    # Ensure the output directory exists; Pester does not create it.
+    # tests/TestResults/ is already gitignored.
+    $coverageDir = Join-Path $PSScriptRoot 'TestResults'
+    if (-not (Test-Path -LiteralPath $coverageDir)) {
+        New-Item -ItemType Directory -Path $coverageDir -Force | Out-Null
+    }
+
+    $config.CodeCoverage.Enabled        = $true
+    # CodeCoverage.Path accepts string[]; wrap defensively so older 5.x
+    # versions don't trip on a bare string. We measure ONLY the script
+    # under test, not the test files themselves.
+    $config.CodeCoverage.Path           = @($scriptPath)
+    # Pester 5.2+ profiler-based collector: faster than the legacy
+    # breakpoint-based path and does not mutate the script during the
+    # run via Set-PSBreakpoint.
+    $config.CodeCoverage.UseBreakpoints = $false
+    $config.CodeCoverage.OutputFormat   = 'JaCoCo'
+    $config.CodeCoverage.OutputPath     = Join-Path $coverageDir 'coverage.xml'
+}
+
+$result = Invoke-Pester -Configuration $config
+
+# --- Coverage summary (when enabled) ---
+if (-not $SkipCoverage -and $result.CodeCoverage) {
+    $cov = $result.CodeCoverage
+    # Defensive percent computation: CommandsExecutedCount / CommandsAnalyzedCount
+    # has been stable across Pester 5.0+. Direct $cov.CoveragePercent is
+    # available in newer 5.x but not all releases.
+    $pct = if ($cov.CommandsAnalyzedCount -gt 0) {
+        100.0 * $cov.CommandsExecutedCount / $cov.CommandsAnalyzedCount
+    } else {
+        0.0
+    }
+
+    Write-Host ''
+    # InvariantCulture so the decimal is always '.' regardless of host
+    # locale; keeps the line parseable by any consumer.
+    $pctText = $pct.ToString('N1', [Globalization.CultureInfo]::InvariantCulture)
+    Write-Host ('Code coverage: {0}%' -f $pctText) -ForegroundColor Cyan
+    Write-Host '(Gate not yet enabled.)' -ForegroundColor DarkGray
+}
+
+# --- Exit code ---
+# Preserve today's binary semantics: nonzero iff any test failed.
+# Coverage gate is intentionally NOT enforced in step 1.
+if ($result.FailedCount -gt 0) {
+    exit 1
+} else {
+    exit 0
+}
