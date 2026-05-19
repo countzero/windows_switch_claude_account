@@ -1,12 +1,12 @@
 #Requires -Version 7.0
 
 # Local test runner. Auto-installs Pester 5 on first use, runs
-# PSScriptAnalyzer as an advisory pass (prints findings, never fails),
-# then invokes the Pester suite. By default, code coverage is collected
-# on switch_claude_account.ps1 and a summary line is printed; use
+# PSScriptAnalyzer (Warning advisory, Error fatal), then invokes the
+# Pester suite. By default, code coverage is collected on
+# switch_claude_account.ps1 and a summary line is printed; use
 # -SkipCoverage for the fastest local iteration loop. Exit code is 1
-# if any test failed, 0 otherwise. A coverage gate is not yet wired
-# up; it lands in a follow-up step once we have the baseline.
+# if any test failed or coverage falls below -CoverageThreshold
+# (default 90), 0 otherwise.
 
 [CmdletBinding()]
 Param (
@@ -28,14 +28,24 @@ if (-not $pester) {
 
 Import-Module Pester -MinimumVersion 5.5.0
 
-# --- PSScriptAnalyzer (advisory: print findings, never fail) ---
+# --- PSScriptAnalyzer (Warning advisory, Error fatal) ---
 $scriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..\switch_claude_account.ps1')).Path
 if (Get-Module -ListAvailable PSScriptAnalyzer) {
-    $findings = Invoke-ScriptAnalyzer -Path $scriptPath
+    $settings = (Resolve-Path (Join-Path $PSScriptRoot '..\PSScriptAnalyzerSettings.psd1')).Path
+    $findings = Invoke-ScriptAnalyzer -Path $scriptPath -Settings $settings
     if ($findings) {
         Write-Host ''
-        Write-Host 'PSScriptAnalyzer findings (advisory, non-fatal):' -ForegroundColor Yellow
+        Write-Host 'PSScriptAnalyzer findings:' -ForegroundColor Yellow
         $findings | Format-Table Severity, RuleName, Line, Message -AutoSize | Out-String | Write-Host
+        # Error severity fails the run; Warning stays advisory. The
+        # repo's PSScriptAnalyzerSettings.psd1 silences five rules
+        # documented there as deliberate design choices, so the
+        # remaining Warning surface is small and a new Error-level
+        # finding is almost always a genuine bug.
+        if ($findings | Where-Object { $_.Severity -eq 'Error' }) {
+            Write-Host 'PSScriptAnalyzer: Error-severity findings present; failing run.' -ForegroundColor Red
+            exit 1
+        }
     } else {
         Write-Host 'PSScriptAnalyzer: no findings.' -ForegroundColor Green
     }

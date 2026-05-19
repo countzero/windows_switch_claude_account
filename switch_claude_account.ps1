@@ -400,7 +400,7 @@ function Read-ScaState {
                 # Persist the migration so subsequent reads are O(1).
                 # Failure here is non-fatal; callers see correct behavior
                 # for this call and the migration retries on the next read.
-                try { Write-ScaState -State $state } catch { }
+                try { Write-ScaState -State $state } catch { Write-Verbose "ScaState migration write deferred: $_" }
                 return $state
             }
         }
