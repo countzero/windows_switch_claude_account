@@ -1759,13 +1759,11 @@ Describe 'switch_claude_account' {
         }
 
         It '-Watch -Auto with Claude Code running throws at startup before entering the alt-screen buffer' {
-            # [Console]::IsOutputRedirected is true under Pester, so the
-            # watch loop normally short-circuits with "requires an
-            # interactive terminal". The Claude-Code guard fires AFTER
-            # that one, so we mock IsOutputRedirected away here. The
-            # cleanest path is to verify the guard via a direct call to
-            # Invoke-UsageWatch with Test-ClaudeRunning mocked $true; the
-            # IsOutputRedirected check would short-circuit it otherwise.
+            # The Claude-Code guard runs BEFORE the IsOutputRedirected
+            # guard inside Invoke-UsageWatch, so this test is safe to
+            # run on an interactive terminal: Test-ClaudeRunning mocked
+            # to $true short-circuits before the alt-screen `Write-VTSequence`
+            # ever fires.
             Mock Test-ClaudeRunning -MockWith { $true }
 
             { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*sca usage -Auto*'
@@ -1775,6 +1773,18 @@ Describe 'switch_claude_account' {
             # Test-ClaudeRunning's default mock returns $false. The guard
             # silently passes; the alt-screen / IsOutputRedirected guard
             # throws next because Pester's stdout is redirected.
+            #
+            # BUT: on an interactive terminal (running the test runner
+            # directly without output redirection), IsOutputRedirected
+            # is $false and the guard does NOT fire. Execution then
+            # proceeds to the alt-screen `Write-VTSequence "`e[?1049h"`,
+            # which BLANKS THE TERMINAL until the watch loop exits. The
+            # established pattern at line 973-976 above is to skip this
+            # test when the host is interactive; do the same here.
+            if (-not [Console]::IsOutputRedirected) {
+                Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
+                return
+            }
             { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
         }
     }
