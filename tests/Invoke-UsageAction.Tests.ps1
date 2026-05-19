@@ -1174,6 +1174,124 @@ Describe 'switch_claude_account' {
 
     }
 
+    Context 'Get-PoolMeanUtilization' {
+        # Pure-helper unit tests for the pool-mean utilization math.
+        # Get-PoolMeanUtilization is shared by Format-AggregateBars (the
+        # bar above the table) and Format-WatchTitle -Aggregate (the
+        # -Watch -Auto terminal title). Pinning the math here means a
+        # change to one site cannot silently drift from the other; the
+        # Format-AggregateBars Context above pins the rendering side.
+        BeforeAll {
+            function New-OkRow {
+                Param (
+                    [string] $Name,
+                    [bool]   $IsActive = $false,
+                    $FiveUtil  = 'unset',
+                    $SevenUtil = 'unset'
+                )
+                # Sentinel 'unset' distinguishes "bucket missing entirely"
+                # from "bucket present, util=null". Matches the factory
+                # in the Format-AggregateBars Context above; redeclared
+                # locally so the file can be split later without coupling.
+                $five  = $null
+                $seven = $null
+                if ($FiveUtil  -ne 'unset') { $five  = [pscustomobject]@{ utilization = [double]$FiveUtil;  resets_at = $null } }
+                if ($SevenUtil -ne 'unset') { $seven = [pscustomobject]@{ utilization = [double]$SevenUtil; resets_at = $null } }
+                $data = [pscustomobject]@{ five_hour = $five; seven_day = $seven }
+                return [pscustomobject]@{
+                    Name     = $Name
+                    IsActive = $IsActive
+                    Status   = 'ok'
+                    Data     = $data
+                    Error    = $null
+                    Email    = $null
+                }
+            }
+        }
+
+        It 'returns $null for null Results (empty input)' {
+            Get-PoolMeanUtilization -Results $null -BucketKey 'five_hour' | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null for empty Results array' {
+            Get-PoolMeanUtilization -Results @() -BucketKey 'five_hour' | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when zero HTTP-ok rows (all rows are HTTP-failure)' {
+            $rows = @(
+                [pscustomobject]@{ Name='a'; IsActive=$false; Status='expired';  Data=$null; Error='x';  Email=$null }
+                [pscustomobject]@{ Name='b'; IsActive=$false; Status='no-oauth'; Data=$null; Error=$null; Email=$null }
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour'  | Should -BeNullOrEmpty
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -BeNullOrEmpty
+        }
+
+        It 'returns the row util for a single-row pool (N=1 degenerate)' {
+            $rows = @( New-OkRow -Name 'a' -FiveUtil 37 -SevenUtil 42 )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour'  | Should -Be 37
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 42
+        }
+
+        It 'returns the mean across N HTTP-ok rows' {
+            # 5h mean: (40+60+80)/3 = 60. 7d mean: (50+70+90)/3 = 70.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 40 -SevenUtil 50)
+                (New-OkRow -Name 'b' -FiveUtil 60 -SevenUtil 70)
+                (New-OkRow -Name 'c' -FiveUtil 80 -SevenUtil 90)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour'  | Should -Be 60
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 70
+        }
+
+        It 'rounds to nearest integer (banker''s rounding via [math]::Round)' {
+            # (33+34)/2 = 33.5. [math]::Round uses banker's rounding by default
+            # (round half to even), so 33.5 -> 34. Pin the exact behavior so
+            # a refactor to AwayFromZero would surface here.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 33 -SevenUtil 0)
+                (New-OkRow -Name 'b' -FiveUtil 34 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 34
+        }
+
+        It 'null/missing buckets count as 0 (N stays N, not N-1)' {
+            # Two ok rows, one row missing five_hour. Mean = (0 + 60) / 2 = 30,
+            # NOT 60 (which would be N-1 denominator).
+            $rows = @(
+                (New-OkRow -Name 'a' -SevenUtil 0)                # FiveUtil missing -> 0
+                (New-OkRow -Name 'b' -FiveUtil 60 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 30
+        }
+
+        It 'utilization above 100 is clamped to 100' {
+            # 5h: (150 -> 100) + 50 / 2 = 75
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 150 -SevenUtil 0)
+                (New-OkRow -Name 'b' -FiveUtil  50 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 75
+        }
+
+        It 'utilization below 0 is clamped to 0' {
+            # 5h: (-30 -> 0) + 60 / 2 = 30
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil -30 -SevenUtil 0)
+                (New-OkRow -Name 'b' -FiveUtil  60 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 30
+        }
+
+        It 'HTTP-failure rows are excluded from the mean' {
+            # Only the ok row counts. Mean = 20 / 1 = 20.
+            $rows = @(
+                (New-OkRow -Name 'good' -FiveUtil 20 -SevenUtil 0)
+                [pscustomobject]@{ Name='bad'; IsActive=$false; Status='error'; Data=$null; Error='boom'; Email=$null }
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
+        }
+    }
+
     Context 'Get-AggregateBarColor' {
         # Pure-helper unit tests for the aggregate bar color thresholds.
         # Runs the threshold boundaries explicitly so a future tweak of

@@ -480,6 +480,123 @@ Describe 'switch_claude_account' {
             $title | Should -Not -Match "`a"
             $title | Should -Be '10% | 20% | Switch Claude Account'
         }
+
+        # --- -Aggregate mode (wired to -Auto by Invoke-UsageWatch) ----
+        # In aggregate mode both percentages are the pool mean across
+        # HTTP-ok rows, alarm thresholds swap to
+        # $Script:AggregateRedPct (90) / $Script:AggregateYellowPct (50),
+        # and -Name is ignored. The pool-mean math itself is tested
+        # under Get-PoolMeanUtilization in Invoke-UsageAction.Tests.ps1;
+        # these tests pin the rendering behavior on top of it.
+
+        It '-Aggregate renders pool mean across all HTTP-ok rows (active flag ignored)' {
+            # Regression contrast: without -Aggregate the same snapshot
+            # renders the active row (10% | 10%, see "ignores non-active
+            # rows" test above). With -Aggregate it averages all three:
+            # 5h mean = (100+10+100)/3 = 70, 7d mean = (100+10+100)/3 = 70.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'b'; FiveUtil = 10;  SevenUtil = 10; IsActive = $true }
+                @{ Name = 'c'; FiveUtil = 100; SevenUtil = 100 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 70% | 70% | Switch Claude Account'
+        }
+
+        It '-Aggregate excludes HTTP-failure rows from the mean' {
+            # 2 ok rows + 1 expired. Mean = (40+60)/2 = 50.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 40; SevenUtil = 40 }
+                @{ Name = 'b'; FiveUtil = 60; SevenUtil = 60; IsActive = $true }
+                @{ Name = 'c'; Status = 'expired'; FiveUtil = 100; SevenUtil = 100 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 50% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate counts null buckets as 0 (denominator stays N)' {
+            # 2 ok rows, one with null five_hour. 5h mean = (0+60)/2 = 30
+            # (NOT 60, which would be N-1).
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = $null; SevenUtil = 20; IsActive = $true }
+                @{ Name = 'b'; FiveUtil = 60;    SevenUtil = 20 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '30% | 20% | Switch Claude Account'
+        }
+
+        It '-Aggregate ignores -Name (aggregation is pool-wide by definition)' {
+            # The non-aggregate test "renders the active slot" pins that
+            # -Name='b' overrides IsActive. Under -Aggregate, -Name has
+            # no effect: output equals the no-Name aggregate.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 20; SevenUtil = 20 }
+                @{ Name = 'b'; FiveUtil = 80; SevenUtil = 80; IsActive = $true }
+            )
+            $noName   = Format-WatchTitle -Name ''  -Snapshot $snap -Aggregate
+            $withName = Format-WatchTitle -Name 'b' -Snapshot $snap -Aggregate
+            $withName | Should -Be $noName
+            $noName   | Should -Be '[~] 50% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate returns bare suffix when no HTTP-ok rows exist' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; Status = 'expired'; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
+                @{ Name = 'b'; Status = 'error';   FiveUtil = 50; SevenUtil = 50 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be 'Switch Claude Account'
+        }
+
+        It '-Aggregate returns bare suffix for empty snapshot' {
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            Format-WatchTitle -Name '' -Snapshot $empty -Aggregate |
+                Should -Be 'Switch Claude Account'
+        }
+
+        # Alarm prefix tier swap: AggregateYellowPct (50) / AggregateRedPct (90).
+
+        It '-Aggregate prepends [!] when pool mean is at AggregateRedPct (90)' {
+            # Single row at 90/50 -> pool mean = 90/50.
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 90; SevenUtil = 50; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[!] 90% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate prepends [~] when pool mean is at AggregateYellowPct (50)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 50; SevenUtil = 49; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 50% | 49% | Switch Claude Account'
+        }
+
+        It '-Aggregate no prefix when pool mean is below AggregateYellowPct (49)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 49; SevenUtil = 49; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '49% | 49% | Switch Claude Account'
+        }
+
+        It '-Aggregate [!] wins over [~] when one bucket is at Red and the other at Yellow' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 90; SevenUtil = 50; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[!] 90% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate does NOT fire on per-slot UtilWarnPct (default-mode threshold) below AggregateYellowPct' {
+            # Default mode at 30/40 with active=true would render no prefix.
+            # Aggregate mode at the same row (N=1) also renders no prefix
+            # because both buckets are below AggregateYellowPct (50). This
+            # test is the inverse-axis check: confirm the threshold pair
+            # actually swapped, not just that the default thresholds got
+            # left in.
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 89; SevenUtil = 89; IsActive = $true })
+            # Default mode -> 89/89 is below UtilWarnPct (90), no prefix.
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '89% | 89% | Switch Claude Account'
+            # Aggregate mode -> 89 is at/above AggregateYellowPct (50), [~]
+            # prefix fires. Pins the threshold swap.
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 89% | 89% | Switch Claude Account'
+        }
     }
 
     Context 'Watch-mode VT control rendering' {
