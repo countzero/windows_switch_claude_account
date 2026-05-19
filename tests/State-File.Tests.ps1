@@ -171,6 +171,21 @@ Describe 'switch_claude_account' {
             $r.last_sync_hash | Should -Be 'deadbeef'
         }
 
+        # Read-ScaState's ternaries coerce empty / missing JSON values to
+        # $null so callers never have to disambiguate '' vs $null when
+        # checking active_slot / last_sync_hash. Write-ScaState happens
+        # to write null literals, but a manually edited or partially
+        # written state file can carry empty strings; pin the contract.
+        It 'coerces empty active_slot / last_sync_hash to $null' {
+            $raw = '{"schema":1,"active_slot":"","last_sync_hash":""}'
+            Set-Content -LiteralPath $StateFile -Value $raw -NoNewline -Encoding utf8NoBOM
+
+            $r = Read-ScaState
+            $r.schema         | Should -Be 1
+            $r.active_slot    | Should -BeNullOrEmpty
+            $r.last_sync_hash | Should -BeNullOrEmpty
+        }
+
         It 'returns null on schema mismatch' {
             $bad = '{"schema":2,"active_slot":"work","last_sync_hash":"abc"}'
             Set-Content -LiteralPath $StateFile -Value $bad -NoNewline -Encoding utf8NoBOM

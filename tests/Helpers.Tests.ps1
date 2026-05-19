@@ -233,6 +233,18 @@ Describe 'switch_claude_account' {
             $out | Should -Match '-NoColor'
             $out | Should -Match 'NO_COLOR'
         }
+
+        # Without the install action's profile aliases, Get-Alias returns
+        # nothing and Show-Help prints '.\switch_claude_account.ps1' (the
+        # default test environment). When the alias IS present (post-
+        # install or sourced via a profile that runs the install block),
+        # the USAGE line should print 'sca' instead. Pin both branches.
+        It 'uses the sca alias in USAGE when Get-Alias sca resolves' {
+            Set-Alias -Name sca -Value $script:ScriptPath -Scope Local
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'sca <action>'
+            $out | Should -Not -Match '\.\\switch_claude_account\.ps1 <action>'
+        }
     }
 
     Context 'Format-WatchTitle' {
@@ -349,6 +361,17 @@ Describe 'switch_claude_account' {
 
         It 'returns bare suffix for empty snapshot (no slots saved)' {
             $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            Format-WatchTitle -Name '' -Snapshot $empty |
+                Should -Be 'Switch Claude Account'
+        }
+
+        # Distinct from the NoSlots=true case above: the snapshot was
+        # built successfully (NoSlots=false), but its Results array is
+        # empty. Defensive branch in Format-WatchTitle; reachable in
+        # principle if Get-UsageSnapshot is ever changed to seed the
+        # shape before populating rows.
+        It 'returns bare suffix when Results is empty but NoSlots is false' {
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $false; HasCacheFallback = $false }
             Format-WatchTitle -Name '' -Snapshot $empty |
                 Should -Be 'Switch Claude Account'
         }
