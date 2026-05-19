@@ -10,7 +10,15 @@
 
 [CmdletBinding()]
 Param (
-    [switch] $SkipCoverage
+    [switch] $SkipCoverage,
+    # Minimum command-coverage percent required to pass the run. Wired
+    # into Pester's CodeCoverage.CoveragePercentTarget so the gate is
+    # owned by the same component that computes the number; below the
+    # threshold, $result.Result becomes 'Failed' and the exit predicate
+    # below honors it. Pass -CoverageThreshold 0 to disable the gate
+    # without losing the printed summary (-SkipCoverage skips both).
+    [ValidateRange(0, 100)]
+    [int] $CoverageThreshold = 90
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,34 +86,59 @@ if (-not $SkipCoverage) {
     $config.CodeCoverage.UseBreakpoints = $false
     $config.CodeCoverage.OutputFormat   = 'JaCoCo'
     $config.CodeCoverage.OutputPath     = Join-Path $coverageDir 'coverage.xml'
+    # Pester-native gate: below this percent, $result.Result becomes
+    # 'Failed' and the exit predicate below picks it up. Keeping the
+    # threshold inside Pester avoids a second, slightly-different
+    # percent calculation drifting out of sync with the displayed value.
+    $config.CodeCoverage.CoveragePercentTarget = $CoverageThreshold
 }
 
 $result = Invoke-Pester -Configuration $config
 
-# --- Coverage summary (when enabled) ---
+# --- Coverage summary + gate (when enabled) ---
+# $coverageGateFailed is the explicit signal the exit predicate
+# consumes. We do NOT rely on Pester's $result.Result here: Pester
+# 5.7.1 sets CodeCoverage.CoveragePercentTarget on the config but
+# does NOT propagate a missed target into $result.Result, so the
+# native target alone leaves exit code 0 on a coverage shortfall.
+# The native target stays set (cheap; documents intent; may start
+# flipping $result.Result in a future Pester); the authoritative
+# gate decision is computed here from the same percent we display.
+$coverageGateFailed = $false
 if (-not $SkipCoverage -and $result.CodeCoverage) {
     $cov = $result.CodeCoverage
-    # Defensive percent computation: CommandsExecutedCount / CommandsAnalyzedCount
-    # has been stable across Pester 5.0+. Direct $cov.CoveragePercent is
-    # available in newer 5.x but not all releases.
-    $pct = if ($cov.CommandsAnalyzedCount -gt 0) {
-        100.0 * $cov.CommandsExecutedCount / $cov.CommandsAnalyzedCount
-    } else {
-        0.0
-    }
-
     Write-Host ''
-    # InvariantCulture so the decimal is always '.' regardless of host
-    # locale; keeps the line parseable by any consumer.
-    $pctText = $pct.ToString('N1', [Globalization.CultureInfo]::InvariantCulture)
-    Write-Host ('Code coverage: {0}%' -f $pctText) -ForegroundColor Cyan
-    Write-Host '(Gate not yet enabled.)' -ForegroundColor DarkGray
+    if ($cov.CommandsAnalyzedCount -le 0) {
+        # No commands measured (configuration error or a brand-new
+        # collector behavior change). Skip the gate rather than fail
+        # spuriously at 0%; the missing commands surface elsewhere.
+        Write-Host 'Code coverage: no commands analyzed (gate skipped).' -ForegroundColor DarkGray
+    } else {
+        # CommandsExecutedCount / CommandsAnalyzedCount has been stable
+        # across Pester 5.0+. Direct $cov.CoveragePercent is available
+        # in newer 5.x but not all releases.
+        $pct = 100.0 * $cov.CommandsExecutedCount / $cov.CommandsAnalyzedCount
+        # InvariantCulture so the decimal is always '.' regardless of
+        # host locale; keeps the line parseable by any consumer.
+        $invariant = [Globalization.CultureInfo]::InvariantCulture
+        $pctText   = $pct.ToString('N1', $invariant)
+        $passed    = $pct -ge $CoverageThreshold
+        $color     = if ($passed) { 'Green' } else { 'Red' }
+        Write-Host ('Code coverage: {0}% (threshold {1}%)' -f $pctText, $CoverageThreshold) -ForegroundColor $color
+        if (-not $passed) {
+            # Show two extra decimals on failure so a value that rounds
+            # up to the threshold (e.g. 89.95 -> 90.0) cannot make the
+            # red line look like a contradiction with the summary above.
+            $pctPrecise = $pct.ToString('N2', $invariant)
+            Write-Host ('Coverage gate FAILED: {0}% < {1}% minimum.' -f $pctPrecise, $CoverageThreshold) -ForegroundColor Red
+            $coverageGateFailed = $true
+        }
+    }
 }
 
 # --- Exit code ---
-# Preserve today's binary semantics: nonzero iff any test failed.
-# Coverage gate is intentionally NOT enforced in step 1.
-if ($result.FailedCount -gt 0) {
+# Nonzero iff any test failed OR the coverage gate was not met.
+if ($result.FailedCount -gt 0 -or $coverageGateFailed) {
     exit 1
 } else {
     exit 0
