@@ -243,6 +243,80 @@ Describe 'switch_claude_account' {
         }
     }
 
+    # ----- /api/oauth/profile identity-fallback path --------------------
+    #
+    # When ~/.claude.json has no oauthAccount block (Get-OAuthAccountFromClaudeJson
+    # returns $null), reconcile falls back to /api/oauth/profile to learn
+    # the current identity. The synthesized accountInfo has only
+    # emailAddress populated; the other four fields default to $null.
+    # Exercises the lines 1362-1382 branch that the claude.json-only
+    # tests above cannot reach.
+
+    Context 'Invoke-Reconcile (profile-endpoint fallback identity)' {
+        It 'auto-saves using the /api/oauth/profile email when claude.json has no oauthAccount' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+
+            # ~/.claude.json present but has no oauthAccount, so
+            # Get-OAuthAccountFromClaudeJson returns $null and the
+            # profile fallback fires.
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+
+            # Override Common.ps1's default profile mock (which throws)
+            # to return a real ok+Email shape.
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{
+                    account = [pscustomobject]@{ email = 'fallback@example.com' }
+                }
+            }
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'auto-save'
+            $r.Email  | Should -Be 'fallback@example.com'
+
+            # Auto-save slot is labeled with the fallback email and a sidecar exists.
+            $autoPath    = Join-Path $script:CD ".credentials.$($r.Slot)(fallback@example.com).json"
+            $autoSidecar = Join-Path $script:CD ".credentials.$($r.Slot)(fallback@example.com).account.json"
+            Test-Path -LiteralPath $autoPath    | Should -BeTrue
+            Test-Path -LiteralPath $autoSidecar | Should -BeTrue
+
+            # Sidecar source is 'api_profile' (not 'claude_json') because
+            # the synthesized accountInfo has no accountUuid.
+            $sidecar = Get-Content -LiteralPath $autoSidecar -Raw | ConvertFrom-Json
+            $sidecar.source | Should -Be 'api_profile'
+            $sidecar.oauthAccount.emailAddress | Should -Be 'fallback@example.com'
+            # The four optional fields default to $null in the fallback path.
+            $sidecar.oauthAccount.accountUuid      | Should -BeNullOrEmpty
+            $sidecar.oauthAccount.organizationUuid | Should -BeNullOrEmpty
+        }
+
+        # When state.active_slot points at a slot whose sidecar email
+        # matches the profile-fallback email, reconcile mirrors (no
+        # cross-account swap). Exercises the sidecar-email comparison
+        # via the profile fallback.
+        It 'mirrors when claude.json is empty but profile fallback email matches the tracked slot' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+
+            $slotFile = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'samesame@example.com' -Content 'STALE'
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{
+                    account = [pscustomobject]@{ email = 'samesame@example.com' }
+                }
+            }
+
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE' | Out-Null
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'mirror'
+            $r.Slot   | Should -Be 'work'
+
+            Get-Content -LiteralPath $slotFile -Raw | Should -Be $script:CredsBody
+        }
+    }
+
     AfterAll {
         $env:USERPROFILE = $script:OriginalUserProfile
         $global:PROFILE  = $script:OriginalProfile

@@ -226,6 +226,17 @@ Describe 'switch_claude_account' {
             Read-ScaState | Should -BeNullOrEmpty
             Test-Path -LiteralPath $StateFile | Should -BeFalse
         }
+
+        # Regression guard for the auto-migration's Get-SHA256Hex failure
+        # tolerance branch: when the credentials file cannot be hashed
+        # (e.g. read fails), Read-ScaState must surface $null without
+        # throwing rather than crashing the caller.
+        It 'returns null when .credentials.json cannot be hashed (Get-SHA256Hex throws)' {
+            Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.credentials.json') -Value 'PAYLOAD' -NoNewline
+            Mock Get-SHA256Hex -MockWith { throw [System.IO.IOException]::new('locked') }
+
+            Read-ScaState | Should -BeNullOrEmpty
+        }
     }
 
     Context 'Update-ScaState' {

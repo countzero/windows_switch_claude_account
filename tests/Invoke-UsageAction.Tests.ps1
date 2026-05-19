@@ -1589,6 +1589,278 @@ Describe 'switch_claude_account' {
             $after = Get-Content -LiteralPath $slot -Raw | ConvertFrom-Json
             $after.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
         }
+
+        It 'refresh 429 surfaces as rate-limited (not expired)' {
+            $slot = New-ProfileSlot -Name 'rl' -ExpiresAt ([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds())
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+            (Get-SlotProfile -SlotPath $slot).Status | Should -Be 'rate-limited'
+        }
+
+        It 'refresh failure (non-429) surfaces as expired with the underlying error' {
+            $slot = New-ProfileSlot -Name 'exp' -ExpiresAt ([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds())
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Exception]::new('refresh_token invalid')
+            }
+            $res = Get-SlotProfile -SlotPath $slot
+            $res.Status | Should -Be 'expired'
+            $res.Error  | Should -Match 'refresh_token invalid'
+        }
+
+        It 'profile endpoint 429 surfaces as rate-limited' {
+            $slot = New-ProfileSlot -Name 'pl-rl'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+            (Get-SlotProfile -SlotPath $slot).Status | Should -Be 'rate-limited'
+        }
+
+        It 'returns error when profile response is missing account.email' {
+            $slot = New-ProfileSlot -Name 'noemail'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{ organization = [pscustomobject]@{ name = 'x' } }
+            }
+            $res = Get-SlotProfile -SlotPath $slot
+            $res.Status | Should -Be 'error'
+            $res.Error  | Should -Match 'missing account.email'
+        }
+    }
+
+    Context 'Format-UsageVerbose (uncovered branches)' {
+        # Format-UsageVerbose is exercised indirectly by `sca usage <name>`
+        # integration tests, but several decision branches are not hit:
+        # the active-marker, the Account line, the non-ok fallback table,
+        # the empty-response advisory, and the null-reset em-dash.
+
+        It "appends ' (active)' to the header when Result.IsActive is true" {
+            $row = [pscustomobject]@{
+                Name     = 'work'
+                IsActive = $true
+                Status   = 'ok'
+                Data     = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 2.0; resets_at = $null }
+                }
+                Error    = $null
+                Email    = $null
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            $out | Should -Match "Slot 'work' \(active\)"
+        }
+
+        It "renders an 'Account:' line when Result.Email is set" {
+            $row = [pscustomobject]@{
+                Name     = 'work'
+                IsActive = $false
+                Status   = 'ok'
+                Data     = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 2.0; resets_at = $null }
+                }
+                Error    = $null
+                Email    = 'alice@example.com'
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            $out | Should -Match 'Account: alice@example\.com'
+        }
+
+        It 'delegates to Format-UsageTable for non-ok rows (fallback)' {
+            # When the row's Status is anything other than 'ok',
+            # Format-UsageVerbose drops out to a single-row table render
+            # so the user sees the status label without per-bucket detail.
+            $row = [pscustomobject]@{
+                Name     = 'dead'
+                IsActive = $false
+                Status   = 'expired'
+                Data     = $null
+                Error    = 'refresh_token invalid'
+                Email    = $null
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            $out | Should -Match "Slot 'dead'"
+            # The fallback render uses Format-UsageTable, which renders
+            # the "expired:" status text.
+            $out | Should -Match 'expired:'
+            # No Session/Week bucket rows in the fallback path.
+            $out | Should -Not -Match '^\s+Session\s'
+        }
+
+        It "prints '(empty response)' when Status is ok but Data is null" {
+            $row = [pscustomobject]@{
+                Name     = 'empty'
+                IsActive = $false
+                Status   = 'ok'
+                Data     = $null
+                Error    = $null
+                Email    = $null
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            $out | Should -Match '\(empty response\)'
+        }
+
+        It 'renders em-dash for a bucket whose resets_at is null' {
+            $row = [pscustomobject]@{
+                Name     = 'partial'
+                IsActive = $false
+                Status   = 'ok'
+                Data     = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 4.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 5.0; resets_at = $null }
+                }
+                Error    = $null
+                Email    = $null
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            # The bucket cell renders the percent + em-dash for the
+            # null reset (vs 'Resets <time>' when set).
+            $out | Should -Match 'Session\s+\d+%\s+—'
+            $out | Should -Match 'Week\s+\d+%\s+—'
+        }
+    }
+
+    Context 'Get-SlotUsage (wraps Get-SlotOAuth failures)' {
+        # When Get-SlotOAuth throws (e.g. corrupt slot file), Get-SlotUsage
+        # must catch and surface a Status='error' record rather than
+        # bubbling the exception up to Invoke-UsageAction.
+        It 'returns Status=error when the slot file is corrupt JSON' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.broken.json'
+            Set-Content -LiteralPath $slot -Value 'not-json{' -NoNewline
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status | Should -Be 'error'
+            $r.Error  | Should -Not -BeNullOrEmpty
+        }
+    }
+
+    Context 'Get-SlotUsage (429 retry-after-sleep on first-time cache miss)' {
+        # Documented behavior (see source ~line 2160): on usage-endpoint
+        # 429, if the slot has NO cache entry at all (first poll ever
+        # for this slot, hit by 429), wait 5s and retry once. Mock
+        # Start-Sleep so the test is fast.
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+
+            $script:sleepCount = 0
+            Mock Start-Sleep -MockWith { $script:sleepCount++ }
+        }
+
+        It '429 then ok-on-retry: Status=ok and Start-Sleep was called once with 5 seconds' {
+            $slot = Join-Path $script:CredDirPath '.credentials.first429.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                if ($script:usageCall -eq 1) {
+                    $resp  = [pscustomobject]@{ StatusCode = 429 }
+                    $inner = [System.Exception]::new('Too Many Requests')
+                    $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                    throw $inner
+                }
+                # Second call (after retry sleep) succeeds.
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null }
+                }
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status | Should -Be 'ok'
+            $r.Data.five_hour.utilization | Should -Be 5.0
+            Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 5 }
+            $script:usageCall | Should -Be 2
+        }
+
+        It '429 then 429-again-on-retry: Status=rate-limited' {
+            $slot = Join-Path $script:CredDirPath '.credentials.tworetry.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status | Should -Be 'rate-limited'
+        }
+
+        It '429 with a STALE cache entry: Status=rate-limited; no retry sleep' {
+            $slot = Join-Path $script:CredDirPath '.credentials.staleC.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            # Pre-populate a stale cache entry so the function knows the
+            # slot has been seen before; the retry path should NOT fire.
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 1.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status | Should -Be 'rate-limited'
+            # No 5s retry sleep because the slot was already seen.
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+    }
+
+    Context 'Get-CachedUsageOrNull' {
+        # Direct unit tests for the per-process usage cache helper.
+        # $Script:SlotUsageCache is re-initialized to @{} in each
+        # BeforeEach via the dot-source in Common.ps1.
+
+        It 'returns $null on cache miss' {
+            (Get-CachedUsageOrNull -SlotPath 'missing/path.json') | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null on stale entries (older than UsageCacheTTL minutes)' {
+            $slot = 'D:/some/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 9.0 } }
+                # Force a timestamp far enough in the past to exceed TTL.
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot) | Should -BeNullOrEmpty
+        }
+
+        It 'returns the cached data wrapped in an ok+fallback shape when fresh' {
+            $slot = 'D:/fresh/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 17.0 } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            $r = Get-CachedUsageOrNull -SlotPath $slot
+            $r                         | Should -Not -BeNullOrEmpty
+            $r.Status                  | Should -Be 'ok'
+            $r.IsCachedFallback        | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 17
+        }
     }
 
     Context 'Invoke-UsageAction email rendering' {
