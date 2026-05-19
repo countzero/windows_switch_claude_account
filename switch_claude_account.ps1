@@ -124,7 +124,15 @@ Param (
     # Watch mode's alt-buffer / sync-mode / clear-screen / cursor-home VT
     # sequences are message bytes (not SGR), so they remain unaffected --
     # watch mode keeps working in B&W; only color tinting is suppressed.
-    [switch] $NoColor
+    [switch] $NoColor,
+
+    # -Version: print the script version ($Script:Version) and exit before
+    # any action runs. Lives outside the 'Json' / 'Watch' parameter sets so
+    # it participates in __AllParameterSets and composes with -NoColor (and
+    # with any positional Action, which it short-circuits past). Note: `-V`
+    # is ambiguous (prefix-matches both -Version and -Verbose from
+    # CmdletBinding), so the shortest unambiguous prefix is `-Versi`.
+    [switch] $Version
 )
 
 # We are resolving the script path to reference this file when
@@ -139,6 +147,13 @@ $StateFile      = Join-Path $CredDir ".sca-state.json"
 # at switch time so Claude Code's display follows the active slot.
 $ClaudeJsonPath = Join-Path $env:USERPROFILE ".claude.json"
 $ProfilePath    = $PROFILE.CurrentUserAllHosts
+
+# Version of this script. Bumped in the same commit that adds the matching
+# CHANGELOG.md release section and the git tag (vX.Y.Z) so `sca -Version`
+# matches the tag for users who downloaded the standalone .ps1 from the
+# GitHub release asset and have no git context. A Helpers.Tests.ps1 case
+# cross-checks this string against the most recent CHANGELOG section header.
+$Script:Version = '2.2.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -807,6 +822,7 @@ function Show-Help {
         "",
         "OPTIONS",
         "  -NoColor         Suppress all ANSI color output (also: set NO_COLOR env var)",
+        "  -Version         Print the script version and exit",
         "",
         "EXAMPLES",
         "  $cmd save slot-1                       # save current login as 'slot-1'",
@@ -3980,6 +3996,17 @@ function Invoke-UsageWatch {
 # suite, which calls Invoke-*Action directly and bypasses Invoke-Main)
 # are unaffected.
 function Invoke-Main {
+    # -Version short-circuit. Runs before the help / action dispatch so
+    # `sca -Version usage` (or any positional Action) prints the version
+    # without touching the network, the credentials directory, or any
+    # Invoke-*Action body. Plain Write-Host (information stream 6) matches
+    # the rest of the script's output convention so `6>&1 | Out-String`
+    # tests capture it the same way as Show-Help.
+    if ($Version) {
+        Write-Host $Script:Version
+        return
+    }
+
     if ($Help -or $Action -eq "help" -or $Action -eq "") {
         Show-Help
         return
