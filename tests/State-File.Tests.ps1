@@ -171,6 +171,21 @@ Describe 'switch_claude_account' {
             $r.last_sync_hash | Should -Be 'deadbeef'
         }
 
+        # Read-ScaState's ternaries coerce empty / missing JSON values to
+        # $null so callers never have to disambiguate '' vs $null when
+        # checking active_slot / last_sync_hash. Write-ScaState happens
+        # to write null literals, but a manually edited or partially
+        # written state file can carry empty strings; pin the contract.
+        It 'coerces empty active_slot / last_sync_hash to $null' {
+            $raw = '{"schema":1,"active_slot":"","last_sync_hash":""}'
+            Set-Content -LiteralPath $StateFile -Value $raw -NoNewline -Encoding utf8NoBOM
+
+            $r = Read-ScaState
+            $r.schema         | Should -Be 1
+            $r.active_slot    | Should -BeNullOrEmpty
+            $r.last_sync_hash | Should -BeNullOrEmpty
+        }
+
         It 'returns null on schema mismatch' {
             $bad = '{"schema":2,"active_slot":"work","last_sync_hash":"abc"}'
             Set-Content -LiteralPath $StateFile -Value $bad -NoNewline -Encoding utf8NoBOM
@@ -225,6 +240,17 @@ Describe 'switch_claude_account' {
 
             Read-ScaState | Should -BeNullOrEmpty
             Test-Path -LiteralPath $StateFile | Should -BeFalse
+        }
+
+        # Regression guard for the auto-migration's Get-SHA256Hex failure
+        # tolerance branch: when the credentials file cannot be hashed
+        # (e.g. read fails), Read-ScaState must surface $null without
+        # throwing rather than crashing the caller.
+        It 'returns null when .credentials.json cannot be hashed (Get-SHA256Hex throws)' {
+            Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.credentials.json') -Value 'PAYLOAD' -NoNewline
+            Mock Get-SHA256Hex -MockWith { throw [System.IO.IOException]::new('locked') }
+
+            Read-ScaState | Should -BeNullOrEmpty
         }
     }
 

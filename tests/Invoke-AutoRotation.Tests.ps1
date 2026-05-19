@@ -407,5 +407,37 @@ Describe 'switch_claude_account' {
             $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
             $out | Should -Be '[Auto] No free slot available! Waiting for the next poll.'
         }
+
+        # Regression guard for the default arm: if Get-AutoRotationDecision
+        # ever returns an Action value the switch does not recognise (a
+        # contract bug in the decision helper, or a future Action we
+        # forgot to handle), Invoke-AutoRotationStep must NOT crash; it
+        # preserves the existing latch and lets the watch loop continue.
+        It 'on unknown decision Action, preserves the current latch (default arm)' {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action = 'something-unexpected'
+            } }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
+            $out | Should -Be '[Auto] Automatic slot switching is enabled.'
+        }
+    }
+
+    # Regression guard for Get-AutoRotationDecision's "empty Results
+    # after the @() cast" branch: NoSlots=false but Results is empty.
+    # Difference from the NoSlots branch test above; both arms must
+    # return the 'noop' decision struct.
+    Context 'Get-AutoRotationDecision (empty Results not flagged NoSlots)' {
+        It 'returns noop when Results is empty but NoSlots is false' {
+            $snap = [pscustomobject]@{
+                Results          = @()
+                NoSlots          = $false
+                HasCacheFallback = $false
+            }
+            $d = Get-AutoRotationDecision -Snapshot $snap -Threshold 100
+            $d.Action   | Should -Be 'noop'
+            $d.FromName | Should -BeNullOrEmpty
+            $d.ToName   | Should -BeNullOrEmpty
+        }
     }
 }

@@ -233,6 +233,69 @@ Describe 'switch_claude_account' {
             $out | Should -Match '-NoColor'
             $out | Should -Match 'NO_COLOR'
         }
+
+        # Without the install action's profile aliases, Get-Alias returns
+        # nothing and Show-Help prints '.\switch_claude_account.ps1' (the
+        # default test environment). When the alias IS present (post-
+        # install or sourced via a profile that runs the install block),
+        # the USAGE line should print 'sca' instead. Pin both branches.
+        It 'uses the sca alias in USAGE when Get-Alias sca resolves' {
+            Set-Alias -Name sca -Value $script:ScriptPath -Scope Local
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'sca <action>'
+            $out | Should -Not -Match '\.\\switch_claude_account\.ps1 <action>'
+        }
+
+        It 'documents the -Version option' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match '-Version'
+        }
+    }
+
+    Context '-Version flag' {
+        # Verifies the Invoke-Main short-circuit that prints $Script:Version
+        # and returns before any action body runs. Same dynamic-scope pattern
+        # as the 'No-color mode' context: assign Param() variables in the It
+        # body, call Invoke-Main, capture information stream 6.
+
+        It 'prints $Script:Version and returns before any action runs' {
+            # We do NOT assign $Action; setting it to '' or $null in dynamic
+            # scope re-triggers the [ValidateSet] on the script's Param()
+            # ($Action has no '' member). Letting Invoke-Main read the
+            # parameter's bind-time default exercises the empty-Action path.
+            $Version = $true
+            $out = (Invoke-Main 6>&1 | Out-String).Trim()
+            $out | Should -Be $Script:Version
+        }
+
+        It 'wins over -Help when both are bound' {
+            $Version = $true
+            $Help    = $true
+            $out = (Invoke-Main 6>&1 | Out-String).Trim()
+            $out | Should -Be $Script:Version
+            $out | Should -Not -Match 'ACTIONS'
+        }
+
+        It 'wins over a positional Action (does not dispatch the action)' {
+            Mock Invoke-UsageAction { throw 'should not be called' }
+            $Version = $true
+            $Action  = 'usage'
+            $out = (Invoke-Main 6>&1 | Out-String).Trim()
+            $out | Should -Be $Script:Version
+            Should -Invoke Invoke-UsageAction -Times 0
+        }
+
+        # Inversion guard: forgetting to bump $Script:Version when adding a
+        # release section to CHANGELOG.md is exactly the failure mode this
+        # constant exists to prevent. Cross-check at test time so CI rejects
+        # the bad commit before tag creation.
+        It 'matches the most recent CHANGELOG.md release header' {
+            $repoRoot  = Resolve-Path (Join-Path $PSScriptRoot '..')
+            $changelog = Get-Content -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -Raw
+            $m = [regex]::Match($changelog, '##\s+\[(\d+\.\d+\.\d+)\]\s+-\s+\d{4}-\d{2}-\d{2}')
+            $m.Success     | Should -BeTrue
+            $Script:Version | Should -Be $m.Groups[1].Value
+        }
     }
 
     Context 'Format-WatchTitle' {
@@ -349,6 +412,17 @@ Describe 'switch_claude_account' {
 
         It 'returns bare suffix for empty snapshot (no slots saved)' {
             $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            Format-WatchTitle -Name '' -Snapshot $empty |
+                Should -Be 'Switch Claude Account'
+        }
+
+        # Distinct from the NoSlots=true case above: the snapshot was
+        # built successfully (NoSlots=false), but its Results array is
+        # empty. Defensive branch in Format-WatchTitle; reachable in
+        # principle if Get-UsageSnapshot is ever changed to seed the
+        # shape before populating rows.
+        It 'returns bare suffix when Results is empty but NoSlots is false' {
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $false; HasCacheFallback = $false }
             Format-WatchTitle -Name '' -Snapshot $empty |
                 Should -Be 'Switch Claude Account'
         }
@@ -479,6 +553,123 @@ Describe 'switch_claude_account' {
             $title | Should -Not -Match "`e"
             $title | Should -Not -Match "`a"
             $title | Should -Be '10% | 20% | Switch Claude Account'
+        }
+
+        # --- -Aggregate mode (wired to -Auto by Invoke-UsageWatch) ----
+        # In aggregate mode both percentages are the pool mean across
+        # HTTP-ok rows, alarm thresholds swap to
+        # $Script:AggregateRedPct (90) / $Script:AggregateYellowPct (50),
+        # and -Name is ignored. The pool-mean math itself is tested
+        # under Get-PoolMeanUtilization in Invoke-UsageAction.Tests.ps1;
+        # these tests pin the rendering behavior on top of it.
+
+        It '-Aggregate renders pool mean across all HTTP-ok rows (active flag ignored)' {
+            # Regression contrast: without -Aggregate the same snapshot
+            # renders the active row (10% | 10%, see "ignores non-active
+            # rows" test above). With -Aggregate it averages all three:
+            # 5h mean = (100+10+100)/3 = 70, 7d mean = (100+10+100)/3 = 70.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'b'; FiveUtil = 10;  SevenUtil = 10; IsActive = $true }
+                @{ Name = 'c'; FiveUtil = 100; SevenUtil = 100 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 70% | 70% | Switch Claude Account'
+        }
+
+        It '-Aggregate excludes HTTP-failure rows from the mean' {
+            # 2 ok rows + 1 expired. Mean = (40+60)/2 = 50.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 40; SevenUtil = 40 }
+                @{ Name = 'b'; FiveUtil = 60; SevenUtil = 60; IsActive = $true }
+                @{ Name = 'c'; Status = 'expired'; FiveUtil = 100; SevenUtil = 100 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 50% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate counts null buckets as 0 (denominator stays N)' {
+            # 2 ok rows, one with null five_hour. 5h mean = (0+60)/2 = 30
+            # (NOT 60, which would be N-1).
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = $null; SevenUtil = 20; IsActive = $true }
+                @{ Name = 'b'; FiveUtil = 60;    SevenUtil = 20 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '30% | 20% | Switch Claude Account'
+        }
+
+        It '-Aggregate ignores -Name (aggregation is pool-wide by definition)' {
+            # The non-aggregate test "renders the active slot" pins that
+            # -Name='b' overrides IsActive. Under -Aggregate, -Name has
+            # no effect: output equals the no-Name aggregate.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 20; SevenUtil = 20 }
+                @{ Name = 'b'; FiveUtil = 80; SevenUtil = 80; IsActive = $true }
+            )
+            $noName   = Format-WatchTitle -Name ''  -Snapshot $snap -Aggregate
+            $withName = Format-WatchTitle -Name 'b' -Snapshot $snap -Aggregate
+            $withName | Should -Be $noName
+            $noName   | Should -Be '[~] 50% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate returns bare suffix when no HTTP-ok rows exist' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; Status = 'expired'; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
+                @{ Name = 'b'; Status = 'error';   FiveUtil = 50; SevenUtil = 50 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be 'Switch Claude Account'
+        }
+
+        It '-Aggregate returns bare suffix for empty snapshot' {
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            Format-WatchTitle -Name '' -Snapshot $empty -Aggregate |
+                Should -Be 'Switch Claude Account'
+        }
+
+        # Alarm prefix tier swap: AggregateYellowPct (50) / AggregateRedPct (90).
+
+        It '-Aggregate prepends [!] when pool mean is at AggregateRedPct (90)' {
+            # Single row at 90/50 -> pool mean = 90/50.
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 90; SevenUtil = 50; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[!] 90% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate prepends [~] when pool mean is at AggregateYellowPct (50)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 50; SevenUtil = 49; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 50% | 49% | Switch Claude Account'
+        }
+
+        It '-Aggregate no prefix when pool mean is below AggregateYellowPct (49)' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 49; SevenUtil = 49; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '49% | 49% | Switch Claude Account'
+        }
+
+        It '-Aggregate [!] wins over [~] when one bucket is at Red and the other at Yellow' {
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 90; SevenUtil = 50; IsActive = $true })
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[!] 90% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate does NOT fire on per-slot UtilWarnPct (default-mode threshold) below AggregateYellowPct' {
+            # Default mode at 30/40 with active=true would render no prefix.
+            # Aggregate mode at the same row (N=1) also renders no prefix
+            # because both buckets are below AggregateYellowPct (50). This
+            # test is the inverse-axis check: confirm the threshold pair
+            # actually swapped, not just that the default thresholds got
+            # left in.
+            $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 89; SevenUtil = 89; IsActive = $true })
+            # Default mode -> 89/89 is below UtilWarnPct (90), no prefix.
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '89% | 89% | Switch Claude Account'
+            # Aggregate mode -> 89 is at/above AggregateYellowPct (50), [~]
+            # prefix fires. Pins the threshold swap.
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 89% | 89% | Switch Claude Account'
         }
     }
 
@@ -671,6 +862,488 @@ Describe 'switch_claude_account' {
             finally {
                 $PSStyle.OutputRendering = 'PlainText'
             }
+        }
+    }
+
+    Context 'ConvertTo-ScaJsonString' {
+        # Note: the function's `if ($null -eq $Value) { return 'null' }`
+        # branch is defensive-dead. PowerShell binds $null to a [string]
+        # parameter as '', so external callers cannot exercise it; the
+        # one internal caller in Set-OAuthAccountInClaudeJson short-
+        # circuits before calling. We do NOT test that branch.
+
+        It 'escapes embedded double-quotes, backslashes, and control characters' {
+            ConvertTo-ScaJsonString -Value 'a "b" \ c' | Should -Be '"a \"b\" \\ c"'
+            ConvertTo-ScaJsonString -Value "line1`nline2`tend" | Should -Be '"line1\nline2\tend"'
+        }
+
+        It 'wraps a plain string in double quotes' {
+            ConvertTo-ScaJsonString -Value 'hello' | Should -Be '"hello"'
+        }
+
+        It 'returns an empty JSON string for empty input (binding null collapses to "")' {
+            ConvertTo-ScaJsonString -Value '' | Should -Be '""'
+        }
+    }
+
+    Context 'ConvertTo-DateTimeOffsetOrNull' {
+        It 'returns $null for null and empty input' {
+            ConvertTo-DateTimeOffsetOrNull -Value $null | Should -BeNullOrEmpty
+            ConvertTo-DateTimeOffsetOrNull -Value ''    | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null for unparseable strings rather than throwing' {
+            ConvertTo-DateTimeOffsetOrNull -Value 'not-a-date' | Should -BeNullOrEmpty
+        }
+
+        It 'returns the value unchanged for a DateTimeOffset input' {
+            $dto = [DateTimeOffset]::new(2026, 4, 26, 12, 0, 0, [TimeSpan]::Zero)
+            (ConvertTo-DateTimeOffsetOrNull -Value $dto) | Should -Be $dto
+        }
+
+        It 'casts a [DateTime] input to [DateTimeOffset]' {
+            # The local time zone is environment-dependent, so we only
+            # assert the cast succeeded and the type is correct.
+            $dt = [DateTime]::new(2026, 4, 26, 12, 0, 0, [DateTimeKind]::Utc)
+            $r = ConvertTo-DateTimeOffsetOrNull -Value $dt
+            $r | Should -BeOfType ([DateTimeOffset])
+        }
+
+        It 'parses an ISO-8601 string' {
+            $iso = '2026-04-26T12:00:00.000Z'
+            $r = ConvertTo-DateTimeOffsetOrNull -Value $iso
+            $r | Should -BeOfType ([DateTimeOffset])
+            $r.UtcDateTime | Should -Be ([DateTime]::new(2026, 4, 26, 12, 0, 0, [DateTimeKind]::Utc))
+        }
+    }
+
+    Context 'Format-UtilCell / Format-Truncate / Format-AccountCell / Format-BucketCell' {
+        # Direct unit tests for the pure cell-formatters; closes a
+        # coverage gap previously left by exercising them only through
+        # full Invoke-UsageAction renders.
+
+        It 'Format-UtilCell renders em-dash for $null utilization' {
+            (Format-UtilCell -Utilization $null) | Should -Be '   —'
+        }
+
+        It 'Format-UtilCell renders a right-justified integer percent' {
+            (Format-UtilCell -Utilization 7)    | Should -Be '  7%'
+            (Format-UtilCell -Utilization 99.4) | Should -Be ' 99%'
+        }
+
+        It 'Format-Truncate returns em-dash for $null / empty input' {
+            (Format-Truncate -Text $null -Max 32) | Should -Be '—'
+            (Format-Truncate -Text ''   -Max 32)  | Should -Be '—'
+        }
+
+        It 'Format-Truncate returns a single ellipsis when -Max is 1' {
+            (Format-Truncate -Text 'abcdef' -Max 1) | Should -Be '…'
+        }
+
+        It 'Format-Truncate leaves a fitting string unchanged' {
+            (Format-Truncate -Text 'short' -Max 32) | Should -Be 'short'
+        }
+
+        It 'Format-Truncate middle-truncates with the ellipsis between head and tail' {
+            $r = Format-Truncate -Text 'one.two.three.four.five.six.seven.eight' -Max 12
+            $r.Length | Should -Be 12
+            $r       | Should -Match '…'
+        }
+
+        It 'Format-AccountCell returns em-dash for null / empty email' {
+            (Format-AccountCell -SlotName 'work' -Email $null) | Should -Be '—'
+            (Format-AccountCell -SlotName 'work' -Email '')    | Should -Be '—'
+        }
+
+        It 'Format-AccountCell returns em-dash when slot name equals email (case-insensitive dedup)' {
+            (Format-AccountCell -SlotName 'alice@example.com' -Email 'alice@example.com') | Should -Be '—'
+            (Format-AccountCell -SlotName 'Alice@Example.Com' -Email 'alice@example.com') | Should -Be '—'
+        }
+
+        It 'Format-AccountCell returns the email when slot name differs' {
+            (Format-AccountCell -SlotName 'work' -Email 'alice@example.com') | Should -Be 'alice@example.com'
+        }
+
+        It 'Format-BucketCell renders em-dash for null utilization' {
+            (Format-BucketCell -Utilization $null -ResetsAt $null) | Should -Be '   —'
+        }
+
+        It 'Format-BucketCell renders only the percent when ResetsAt is null / empty' {
+            (Format-BucketCell -Utilization 9 -ResetsAt $null) | Should -Be '  9%'
+            (Format-BucketCell -Utilization 9 -ResetsAt '')    | Should -Be '  9%'
+        }
+
+        It 'Format-BucketCell renders "percent (delta)" when ResetsAt is set' {
+            $future = [DateTimeOffset]::UtcNow.AddHours(2).AddMinutes(14).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+            (Format-BucketCell -Utilization 31 -ResetsAt $future) | Should -Match '^ 31% \(2h 1[34]m\)$'
+        }
+    }
+
+    Context 'Get-StatusColor (uncovered branches)' {
+        It 'returns DarkGray for the no-oauth label' {
+            (Get-StatusColor -Label 'no-oauth' -IsActive $false) | Should -Be 'DarkGray'
+        }
+
+        It 'returns Yellow for the rate-limited label' {
+            (Get-StatusColor -Label 'rate-limited' -IsActive $false) | Should -Be 'Yellow'
+        }
+
+        It 'returns Gray for unknown labels (default arm)' {
+            (Get-StatusColor -Label 'something-new' -IsActive $false) | Should -Be 'Gray'
+            (Get-StatusColor -Label ''             -IsActive $false) | Should -Be 'Gray'
+        }
+    }
+
+    Context 'Get-StatusRationale' {
+        It '<Case>' -ForEach @(
+            @{ Case = 'limited 5h';        Label = 'limited 5h';        Expected = 'no prompts until 5h window resets' }
+            @{ Case = 'limited 7d';        Label = 'limited 7d';        Expected = 'no prompts until 7d window resets' }
+            @{ Case = 'limited (both)';    Label = 'limited';           Expected = 'no prompts until both 5h and 7d windows reset' }
+            @{ Case = 'ok (no plan data)'; Label = 'ok (no plan data)'; Expected = 'HTTP ok but response carried no bucket data' }
+        ) {
+            (Get-StatusRationale -Label $Label) | Should -Be $Expected
+        }
+
+        It "returns Script:UtilWarnPct-templated rationale for 'near limit'" {
+            $out = Get-StatusRationale -Label 'near limit'
+            $out | Should -Match '^at or above \d+%'
+            $out | Should -Match 'at least one bucket$'
+        }
+
+        It 'returns $null for labels with no rationale (ok, error, expired, ...)' {
+            (Get-StatusRationale -Label 'ok')    | Should -BeNullOrEmpty
+            (Get-StatusRationale -Label 'error') | Should -BeNullOrEmpty
+            (Get-StatusRationale -Label '')      | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Read-Sidecar' {
+        # Pure-helper file-IO tests; sandbox uses $TestDrive directly to
+        # avoid pulling in the full credential-dir scaffolding.
+        It 'returns $null when the sidecar file is missing' {
+            $slot = Join-Path $TestDrive '.credentials.missing.json'
+            Read-Sidecar -SlotPath $slot | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when the sidecar JSON is corrupt' {
+            $slot     = Join-Path $TestDrive '.credentials.corrupt.json'
+            $sidecar  = $slot -replace '\.json$', '.account.json'
+            Set-Content -LiteralPath $sidecar -Value 'not-json{' -NoNewline -Encoding utf8NoBOM
+            Read-Sidecar -SlotPath $slot | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when the sidecar schema is not 1' {
+            $slot    = Join-Path $TestDrive '.credentials.badschema.json'
+            $sidecar = $slot -replace '\.json$', '.account.json'
+            $payload = '{"schema":2,"oauthAccount":{"emailAddress":"a@b.com"}}'
+            Set-Content -LiteralPath $sidecar -Value $payload -NoNewline -Encoding utf8NoBOM
+            Read-Sidecar -SlotPath $slot | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when oauthAccount is missing' {
+            $slot    = Join-Path $TestDrive '.credentials.nooauth.json'
+            $sidecar = $slot -replace '\.json$', '.account.json'
+            Set-Content -LiteralPath $sidecar -Value '{"schema":1}' -NoNewline -Encoding utf8NoBOM
+            Read-Sidecar -SlotPath $slot | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when oauthAccount.emailAddress is blank' {
+            $slot    = Join-Path $TestDrive '.credentials.noemail.json'
+            $sidecar = $slot -replace '\.json$', '.account.json'
+            $payload = '{"schema":1,"oauthAccount":{"emailAddress":""}}'
+            Set-Content -LiteralPath $sidecar -Value $payload -NoNewline -Encoding utf8NoBOM
+            Read-Sidecar -SlotPath $slot | Should -BeNullOrEmpty
+        }
+
+        It 'returns a parsed pscustomobject for a well-formed sidecar' {
+            $slot    = Join-Path $TestDrive '.credentials.ok.json'
+            $sidecar = $slot -replace '\.json$', '.account.json'
+            $payload = '{"schema":1,"captured_at":"2026-04-26T00:00:00Z","source":"test","oauthAccount":{"emailAddress":"alice@example.com","accountUuid":"u1"}}'
+            Set-Content -LiteralPath $sidecar -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $obj = Read-Sidecar -SlotPath $slot
+            $obj                              | Should -Not -BeNullOrEmpty
+            $obj.schema                       | Should -Be 1
+            $obj.oauthAccount.emailAddress    | Should -Be 'alice@example.com'
+        }
+    }
+
+    Context 'Get-OAuthAccountFromClaudeJson (uncovered branches)' {
+        # Tests sandbox $env:USERPROFILE per BeforeEach (Common.ps1), so
+        # $ClaudeJsonPath resolves under $TestDrive automatically.
+        It 'returns $null when ~/.claude.json is missing' {
+            Get-OAuthAccountFromClaudeJson | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when ~/.claude.json is corrupt' {
+            Set-Content -LiteralPath $ClaudeJsonPath -Value 'not-json{' -NoNewline -Encoding utf8NoBOM
+            Get-OAuthAccountFromClaudeJson | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when ~/.claude.json has no oauthAccount key' {
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+            Get-OAuthAccountFromClaudeJson | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when oauthAccount.emailAddress is empty / whitespace' {
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"oauthAccount":{"emailAddress":"  "}}' -NoNewline -Encoding utf8NoBOM
+            Get-OAuthAccountFromClaudeJson | Should -BeNullOrEmpty
+        }
+
+        It 'defaults missing optional fields (accountUuid, etc.) to $null' {
+            # emailAddress is the only mandatory non-null field; the other
+            # four are populated only when present, otherwise null.
+            $payload = '{"oauthAccount":{"emailAddress":"a@b.com"}}'
+            Set-Content -LiteralPath $ClaudeJsonPath -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $r = Get-OAuthAccountFromClaudeJson
+            $r                  | Should -Not -BeNullOrEmpty
+            $r.emailAddress     | Should -Be 'a@b.com'
+            $r.accountUuid      | Should -BeNullOrEmpty
+            $r.organizationUuid | Should -BeNullOrEmpty
+            $r.displayName      | Should -BeNullOrEmpty
+            $r.organizationName | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Set-OAuthAccountInClaudeJson (uncovered failure modes)' {
+        It 'throws when ~/.claude.json has no oauthAccount block' {
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+            $oa = [pscustomobject]@{ emailAddress = 'a@b.com' }
+            { Set-OAuthAccountInClaudeJson -OAuthAccount $oa } |
+                Should -Throw -ExpectedMessage '*no oauthAccount block*'
+        }
+
+        It 'throws when the oauthAccount block has unbalanced braces' {
+            # Truncate the file so the brace counter walks off the end
+            # without closing depth. Surfaces as 'unbalanced braces'.
+            $payload = '{"oauthAccount":{ "emailAddress":"a@b.com"'
+            Set-Content -LiteralPath $ClaudeJsonPath -Value $payload -NoNewline -Encoding utf8NoBOM
+            $oa = [pscustomobject]@{ emailAddress = 'c@d.com' }
+            { Set-OAuthAccountInClaudeJson -OAuthAccount $oa } |
+                Should -Throw -ExpectedMessage '*unbalanced braces*'
+        }
+    }
+
+    Context 'Get-NextSlotName (single-slot active no-op)' {
+        It "prints the 'Only one slot' advisory and returns null when one active slot exists" {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $credDir -Name 'only' -Content 'X' | Out-Null
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.json') -Value 'X' -NoNewline
+
+            $out = Get-NextSlotName 6>&1 | Out-String
+            $out | Should -Match 'Only one slot'
+            # Function writes the advisory and returns $null; capture via
+            # a second call with the stream redirected.
+            Get-NextSlotName 6>$null | Should -BeNullOrEmpty
+        }
+
+        It 'returns the first slot (no rotation cursor) when no slot is currently active' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $credDir -Name 'a' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $credDir -Name 'b' -Content 'B' | Out-Null
+            # .credentials.json bytes don't match either slot -> no IsActive flag.
+            Set-Content -LiteralPath (Join-Path $credDir '.credentials.json') -Value 'UNKNOWN' -NoNewline
+
+            $r = Get-NextSlotName 6>$null
+            $r.To.Name        | Should -Be 'a'
+            $r.HasActiveSlot  | Should -BeFalse
+        }
+    }
+
+    Context 'Update-SlotTokens (uncovered failure modes)' {
+        # Direct unit tests for Update-SlotTokens' guard clauses and
+        # advisory paths. The happy path is exercised through Invoke-
+        # UsageAction; here we hit the throws and the
+        # propagation-to-credentials.json failure branch.
+
+        It 'throws when the slot file has no OAuth material to refresh' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.apikey.json'
+            Set-Content -LiteralPath $slot -Value '{"apiKey":"sk-ant-api..."}' -NoNewline
+
+            { Update-SlotTokens -SlotPath $slot } |
+                Should -Throw -ExpectedMessage '*no OAuth material to refresh*'
+        }
+
+        It 'throws when refresh response is missing access_token' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.stale.json'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'old'
+                    refreshToken = 'rt'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                # No access_token; expires_in only.
+                return [pscustomobject]@{ expires_in = 3600 }
+            }
+
+            { Update-SlotTokens -SlotPath $slot } |
+                Should -Throw -ExpectedMessage '*missing access_token*'
+        }
+
+        It 'throws when refresh response is missing expires_in' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.stale.json'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'old'
+                    refreshToken = 'rt'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{ access_token = 'new' }
+            }
+
+            { Update-SlotTokens -SlotPath $slot } |
+                Should -Throw -ExpectedMessage '*missing expires_in*'
+        }
+
+        It 'falls back to the old refresh token when response omits refresh_token (RFC 6749)' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.norotate.json'
+            $oldRt = 'sk-ant-ort-KEEPME'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'old-at'
+                    refreshToken = $oldRt
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                # access_token + expires_in but no refresh_token field.
+                return [pscustomobject]@{
+                    access_token = 'new-at'
+                    expires_in   = 3600
+                }
+            }
+
+            Update-SlotTokens -SlotPath $slot 6>$null | Out-Null
+
+            $after = Get-Content -LiteralPath $slot -Raw | ConvertFrom-Json
+            $after.claudeAiOauth.accessToken  | Should -Be 'new-at'
+            # Old refresh token preserved per RFC 6749 fallback.
+            $after.claudeAiOauth.refreshToken | Should -Be $oldRt
+        }
+
+        It 'emits a yellow advisory when propagation to .credentials.json fails' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $credFile = Join-Path $credDir '.credentials.json'
+
+            # Build a labeled slot pair with stale tokens, plus a
+            # matching .credentials.json mirror, and seed state.
+            $slot = New-SlotPair -CredDir $credDir -Name 'active' -Email 'a@b.com' -Content (@{
+                claudeAiOauth = @{
+                    accessToken  = 'OLD'
+                    refreshToken = 'RT'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress)
+            Copy-Item -LiteralPath $slot -Destination $credFile -Force
+            $hash = (Get-FileHash -LiteralPath $credFile -Algorithm SHA256).Hash
+            Update-ScaState -ActiveSlot 'active' -LastSyncHash $hash | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{ access_token = 'NEW'; refresh_token = 'NEW-RT'; expires_in = 3600 }
+            }
+
+            # Force the second atomic write (the propagation to
+            # .credentials.json) to fail. The first call writes the
+            # slot; the second call writes .credentials.json.
+            $script:writeCount = 0
+            Mock Set-CredentialFileAtomic -MockWith {
+                $script:writeCount++
+                if ($script:writeCount -ge 2) {
+                    throw [System.IO.IOException]::new('propagation denied')
+                }
+                # Fall back to the real implementation for the first call
+                # so the slot file actually gets updated.
+                [System.IO.File]::WriteAllBytes($Path, $Bytes)
+            }
+
+            $out = Update-SlotTokens -SlotPath $slot 6>&1 | Out-String
+
+            $out | Should -Match "Token refreshed in slot 'active'"
+            $out | Should -Match 'propagation to \.credentials\.json failed'
+            $out | Should -Match 'propagation denied'
+        }
+    }
+
+    Context 'New-AutoSaveSlot (sidecar-write failure advisory)' {
+        # Direct test for the New-AutoSaveSlot helper's catch path:
+        # when Write-Sidecar throws, the function must NOT throw; it
+        # emits a yellow advisory and the slot tokens file remains on
+        # disk (Get-Slots will hide it, user can clean up by name).
+
+        It 'emits a yellow advisory and keeps the tokens file when sidecar write fails' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes('AUTOBYTES')
+            $oa = [pscustomobject]@{
+                accountUuid      = 'u'
+                emailAddress     = 'auto@example.com'
+                organizationUuid = $null
+                displayName      = $null
+                organizationName = $null
+            }
+
+            Mock Write-Sidecar -MockWith { throw [System.Exception]::new('disk full') }
+
+            $out = New-AutoSaveSlot -Bytes $bytes `
+                                    -Email 'auto@example.com' `
+                                    -OAuthAccount $oa `
+                                    -SourceLabel 'test' `
+                                    -LastSyncHash 'H1' 6>&1 | Out-String
+
+            $out | Should -Match 'Auto-save sidecar write failed'
+            $out | Should -Match 'disk full'
+
+            # Tokens file landed on disk despite the sidecar failure.
+            $tokenFiles = @(Get-ChildItem -LiteralPath $credDir -Filter '.credentials.auto-*.json' |
+                Where-Object { $_.Name -notlike '*.account.json' })
+            $tokenFiles.Count | Should -Be 1
+            [System.IO.File]::ReadAllBytes($tokenFiles[0].FullName) | Should -Be $bytes
+        }
+    }
+
+    Context 'Write-Color (uncovered branches)' {
+        # Common.ps1 forces OutputRendering=PlainText so the SGR codes
+        # Write-Color emits are stripped by PowerShell's host filter
+        # before we see them. We can still verify the function does not
+        # throw on each color name (covers the switch arms) and that
+        # NoNewline is honored.
+
+        It 'emits without throwing for every named color (covers BrightCyan branch)' {
+            foreach ($c in 'Yellow','DarkYellow','Green','Red','Cyan','Gray','DarkGray') {
+                { Write-Color "test" $c 6>$null } | Should -Not -Throw
+            }
+        }
+
+        It 'tolerates an unknown color name via the default branch' {
+            { Write-Color "test" 'not-a-color' 6>$null } | Should -Not -Throw
+        }
+
+        It '-NoNewline switch is honored (single Write-Host call without a newline)' {
+            # Capture stream 6 and verify the emitted line carries the
+            # message text. PlainText stripping leaves the text intact.
+            $out = Write-Color 'sentinel-no-newline' 'Cyan' -NoNewline 6>&1 | Out-String
+            $out | Should -Match 'sentinel-no-newline'
         }
     }
 

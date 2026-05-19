@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [2.2.0] - 2026-05-19
+
+### Added
+- `-Version` flag prints `$Script:Version` and exits.
+
+### Changed
+- `sca usage -Watch -Auto` title shows the pool mean across HTTP-ok slots, not the active slot.
+- Pool-mean math extracted into `Get-PoolMeanUtilization`, shared by `Format-AggregateBars` and `Format-WatchTitle -Aggregate`.
+
 ## [2.1.0] - 2026-05-18
 
 ### Added

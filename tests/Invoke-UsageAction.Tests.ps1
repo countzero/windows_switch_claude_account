@@ -1174,6 +1174,124 @@ Describe 'switch_claude_account' {
 
     }
 
+    Context 'Get-PoolMeanUtilization' {
+        # Pure-helper unit tests for the pool-mean utilization math.
+        # Get-PoolMeanUtilization is shared by Format-AggregateBars (the
+        # bar above the table) and Format-WatchTitle -Aggregate (the
+        # -Watch -Auto terminal title). Pinning the math here means a
+        # change to one site cannot silently drift from the other; the
+        # Format-AggregateBars Context above pins the rendering side.
+        BeforeAll {
+            function New-OkRow {
+                Param (
+                    [string] $Name,
+                    [bool]   $IsActive = $false,
+                    $FiveUtil  = 'unset',
+                    $SevenUtil = 'unset'
+                )
+                # Sentinel 'unset' distinguishes "bucket missing entirely"
+                # from "bucket present, util=null". Matches the factory
+                # in the Format-AggregateBars Context above; redeclared
+                # locally so the file can be split later without coupling.
+                $five  = $null
+                $seven = $null
+                if ($FiveUtil  -ne 'unset') { $five  = [pscustomobject]@{ utilization = [double]$FiveUtil;  resets_at = $null } }
+                if ($SevenUtil -ne 'unset') { $seven = [pscustomobject]@{ utilization = [double]$SevenUtil; resets_at = $null } }
+                $data = [pscustomobject]@{ five_hour = $five; seven_day = $seven }
+                return [pscustomobject]@{
+                    Name     = $Name
+                    IsActive = $IsActive
+                    Status   = 'ok'
+                    Data     = $data
+                    Error    = $null
+                    Email    = $null
+                }
+            }
+        }
+
+        It 'returns $null for null Results (empty input)' {
+            Get-PoolMeanUtilization -Results $null -BucketKey 'five_hour' | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null for empty Results array' {
+            Get-PoolMeanUtilization -Results @() -BucketKey 'five_hour' | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null when zero HTTP-ok rows (all rows are HTTP-failure)' {
+            $rows = @(
+                [pscustomobject]@{ Name='a'; IsActive=$false; Status='expired';  Data=$null; Error='x';  Email=$null }
+                [pscustomobject]@{ Name='b'; IsActive=$false; Status='no-oauth'; Data=$null; Error=$null; Email=$null }
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour'  | Should -BeNullOrEmpty
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -BeNullOrEmpty
+        }
+
+        It 'returns the row util for a single-row pool (N=1 degenerate)' {
+            $rows = @( New-OkRow -Name 'a' -FiveUtil 37 -SevenUtil 42 )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour'  | Should -Be 37
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 42
+        }
+
+        It 'returns the mean across N HTTP-ok rows' {
+            # 5h mean: (40+60+80)/3 = 60. 7d mean: (50+70+90)/3 = 70.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 40 -SevenUtil 50)
+                (New-OkRow -Name 'b' -FiveUtil 60 -SevenUtil 70)
+                (New-OkRow -Name 'c' -FiveUtil 80 -SevenUtil 90)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour'  | Should -Be 60
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 70
+        }
+
+        It 'rounds to nearest integer (banker''s rounding via [math]::Round)' {
+            # (33+34)/2 = 33.5. [math]::Round uses banker's rounding by default
+            # (round half to even), so 33.5 -> 34. Pin the exact behavior so
+            # a refactor to AwayFromZero would surface here.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 33 -SevenUtil 0)
+                (New-OkRow -Name 'b' -FiveUtil 34 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 34
+        }
+
+        It 'null/missing buckets count as 0 (N stays N, not N-1)' {
+            # Two ok rows, one row missing five_hour. Mean = (0 + 60) / 2 = 30,
+            # NOT 60 (which would be N-1 denominator).
+            $rows = @(
+                (New-OkRow -Name 'a' -SevenUtil 0)                # FiveUtil missing -> 0
+                (New-OkRow -Name 'b' -FiveUtil 60 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 30
+        }
+
+        It 'utilization above 100 is clamped to 100' {
+            # 5h: (150 -> 100) + 50 / 2 = 75
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 150 -SevenUtil 0)
+                (New-OkRow -Name 'b' -FiveUtil  50 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 75
+        }
+
+        It 'utilization below 0 is clamped to 0' {
+            # 5h: (-30 -> 0) + 60 / 2 = 30
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil -30 -SevenUtil 0)
+                (New-OkRow -Name 'b' -FiveUtil  60 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 30
+        }
+
+        It 'HTTP-failure rows are excluded from the mean' {
+            # Only the ok row counts. Mean = 20 / 1 = 20.
+            $rows = @(
+                (New-OkRow -Name 'good' -FiveUtil 20 -SevenUtil 0)
+                [pscustomobject]@{ Name='bad'; IsActive=$false; Status='error'; Data=$null; Error='boom'; Email=$null }
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
+        }
+    }
+
     Context 'Get-AggregateBarColor' {
         # Pure-helper unit tests for the aggregate bar color thresholds.
         # Runs the threshold boundaries explicitly so a future tweak of
@@ -1471,6 +1589,278 @@ Describe 'switch_claude_account' {
             $after = Get-Content -LiteralPath $slot -Raw | ConvertFrom-Json
             $after.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
         }
+
+        It 'refresh 429 surfaces as rate-limited (not expired)' {
+            $slot = New-ProfileSlot -Name 'rl' -ExpiresAt ([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds())
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+            (Get-SlotProfile -SlotPath $slot).Status | Should -Be 'rate-limited'
+        }
+
+        It 'refresh failure (non-429) surfaces as expired with the underlying error' {
+            $slot = New-ProfileSlot -Name 'exp' -ExpiresAt ([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds())
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Exception]::new('refresh_token invalid')
+            }
+            $res = Get-SlotProfile -SlotPath $slot
+            $res.Status | Should -Be 'expired'
+            $res.Error  | Should -Match 'refresh_token invalid'
+        }
+
+        It 'profile endpoint 429 surfaces as rate-limited' {
+            $slot = New-ProfileSlot -Name 'pl-rl'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+            (Get-SlotProfile -SlotPath $slot).Status | Should -Be 'rate-limited'
+        }
+
+        It 'returns error when profile response is missing account.email' {
+            $slot = New-ProfileSlot -Name 'noemail'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{ organization = [pscustomobject]@{ name = 'x' } }
+            }
+            $res = Get-SlotProfile -SlotPath $slot
+            $res.Status | Should -Be 'error'
+            $res.Error  | Should -Match 'missing account.email'
+        }
+    }
+
+    Context 'Format-UsageVerbose (uncovered branches)' {
+        # Format-UsageVerbose is exercised indirectly by `sca usage <name>`
+        # integration tests, but several decision branches are not hit:
+        # the active-marker, the Account line, the non-ok fallback table,
+        # the empty-response advisory, and the null-reset em-dash.
+
+        It "appends ' (active)' to the header when Result.IsActive is true" {
+            $row = [pscustomobject]@{
+                Name     = 'work'
+                IsActive = $true
+                Status   = 'ok'
+                Data     = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 2.0; resets_at = $null }
+                }
+                Error    = $null
+                Email    = $null
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            $out | Should -Match "Slot 'work' \(active\)"
+        }
+
+        It "renders an 'Account:' line when Result.Email is set" {
+            $row = [pscustomobject]@{
+                Name     = 'work'
+                IsActive = $false
+                Status   = 'ok'
+                Data     = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 2.0; resets_at = $null }
+                }
+                Error    = $null
+                Email    = 'alice@example.com'
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            $out | Should -Match 'Account: alice@example\.com'
+        }
+
+        It 'delegates to Format-UsageTable for non-ok rows (fallback)' {
+            # When the row's Status is anything other than 'ok',
+            # Format-UsageVerbose drops out to a single-row table render
+            # so the user sees the status label without per-bucket detail.
+            $row = [pscustomobject]@{
+                Name     = 'dead'
+                IsActive = $false
+                Status   = 'expired'
+                Data     = $null
+                Error    = 'refresh_token invalid'
+                Email    = $null
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            $out | Should -Match "Slot 'dead'"
+            # The fallback render uses Format-UsageTable, which renders
+            # the "expired:" status text.
+            $out | Should -Match 'expired:'
+            # No Session/Week bucket rows in the fallback path.
+            $out | Should -Not -Match '^\s+Session\s'
+        }
+
+        It "prints '(empty response)' when Status is ok but Data is null" {
+            $row = [pscustomobject]@{
+                Name     = 'empty'
+                IsActive = $false
+                Status   = 'ok'
+                Data     = $null
+                Error    = $null
+                Email    = $null
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            $out | Should -Match '\(empty response\)'
+        }
+
+        It 'renders em-dash for a bucket whose resets_at is null' {
+            $row = [pscustomobject]@{
+                Name     = 'partial'
+                IsActive = $false
+                Status   = 'ok'
+                Data     = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 4.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 5.0; resets_at = $null }
+                }
+                Error    = $null
+                Email    = $null
+            }
+            $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
+            # The bucket cell renders the percent + em-dash for the
+            # null reset (vs 'Resets <time>' when set).
+            $out | Should -Match 'Session\s+\d+%\s+—'
+            $out | Should -Match 'Week\s+\d+%\s+—'
+        }
+    }
+
+    Context 'Get-SlotUsage (wraps Get-SlotOAuth failures)' {
+        # When Get-SlotOAuth throws (e.g. corrupt slot file), Get-SlotUsage
+        # must catch and surface a Status='error' record rather than
+        # bubbling the exception up to Invoke-UsageAction.
+        It 'returns Status=error when the slot file is corrupt JSON' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.broken.json'
+            Set-Content -LiteralPath $slot -Value 'not-json{' -NoNewline
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status | Should -Be 'error'
+            $r.Error  | Should -Not -BeNullOrEmpty
+        }
+    }
+
+    Context 'Get-SlotUsage (429 retry-after-sleep on first-time cache miss)' {
+        # Documented behavior (see source ~line 2160): on usage-endpoint
+        # 429, if the slot has NO cache entry at all (first poll ever
+        # for this slot, hit by 429), wait 5s and retry once. Mock
+        # Start-Sleep so the test is fast.
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+
+            $script:sleepCount = 0
+            Mock Start-Sleep -MockWith { $script:sleepCount++ }
+        }
+
+        It '429 then ok-on-retry: Status=ok and Start-Sleep was called once with 5 seconds' {
+            $slot = Join-Path $script:CredDirPath '.credentials.first429.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                if ($script:usageCall -eq 1) {
+                    $resp  = [pscustomobject]@{ StatusCode = 429 }
+                    $inner = [System.Exception]::new('Too Many Requests')
+                    $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                    throw $inner
+                }
+                # Second call (after retry sleep) succeeds.
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null }
+                }
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status | Should -Be 'ok'
+            $r.Data.five_hour.utilization | Should -Be 5.0
+            Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 5 }
+            $script:usageCall | Should -Be 2
+        }
+
+        It '429 then 429-again-on-retry: Status=rate-limited' {
+            $slot = Join-Path $script:CredDirPath '.credentials.tworetry.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status | Should -Be 'rate-limited'
+        }
+
+        It '429 with a STALE cache entry: Status=rate-limited; no retry sleep' {
+            $slot = Join-Path $script:CredDirPath '.credentials.staleC.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            # Pre-populate a stale cache entry so the function knows the
+            # slot has been seen before; the retry path should NOT fire.
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 1.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status | Should -Be 'rate-limited'
+            # No 5s retry sleep because the slot was already seen.
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+    }
+
+    Context 'Get-CachedUsageOrNull' {
+        # Direct unit tests for the per-process usage cache helper.
+        # $Script:SlotUsageCache is re-initialized to @{} in each
+        # BeforeEach via the dot-source in Common.ps1.
+
+        It 'returns $null on cache miss' {
+            (Get-CachedUsageOrNull -SlotPath 'missing/path.json') | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null on stale entries (older than UsageCacheTTL minutes)' {
+            $slot = 'D:/some/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 9.0 } }
+                # Force a timestamp far enough in the past to exceed TTL.
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot) | Should -BeNullOrEmpty
+        }
+
+        It 'returns the cached data wrapped in an ok+fallback shape when fresh' {
+            $slot = 'D:/fresh/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 17.0 } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            $r = Get-CachedUsageOrNull -SlotPath $slot
+            $r                         | Should -Not -BeNullOrEmpty
+            $r.Status                  | Should -Be 'ok'
+            $r.IsCachedFallback        | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 17
+        }
     }
 
     Context 'Invoke-UsageAction email rendering' {
@@ -1641,13 +2031,11 @@ Describe 'switch_claude_account' {
         }
 
         It '-Watch -Auto with Claude Code running throws at startup before entering the alt-screen buffer' {
-            # [Console]::IsOutputRedirected is true under Pester, so the
-            # watch loop normally short-circuits with "requires an
-            # interactive terminal". The Claude-Code guard fires AFTER
-            # that one, so we mock IsOutputRedirected away here. The
-            # cleanest path is to verify the guard via a direct call to
-            # Invoke-UsageWatch with Test-ClaudeRunning mocked $true; the
-            # IsOutputRedirected check would short-circuit it otherwise.
+            # The Claude-Code guard runs BEFORE the IsOutputRedirected
+            # guard inside Invoke-UsageWatch, so this test is safe to
+            # run on an interactive terminal: Test-ClaudeRunning mocked
+            # to $true short-circuits before the alt-screen `Write-VTSequence`
+            # ever fires.
             Mock Test-ClaudeRunning -MockWith { $true }
 
             { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*sca usage -Auto*'
@@ -1657,6 +2045,18 @@ Describe 'switch_claude_account' {
             # Test-ClaudeRunning's default mock returns $false. The guard
             # silently passes; the alt-screen / IsOutputRedirected guard
             # throws next because Pester's stdout is redirected.
+            #
+            # BUT: on an interactive terminal (running the test runner
+            # directly without output redirection), IsOutputRedirected
+            # is $false and the guard does NOT fire. Execution then
+            # proceeds to the alt-screen `Write-VTSequence "`e[?1049h"`,
+            # which BLANKS THE TERMINAL until the watch loop exits. The
+            # established pattern at line 973-976 above is to skip this
+            # test when the host is interactive; do the same here.
+            if (-not [Console]::IsOutputRedirected) {
+                Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
+                return
+            }
             { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
         }
     }

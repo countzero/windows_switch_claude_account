@@ -124,7 +124,15 @@ Param (
     # Watch mode's alt-buffer / sync-mode / clear-screen / cursor-home VT
     # sequences are message bytes (not SGR), so they remain unaffected --
     # watch mode keeps working in B&W; only color tinting is suppressed.
-    [switch] $NoColor
+    [switch] $NoColor,
+
+    # -Version: print the script version ($Script:Version) and exit before
+    # any action runs. Lives outside the 'Json' / 'Watch' parameter sets so
+    # it participates in __AllParameterSets and composes with -NoColor (and
+    # with any positional Action, which it short-circuits past). Note: `-V`
+    # is ambiguous (prefix-matches both -Version and -Verbose from
+    # CmdletBinding), so the shortest unambiguous prefix is `-Versi`.
+    [switch] $Version
 )
 
 # We are resolving the script path to reference this file when
@@ -139,6 +147,13 @@ $StateFile      = Join-Path $CredDir ".sca-state.json"
 # at switch time so Claude Code's display follows the active slot.
 $ClaudeJsonPath = Join-Path $env:USERPROFILE ".claude.json"
 $ProfilePath    = $PROFILE.CurrentUserAllHosts
+
+# Version of this script. Bumped in the same commit that adds the matching
+# CHANGELOG.md release section and the git tag (vX.Y.Z) so `sca -Version`
+# matches the tag for users who downloaded the standalone .ps1 from the
+# GitHub release asset and have no git context. A Helpers.Tests.ps1 case
+# cross-checks this string against the most recent CHANGELOG section header.
+$Script:Version = '2.2.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -400,7 +415,7 @@ function Read-ScaState {
                 # Persist the migration so subsequent reads are O(1).
                 # Failure here is non-fatal; callers see correct behavior
                 # for this call and the migration retries on the next read.
-                try { Write-ScaState -State $state } catch { }
+                try { Write-ScaState -State $state } catch { Write-Verbose "ScaState migration write deferred: $_" }
                 return $state
             }
         }
@@ -807,6 +822,7 @@ function Show-Help {
         "",
         "OPTIONS",
         "  -NoColor         Suppress all ANSI color output (also: set NO_COLOR env var)",
+        "  -Version         Print the script version and exit",
         "",
         "EXAMPLES",
         "  $cmd save slot-1                       # save current login as 'slot-1'",
@@ -2555,6 +2571,60 @@ function Get-AggregateBarColor {
     return 'Green'
 }
 
+# Compute the pool-mean utilization for a single bucket key across the
+# HTTP-ok rows of a usage-snapshot Results list. Pure function. Used by
+# both Format-AggregateBars (renders the bar above the table) and
+# Format-WatchTitle's -Aggregate branch (renders the OSC 0 title in
+# -Watch -Auto mode); colocating the math here keeps the title number
+# and the on-screen bar percentage structurally in lockstep instead of
+# coupled by copy-paste.
+#
+# Inputs:
+#   * $Results   - raw Results array from Get-UsageSnapshot (mixed
+#                  Status values). Internal filter keeps callers from
+#                  having to pre-filter; both call sites pass the raw
+#                  list.
+#   * $BucketKey - 'five_hour' or 'seven_day'.
+#
+# Return:
+#   * Integer in [0, 100], rounded with [math]::Round, when at least one
+#     HTTP-ok row exists. Math: sum of per-row utilization (each clamped
+#     to [0,100], null/missing counted as 0) divided by cap = N*100,
+#     scaled to percent. Equivalently the mean utilization across all
+#     HTTP-ok rows.
+#   * $null when zero HTTP-ok rows. Callers decide what to render for
+#     the empty case (Format-AggregateBars emits nothing; Format-WatchTitle
+#     collapses to bare suffix).
+function Get-PoolMeanUtilization {
+    Param (
+        [object[]] $Results,
+        [string]   $BucketKey
+    )
+
+    if (-not $Results) { return $null }
+
+    $eligible = @($Results | Where-Object { $_.Status -eq 'ok' })
+    if ($eligible.Count -eq 0) { return $null }
+
+    $n   = $eligible.Count
+    $cap = $n * 100
+
+    $usedSum = 0.0
+    foreach ($r in $eligible) {
+        if ($r.Data -and $r.Data.$BucketKey -and $null -ne $r.Data.$BucketKey.utilization) {
+            $u = [double]$r.Data.$BucketKey.utilization
+            if ($u -lt 0)   { $u = 0 }
+            if ($u -gt 100) { $u = 100 }
+            $usedSum += $u
+        }
+        # null / missing utilization -> 0 used.
+    }
+
+    # usedSum is in [0, cap] by construction (each $u clamped to [0,100],
+    # summed N times with cap = N*100), so no outer clamp needed here.
+    return [int][math]::Round(($usedSum / $cap) * 100)
+}
+
 # Render aggregate progress bars showing pool-wide USAGE above the
 # usage table. Two bars: 'Session' (five_hour) and 'Week' (seven_day).
 # For each bucket the function sums per-slot utilization across HTTP-ok
@@ -2593,11 +2663,11 @@ function Format-AggregateBars {
 
     if (-not $Results) { return }
 
+    # Skip-render when no HTTP-ok rows exist. Get-PoolMeanUtilization
+    # returns $null in that case; checking once up front (rather than
+    # per-bucket) keeps the per-bucket loop branch-free.
     $eligible = @($Results | Where-Object { $_.Status -eq 'ok' })
     if ($eligible.Count -eq 0) { return }
-
-    $n   = $eligible.Count
-    $cap = $n * 100
 
     # Width derivation explained above. Floor 8 so 1-slot tables with
     # short status text still render a visible bar instead of an
@@ -2618,20 +2688,10 @@ function Format-AggregateBars {
         $key   = $b.Key
         $label = $b.Label
 
-        $usedSum = 0.0
-        foreach ($r in $eligible) {
-            if ($r.Data -and $r.Data.$key -and $null -ne $r.Data.$key.utilization) {
-                $u = [double]$r.Data.$key.utilization
-                if ($u -lt 0)   { $u = 0 }
-                if ($u -gt 100) { $u = 100 }
-                $usedSum += $u
-            }
-            # null / missing utilization -> 0 used.
-        }
-
-        # usedSum is in [0, cap] by construction (each $u clamped to [0,100],
-        # summed N times with cap = N*100), so no outer clamp needed here.
-        $usedPct = [int][math]::Round(($usedSum / $cap) * 100)
+        # Shared math via Get-PoolMeanUtilization so the bar percentage
+        # and Format-WatchTitle's -Aggregate title number cannot drift.
+        # $eligible.Count > 0 guarantees a non-null return.
+        $usedPct = Get-PoolMeanUtilization -Results $Results -BucketKey $key
 
         $filled = [int][math]::Round(($usedPct / 100.0) * $barWidth)
         if ($filled -lt 0)         { $filled = 0 }    # defense-in-depth
@@ -3138,37 +3198,49 @@ function Format-UsageFooter {
 $Script:WatchTitleSuffix = 'Switch Claude Account'
 
 # Build the OSC 0 terminal-title string for `sca usage -Watch`. The
-# title carries the active slot's two utilization numbers + brand suffix,
-# optionally prefixed with an alarm marker when usage crosses the
-# warn / limit thresholds:
+# title carries two utilization numbers + brand suffix, optionally
+# prefixed with an alarm marker when usage crosses the warn / limit
+# thresholds:
 #
-#   34% | 42% | Switch Claude Account            # both below UtilWarnPct
-#   [~] 92% | 80% | Switch Claude Account        # any bucket >= UtilWarnPct, all < UtilLimitPct
-#   [!] 100% | 80% | Switch Claude Account       # any bucket >= UtilLimitPct
-#   — | 42% | Switch Claude Account              # active row has null five_hour
-#   Switch Claude Account                         # no usable active row
+#   34% | 42% | Switch Claude Account            # both below warn threshold
+#   [~] 92% | 80% | Switch Claude Account        # any bucket >= warn, all < limit
+#   [!] 100% | 80% | Switch Claude Account       # any bucket >= limit
+#   — | 42% | Switch Claude Account              # source row has null five_hour
+#   Switch Claude Account                         # no usable source row
 #
-# Source row priority (the snapshot may carry many rows):
-#   1. -Name <slot> set      -> the row whose Name matches (explicit user
-#                               filter wins; mirrors Get-UsageSnapshot's
-#                               upstream filter).
-#   2. else                  -> the row where IsActive = $true.
-#   3. else / row not 'ok'   -> bare suffix. Numbers from a failed poll
-#                               would be stale or absent; the body table
-#                               already carries the error-tier signal in
-#                               the Status column.
+# Two modes, gated by -Aggregate:
 #
-# Threshold reuse: $Script:UtilWarnPct (90) / $Script:UtilLimitPct (100)
-# match Get-PlanStatus, so the title prefix and the body's Status column
-# stay in lockstep; '[!]' here corresponds to 'limited 5h' / 'limited 7d'
-# / 'limited' there; '[~]' corresponds to 'near limit'. Limit wins over
-# warn when buckets straddle the two tiers.
+# 1. Default (active-slot mode, used by bare `sca usage -Watch`):
+#    Source row priority (the snapshot may carry many rows):
+#      a. -Name <slot> set    -> the row whose Name matches (explicit
+#                                 user filter wins).
+#      b. else                -> the row where IsActive = $true.
+#      c. else / row not 'ok' -> bare suffix.
+#    Alarm thresholds: $Script:UtilWarnPct (90) / $Script:UtilLimitPct
+#    (100). Matches Get-PlanStatus so the title prefix and the body's
+#    Status column stay in lockstep: '[!]' corresponds to 'limited *',
+#    '[~]' to 'near limit'.
 #
-# Active-slot-only (vs. the previous pool-mean) is a deliberate
-# simplification: a multi-slot pool mean averages a burned slot down to
-# noise (1 of 5 slots at 100% reads as ~20% mean), defeating the
-# alarm-glance value of the title. The active slot is the one currently
-# serving prompts; its numbers are what the user actually cares about.
+#    Active-slot-only (vs. pool-mean) is deliberate: a multi-slot pool
+#    mean averages a burned slot down to noise (1 of 5 slots at 100%
+#    reads as ~20% mean), defeating the alarm-glance value of the title.
+#
+# 2. -Aggregate (pool-mean mode, wired to -Auto by Invoke-UsageWatch):
+#    In -Auto the active slot moves under the user as the script rotates
+#    to fresh slots, so the active-slot title becomes a moving target
+#    rather than an actionable signal. Pool-mean across all HTTP-ok
+#    rows mirrors the aggregate bars rendered above the table; the title
+#    number and the on-screen bar percentage are computed by the same
+#    helper (Get-PoolMeanUtilization), so they cannot drift.
+#    -Name is IGNORED in this mode (aggregation is pool-wide by
+#    definition).
+#    Alarm thresholds: $Script:AggregateRedPct (90, [!]) /
+#    $Script:AggregateYellowPct (50, [~]). These are designed for
+#    pool-mean semantics; the per-slot UtilLimitPct / UtilWarnPct would
+#    virtually never fire on a pool mean (need nearly all slots at that
+#    level), defeating the alarm signal.
+#    Bare suffix when no HTTP-ok rows exist (matches Format-AggregateBars
+#    skip-render).
 #
 # Control bytes (\x00-\x1F, \x7F) are stripped from the assembled string
 # as defense-in-depth: slot names already pass Get-SafeName so user
@@ -3178,7 +3250,11 @@ $Script:WatchTitleSuffix = 'Switch Claude Account'
 function Format-WatchTitle {
     Param (
         [String]         $Name,
-        [pscustomobject] $Snapshot
+        [pscustomobject] $Snapshot,
+        # -Aggregate: switch to pool-mean mode (see docblock above).
+        # Wired to -Auto by Invoke-UsageWatch's single call site so the
+        # mode tracks the user's existing -Auto opt-in.
+        [switch]         $Aggregate
     )
 
     $suffix = $Script:WatchTitleSuffix
@@ -3188,20 +3264,38 @@ function Format-WatchTitle {
     $results = @($Snapshot.Results)
     if ($results.Count -eq 0) { return $suffix }
 
-    # Source row: explicit -Name wins; otherwise the active slot. We do
-    # NOT fall back to "first row" or "pool mean"; the active slot is
-    # the right answer for an alarm-style display, and -Name is the
-    # only reason to override it. Strict Name match (defense-in-depth
-    # against an upstream caller that did not pre-filter the snapshot).
-    $row = if ($Name) {
-        $results | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
-    } else {
-        $results | Where-Object { $_.IsActive } | Select-Object -First 1
-    }
-    if (-not $row -or $row.Status -ne 'ok') { return $suffix }
+    if ($Aggregate) {
+        # Pool-mean mode. Math delegated to Get-PoolMeanUtilization so
+        # the title number tracks Format-AggregateBars byte-for-byte.
+        # $null return = no HTTP-ok rows in the snapshot -> bare suffix
+        # (matches the aggregate bar's skip-render behavior).
+        $five  = Get-PoolMeanUtilization -Results $results -BucketKey 'five_hour'
+        $seven = Get-PoolMeanUtilization -Results $results -BucketKey 'seven_day'
+        if ($null -eq $five -and $null -eq $seven) { return $suffix }
 
-    $five  = if ($row.Data -and $row.Data.five_hour) { $row.Data.five_hour.utilization } else { $null }
-    $seven = if ($row.Data -and $row.Data.seven_day) { $row.Data.seven_day.utilization } else { $null }
+        $warnPct  = $Script:AggregateYellowPct
+        $limitPct = $Script:AggregateRedPct
+    }
+    else {
+        # Active-slot mode. Source row: explicit -Name wins; otherwise
+        # the active slot. We do NOT fall back to "first row" or "pool
+        # mean"; the active slot is the right answer for an alarm-style
+        # display, and -Name is the only reason to override it. Strict
+        # Name match (defense-in-depth against an upstream caller that
+        # did not pre-filter the snapshot).
+        $row = if ($Name) {
+            $results | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+        } else {
+            $results | Where-Object { $_.IsActive } | Select-Object -First 1
+        }
+        if (-not $row -or $row.Status -ne 'ok') { return $suffix }
+
+        $five  = if ($row.Data -and $row.Data.five_hour) { $row.Data.five_hour.utilization } else { $null }
+        $seven = if ($row.Data -and $row.Data.seven_day) { $row.Data.seven_day.utilization } else { $null }
+
+        $warnPct  = $Script:UtilWarnPct
+        $limitPct = $Script:UtilLimitPct
+    }
 
     # Render one bucket value to either 'NN%' (rounded percent) or '—'
     # for null. Local closure so the prefix branch and the format string
@@ -3212,21 +3306,21 @@ function Format-WatchTitle {
         return ('{0}%' -f [int][math]::Round([double]$v))
     }
 
-    # Alarm prefix: tiered to mirror Get-PlanStatus. '[!]' wins over
-    # '[~]' (a bucket at limit is more actionable than another bucket
-    # only near limit). Null buckets contribute nothing to the alarm;
-    # they cannot be at or above any threshold by definition.
+    # Alarm prefix: tiered. '[!]' wins over '[~]' (at-limit is more
+    # actionable than only-near-limit). Null buckets contribute nothing
+    # to the alarm; they cannot be at or above any threshold by
+    # definition. Threshold pair varies by mode (set above).
     $hasLimit = (
-        ($null -ne $five  -and [double]$five  -ge $Script:UtilLimitPct) -or
-        ($null -ne $seven -and [double]$seven -ge $Script:UtilLimitPct)
+        ($null -ne $five  -and [double]$five  -ge $limitPct) -or
+        ($null -ne $seven -and [double]$seven -ge $limitPct)
     )
     $prefix = ''
     if ($hasLimit) {
         $prefix = '[!] '
     } else {
         $hasWarn = (
-            ($null -ne $five  -and [double]$five  -ge $Script:UtilWarnPct) -or
-            ($null -ne $seven -and [double]$seven -ge $Script:UtilWarnPct)
+            ($null -ne $five  -and [double]$five  -ge $warnPct) -or
+            ($null -ne $seven -and [double]$seven -ge $warnPct)
         )
         if ($hasWarn) { $prefix = '[~] ' }
     }
@@ -3774,7 +3868,13 @@ function Invoke-UsageWatch {
                     # with DEC sequences (bypasses the
                     # OutputRendering=PlainText filter; see Write-VTSequence
                     # docblock).
-                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot))
+                    # -Aggregate is tied to -Auto: in -Auto mode the
+                    # active slot moves under the user as the script
+                    # rotates, so the active-slot title loses signal;
+                    # pool-mean matches the aggregate bars rendered
+                    # above the table. Bare -Watch keeps the per-slot
+                    # alarm-glance title. See Format-WatchTitle docblock.
+                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot -Aggregate:$Auto))
 
                     # Auto-rotation decision happens after each successful
                     # poll. The latched footer string is updated based on
@@ -3896,6 +3996,17 @@ function Invoke-UsageWatch {
 # suite, which calls Invoke-*Action directly and bypasses Invoke-Main)
 # are unaffected.
 function Invoke-Main {
+    # -Version short-circuit. Runs before the help / action dispatch so
+    # `sca -Version usage` (or any positional Action) prints the version
+    # without touching the network, the credentials directory, or any
+    # Invoke-*Action body. Plain Write-Host (information stream 6) matches
+    # the rest of the script's output convention so `6>&1 | Out-String`
+    # tests capture it the same way as Show-Help.
+    if ($Version) {
+        Write-Host $Script:Version
+        return
+    }
+
     if ($Help -or $Action -eq "help" -or $Action -eq "") {
         Show-Help
         return

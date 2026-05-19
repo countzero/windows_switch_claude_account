@@ -109,6 +109,24 @@ Describe 'switch_claude_account' {
             { Invoke-SwitchAction -Name '' 6>$null } | Should -Throw -ExpectedMessage '*No slots saved*'
         }
 
+        # Regression for the "no currently active slot detected" advisory:
+        # fires when reconcile noops (no .credentials.json) AND state has
+        # no active_slot AND slots are saved. Rotation still proceeds to
+        # the first slot alphabetically.
+        It "prints '[Switch] No currently active slot detected' advisory when no active slot is tracked" {
+            # No .credentials.json -> reconcile noops with
+            # 'no-active-credentials' so no auto-save happens.
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Content 'B' | Out-Null
+
+            $out = Invoke-SwitchAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match '\[Switch\] No currently active slot detected'
+            $out | Should -Match "Rotating to 'alpha'"
+            # Rotation landed on the first slot alphabetically.
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'A'
+        }
+
         It 'rotation is a no-op when only one slot exists and it is active' {
             New-SlotPair -CredDir $script:CredDirPath -Name 'only' -Content 'X' | Out-Null
             Set-Content -LiteralPath $script:CredFilePath -Value 'X' -NoNewline
