@@ -126,12 +126,16 @@ Param (
     # watch mode keeps working in B&W; only color tinting is suppressed.
     [switch] $NoColor,
 
-    # -Version: print the script version ($Script:Version) and exit before
-    # any action runs. Lives outside the 'Json' / 'Watch' parameter sets so
-    # it participates in __AllParameterSets and composes with -NoColor (and
-    # with any positional Action, which it short-circuits past). Note: `-V`
-    # is ambiguous (prefix-matches both -Version and -Verbose from
-    # CmdletBinding), so the shortest unambiguous prefix is `-Versi`.
+    # -Version: print the script version ($Script:ScriptVersion) and exit
+    # before any action runs. Lives outside the 'Json' / 'Watch' parameter
+    # sets so it participates in __AllParameterSets and composes with
+    # -NoColor (and with any positional Action, which it short-circuits
+    # past). Note: `-V` is ambiguous (prefix-matches both -Version and
+    # -Verbose from CmdletBinding), so the shortest unambiguous prefix is
+    # `-Versi`. The internal storage variable is $Script:ScriptVersion
+    # (NOT $Script:Version): a [switch]-typed parameter named $Version
+    # would shadow $Script:Version and silently coerce the string
+    # assignment to a boolean.
     [switch] $Version
 )
 
@@ -153,7 +157,11 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # matches the tag for users who downloaded the standalone .ps1 from the
 # GitHub release asset and have no git context. A Helpers.Tests.ps1 case
 # cross-checks this string against the most recent CHANGELOG section header.
-$Script:Version = '2.2.0'
+# Named $Script:ScriptVersion (not $Script:Version) to avoid colliding with
+# the [switch] $Version parameter declared above: a same-named parameter
+# enforces its [switch] type on every assignment to the script-scope
+# variable, silently coercing this string to $true.
+$Script:ScriptVersion = '2.2.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -4003,7 +4011,7 @@ function Invoke-Main {
     # the rest of the script's output convention so `6>&1 | Out-String`
     # tests capture it the same way as Show-Help.
     if ($Version) {
-        Write-Host $Script:Version
+        Write-Host $Script:ScriptVersion
         return
     }
 
