@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-05-20
+
+### Fixed
+- `sca -Version` prints the version string instead of `True`, and every other action no longer emits a red `InvalidArgument` error at startup. The internal version constant collided with the `[switch] $Version` parameter; renamed to `$Script:ScriptVersion`.
+
 ## [2.2.0] - 2026-05-19
 
 ### Added

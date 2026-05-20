@@ -253,26 +253,37 @@ Describe 'switch_claude_account' {
     }
 
     Context '-Version flag' {
-        # Verifies the Invoke-Main short-circuit that prints $Script:Version
-        # and returns before any action body runs. Same dynamic-scope pattern
-        # as the 'No-color mode' context: assign Param() variables in the It
-        # body, call Invoke-Main, capture information stream 6.
+        # Verifies the Invoke-Main short-circuit that prints
+        # $Script:ScriptVersion and returns before any action body runs.
+        # Same dynamic-scope pattern as the 'No-color mode' context: assign
+        # Param() variables in the It body, call Invoke-Main, capture
+        # information stream 6.
+        #
+        # Each test also asserts the printed output matches the literal
+        # version shape (\d+\.\d+\.\d+). The shape pin is non-negotiable:
+        # the Param() block declares [switch] $Version, which previously
+        # shadowed the $Script:Version constant. Under that collision, both
+        # sides of `Should -Be $Script:ScriptVersion` could silently degrade
+        # to the same boolean and the equality assertion would still pass.
+        # The regex makes that failure mode impossible to miss.
 
-        It 'prints $Script:Version and returns before any action runs' {
+        It 'prints $Script:ScriptVersion and returns before any action runs' {
             # We do NOT assign $Action; setting it to '' or $null in dynamic
             # scope re-triggers the [ValidateSet] on the script's Param()
             # ($Action has no '' member). Letting Invoke-Main read the
             # parameter's bind-time default exercises the empty-Action path.
             $Version = $true
             $out = (Invoke-Main 6>&1 | Out-String).Trim()
-            $out | Should -Be $Script:Version
+            $out | Should -Be $Script:ScriptVersion
+            $out | Should -Match '^\d+\.\d+\.\d+$'
         }
 
         It 'wins over -Help when both are bound' {
             $Version = $true
             $Help    = $true
             $out = (Invoke-Main 6>&1 | Out-String).Trim()
-            $out | Should -Be $Script:Version
+            $out | Should -Be $Script:ScriptVersion
+            $out | Should -Match '^\d+\.\d+\.\d+$'
             $out | Should -Not -Match 'ACTIONS'
         }
 
@@ -281,20 +292,21 @@ Describe 'switch_claude_account' {
             $Version = $true
             $Action  = 'usage'
             $out = (Invoke-Main 6>&1 | Out-String).Trim()
-            $out | Should -Be $Script:Version
+            $out | Should -Be $Script:ScriptVersion
+            $out | Should -Match '^\d+\.\d+\.\d+$'
             Should -Invoke Invoke-UsageAction -Times 0
         }
 
-        # Inversion guard: forgetting to bump $Script:Version when adding a
-        # release section to CHANGELOG.md is exactly the failure mode this
-        # constant exists to prevent. Cross-check at test time so CI rejects
-        # the bad commit before tag creation.
+        # Inversion guard: forgetting to bump $Script:ScriptVersion when
+        # adding a release section to CHANGELOG.md is exactly the failure
+        # mode this constant exists to prevent. Cross-check at test time so
+        # CI rejects the bad commit before tag creation.
         It 'matches the most recent CHANGELOG.md release header' {
             $repoRoot  = Resolve-Path (Join-Path $PSScriptRoot '..')
             $changelog = Get-Content -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -Raw
             $m = [regex]::Match($changelog, '##\s+\[(\d+\.\d+\.\d+)\]\s+-\s+\d{4}-\d{2}-\d{2}')
-            $m.Success     | Should -BeTrue
-            $Script:Version | Should -Be $m.Groups[1].Value
+            $m.Success           | Should -BeTrue
+            $Script:ScriptVersion | Should -Be $m.Groups[1].Value
         }
     }
 
