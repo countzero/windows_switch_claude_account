@@ -161,7 +161,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '2.2.1'
+$Script:ScriptVersion = '2.3.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -169,17 +169,17 @@ $Script:ScriptVersion = '2.2.1'
 $MarkerStart = "# === Switch Claude Account ==="
 $MarkerEnd   = "# === End Switch Claude Account ==="
 
-# --- Unofficial /api/oauth/usage constants ---
+# --- Unofficial Claude Code OAuth-flow constants ---
 #
-# These values power the `usage` action, which replicates the live 5-hour
-# and 7-day rate-limit read that Claude Code's own `/usage` slash command
-# performs. They were extracted from claude.exe 2.1.119 (a Bun-compiled
-# binary that embeds the JS source) by string-scanning the file.
+# These values power the `usage` action, which replicates the live 5h /
+# 7d rate-limit read that Claude Code's own `/usage` slash command
+# performs. Extracted from claude.exe 2.1.119 (a Bun-compiled binary
+# that embeds the JS source) by string-scanning the file.
 #
-# This endpoint is UNDOCUMENTED and unsupported by Anthropic. Expect it
-# to break when Anthropic bumps the beta flag, rotates the OAuth client
-# id, or reshapes the response body. To re-extract after an upstream
-# change, from a PowerShell 7 prompt:
+# These endpoints are UNDOCUMENTED and unsupported by Anthropic. Expect
+# them to break when Anthropic bumps the beta flag, rotates the OAuth
+# client id, or reshapes the response body. To re-extract after an
+# upstream change, from a PowerShell 7 prompt:
 #
 #   $bin   = (Get-Command claude -ErrorAction Stop).Source
 #   $bytes = [IO.File]::ReadAllBytes($bin)
@@ -188,20 +188,28 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 #   # Profile endpoint path:  $text | Select-String '/api/oauth/profile' (function Ql)
 #   # Base API URL + TOKEN_URL + CLIENT_ID: Select-String 'TOKEN_URL:"'
 #   # Beta header value:      Select-String 'lj="oauth-'
+#   # API version header:     Select-String 'anthropic-version'
 #   # UA version convention:  Select-String 'claude-code/\$\{'
 #
 # The client id below is the Claude.ai subscription flow's client id
 # (matches the `user:sessions:claude_code` scope slot files carry); the
 # other client id in the binary (22422756-...) is for the Console API-key
 # flow and does not accept our refresh tokens.
-$Script:UsageEndpoint     = "https://api.anthropic.com/api/oauth/usage"
-$Script:ProfileEndpoint   = "https://api.anthropic.com/api/oauth/profile"
-$Script:TokenEndpoint     = "https://platform.claude.com/v1/oauth/token"
-$Script:OAuthClientId     = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-$Script:AnthropicBeta     = "oauth-2025-04-20"
-$Script:UsageUserAgent    = "claude-code/2.1.119"
-$Script:UsageTimeoutSec   = 5
-$Script:ProfileTimeoutSec = 10
+$Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
+$Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
+$Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
+$Script:OAuthClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+$Script:AnthropicBeta       = "oauth-2025-04-20"
+# anthropic-version: sent on every authenticated request for defense-in-
+# depth. The OAuth-namespaced endpoints (/api/oauth/usage, /api/oauth/
+# profile, /v1/oauth/token) accept calls without it today, but if
+# Anthropic later tightens any of them the script keeps working without
+# an emergency patch. Pinned to the stable 2023-06-01 API version that
+# Claude Code itself ships with.
+$Script:AnthropicApiVersion = "2023-06-01"
+$Script:UsageUserAgent      = "claude-code/2.1.119"
+$Script:UsageTimeoutSec     = 5
+$Script:ProfileTimeoutSec   = 10
 
 # Cache of the last successful /api/oauth/usage response per slot path.
 # Used as a fallback when the endpoint returns 429 (rate limited) so the
@@ -340,16 +348,36 @@ function Set-CredentialFileAtomic {
 # Persist $State to $StateFile via atomic rename. The schema field is
 # enforced to 1 here so callers cannot accidentally write a stale or
 # missing version. last_sync_hash and active_slot may be $null (initial
-# state where reconcile has not yet captured any sync).
+# state where reconcile has not yet captured any sync). last_warmup_at
+# is an optional map of slot-name -> Unix-epoch-ms timestamps consumed
+# by Invoke-WarmAllSlotsBySwitch's per-slot cooldown gate; missing /
+# empty -> emit `{}` so the file shape stays stable across writes.
 function Write-ScaState {
     Param (
         [Parameter(Mandatory)] [psobject] $State
     )
 
+    # Normalize last_warmup_at to a plain hashtable. ConvertFrom-Json
+    # returns a psobject; in-script construction may pass a hashtable.
+    # ConvertTo-Json preserves both, but we want a single canonical
+    # shape (JSON object) on disk so future readers see a consistent
+    # type. Empty when the property is missing.
+    $warm = @{}
+    if ($State.PSObject.Properties.Match('last_warmup_at').Count -gt 0 -and $null -ne $State.last_warmup_at) {
+        if ($State.last_warmup_at -is [hashtable]) {
+            $warm = $State.last_warmup_at
+        } else {
+            foreach ($p in $State.last_warmup_at.PSObject.Properties) {
+                $warm[$p.Name] = [int64]$p.Value
+            }
+        }
+    }
+
     $payload = [ordered]@{
         schema         = 1
         active_slot    = $State.active_slot
         last_sync_hash = $State.last_sync_hash
+        last_warmup_at = $warm
     }
     $json  = $payload | ConvertTo-Json -Compress
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
@@ -358,8 +386,10 @@ function Write-ScaState {
 }
 
 # Load the state file. Returns a [pscustomobject] with .schema /
-# .active_slot / .last_sync_hash on success, or $null when the file is
-# missing, unreadable, or schema-incompatible.
+# .active_slot / .last_sync_hash / .last_warmup_at on success, or $null
+# when the file is missing, unreadable, or schema-incompatible.
+# last_warmup_at is normalized to a plain hashtable; missing / null on
+# disk becomes @{} so callers can index it unconditionally.
 #
 # Auto-migration: when no state file exists AND .credentials.json exists,
 # this function attempts to identify the active slot by hashing every
@@ -381,10 +411,26 @@ function Read-ScaState {
             $raw = Get-Content -LiteralPath $StateFile -Raw -ErrorAction Stop
             $obj = $raw | ConvertFrom-Json -ErrorAction Stop
             if ($obj.schema -ne 1) { return $null }
+            # Coerce last_warmup_at to a hashtable so callers can index
+            # with $state.last_warmup_at[$name]. ConvertFrom-Json returns
+            # a psobject for nested JSON objects; missing field -> @{}.
+            $warm = @{}
+            if ($null -ne $obj.last_warmup_at) {
+                foreach ($p in $obj.last_warmup_at.PSObject.Properties) {
+                    # Defensive int64 coercion: a non-numeric value
+                    # written by a future schema would be skipped rather
+                    # than crashing the read. Verbose-stream the skip so
+                    # it is greppable in -Verbose mode without polluting
+                    # stdout. PSAvoidUsingEmptyCatchBlock satisfied.
+                    try { $warm[$p.Name] = [int64]$p.Value }
+                    catch { Write-Verbose "Read-ScaState: skipping last_warmup_at['$($p.Name)'] = '$($p.Value)': $_" }
+                }
+            }
             return [pscustomobject]@{
                 schema         = [int]$obj.schema
                 active_slot    = if ($obj.active_slot)    { [string]$obj.active_slot }    else { $null }
                 last_sync_hash = if ($obj.last_sync_hash) { [string]$obj.last_sync_hash } else { $null }
+                last_warmup_at = $warm
             }
         }
         catch {
@@ -419,6 +465,7 @@ function Read-ScaState {
                     schema         = 1
                     active_slot    = $parsed.Name
                     last_sync_hash = $activeHash
+                    last_warmup_at = @{}
                 }
                 # Persist the migration so subsequent reads are O(1).
                 # Failure here is non-fatal; callers see correct behavior
@@ -436,7 +483,8 @@ function Read-ScaState {
 # parameters not bound are left at their current state-file value (or null
 # when no state file existed). -ClearActiveSlot wins over -ActiveSlot in
 # the unusual case both are bound, so callers expressing "forget the
-# active slot" cannot accidentally re-set it.
+# active slot" cannot accidentally re-set it. last_warmup_at is preserved
+# unchanged across this helper; mutate it via Set-SlotWarmupTimestamp.
 function Update-ScaState {
     Param (
         [String] $ActiveSlot,
@@ -450,6 +498,7 @@ function Update-ScaState {
             schema         = 1
             active_slot    = $null
             last_sync_hash = $null
+            last_warmup_at = @{}
         }
     }
 
@@ -459,6 +508,48 @@ function Update-ScaState {
 
     Write-ScaState -State $current
     return $current
+}
+
+# Read one slot's last warmup-attempt timestamp from the state file.
+# Returns [int64] Unix-epoch-ms, or $null when no record exists for that
+# slot. Used by Invoke-WarmAllSlotsBySwitch's per-slot cooldown gate.
+function Get-SlotWarmupTimestamp {
+    Param ([Parameter(Mandatory)] [string] $Name)
+
+    $state = Read-ScaState
+    if (-not $state -or -not $state.last_warmup_at) { return $null }
+    if (-not $state.last_warmup_at.ContainsKey($Name)) { return $null }
+    return [int64]$state.last_warmup_at[$Name]
+}
+
+# Record a slot's warmup-attempt timestamp into the state file. Always
+# writes UtcNow.ToUnixTimeMilliseconds(); we intentionally don't expose
+# a -Ms parameter so the cooldown clock cannot be backdated by a buggy
+# caller. Reads the full state first so concurrent fields (active_slot,
+# last_sync_hash, other slots' timestamps) round-trip unchanged. No-op
+# when no state file exists (we have nothing to attach the timestamp
+# to; the watch loop only writes a fresh state once a slot is swapped
+# in, which is the natural place for first timestamp population anyway).
+function Set-SlotWarmupTimestamp {
+    Param ([Parameter(Mandatory)] [string] $Name)
+
+    $state = Read-ScaState
+    if (-not $state) {
+        # No state file exists yet; seed a minimal one so the timestamp
+        # has somewhere to live. Mirrors Update-ScaState's default-seed
+        # branch above.
+        $state = [pscustomobject]@{
+            schema         = 1
+            active_slot    = $null
+            last_sync_hash = $null
+            last_warmup_at = @{}
+        }
+    }
+    if (-not $state.last_warmup_at) {
+        $state | Add-Member -NotePropertyName last_warmup_at -NotePropertyValue @{} -Force
+    }
+    $state.last_warmup_at[$Name] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    Write-ScaState -State $state
 }
 
 # --- ~/.claude.json identity bridge ---------------------------------------
@@ -1961,9 +2052,10 @@ function Update-SlotTokens {
     } | ConvertTo-Json -Compress
 
     $headers = @{
-        'Content-Type'   = 'application/json'
-        'anthropic-beta' = $Script:AnthropicBeta
-        'User-Agent'     = $Script:UsageUserAgent
+        'Content-Type'      = 'application/json'
+        'anthropic-beta'    = $Script:AnthropicBeta
+        'anthropic-version' = $Script:AnthropicApiVersion
+        'User-Agent'        = $Script:UsageUserAgent
     }
 
     $resp = Invoke-RestMethod -Method Post `
@@ -2146,10 +2238,11 @@ function Get-SlotUsage {
     }
 
     $headers = @{
-        'Authorization'  = "Bearer $accessToken"
-        'anthropic-beta' = $Script:AnthropicBeta
-        'Content-Type'   = 'application/json'
-        'User-Agent'     = $Script:UsageUserAgent
+        'Authorization'     = "Bearer $accessToken"
+        'anthropic-beta'    = $Script:AnthropicBeta
+        'anthropic-version' = $Script:AnthropicApiVersion
+        'Content-Type'      = 'application/json'
+        'User-Agent'        = $Script:UsageUserAgent
     }
 
     try {
@@ -2237,10 +2330,14 @@ function Get-SlotUsage {
 # update the email on a slot is to re-run `sca save`, which also re-runs
 # this call against the freshly-saved tokens.
 #
-# The HTTP call mirrors Claude Code's Ql() shape exactly: Authorization +
-# Content-Type only, no anthropic-beta / User-Agent. Deviating there for
-# "consistency" would add drift risk without benefit, since Ql() is the
-# known-good call shape.
+# The HTTP call mirrors Claude Code's Ql() shape: Authorization +
+# Content-Type, no anthropic-beta / User-Agent. The single deliberate
+# deviation is the `anthropic-version` header, which Ql() omits but
+# which we send on every authenticated request for defense-in-depth (see
+# the $Script:AnthropicApiVersion docstring up top). The OAuth-namespaced
+# endpoints accept the call with or without it today; sending it
+# uniformly insulates the script from a future tightening at this
+# endpoint without an emergency patch.
 function Get-SlotProfile {
     Param (
         [String] $SlotPath
@@ -2281,8 +2378,9 @@ function Get-SlotProfile {
     }
 
     $headers = @{
-        'Authorization' = "Bearer $accessToken"
-        'Content-Type'  = 'application/json'
+        'Authorization'     = "Bearer $accessToken"
+        'anthropic-version' = $Script:AnthropicApiVersion
+        'Content-Type'      = 'application/json'
     }
 
     try {
@@ -2546,8 +2644,14 @@ function Get-StatusColor {
         '^expired'      { return 'Yellow' }
         '^unauthorized' { return 'Red' }
         '^error'        { return 'Red' }
-         '^rate-limited' { return 'Yellow' }
-         default         { return 'Gray' }
+        '^rate-limited' { return 'Yellow' }
+        # 'warming up' is the transient -Watch -Auto startup state; the
+        # label is space-separated to match the other multi-word labels.
+        # Yellow matches its "attention required" cousins (near limit,
+        # rate-limited, expired) so the user immediately knows the row
+        # is in flight, not in steady state.
+        '^warming up'   { return 'Yellow' }
+        default         { return 'Gray' }
     }
 }
 
@@ -2788,6 +2892,14 @@ function Format-UsageTable {
             'unauthorized' { 'unauthorized (token revoked; run sca switch then /login)' }
             'error'        { "error: $(Format-StatusErrorTail $r.Error)" }
             'rate-limited' { 'rate-limited' }
+            # 'warming-up' is the transient label rendered while
+            # Invoke-WarmAllSlotsBySwitch is iterating slots on `-Watch
+            # -Auto` startup. Synthetic snapshot rows carry it; the
+            # first real poll replaces them with one of the HTTP states
+            # above. The hyphenated internal value renders space-
+            # separated ('warming up') to match the existing label
+            # convention ('rate limited' / 'limited 5h' / 'near limit').
+            'warming-up'   { 'warming up' }
             default        { [string]$r.Status }
         }
 
@@ -3743,6 +3855,152 @@ function Invoke-AutoRotationStep {
 # round number.
 $Script:UsageWatchMinInterval = 60
 
+# Minimum gap between consecutive Invoke-WarmAllSlotsBySwitch attempts
+# against the same slot. Tracked per-slot via state.last_warmup_at;
+# Invoke-WarmAllSlotsBySwitch skips a peer that was warmed less than
+# this many milliseconds ago. Prevents thrashing on rapid `-Watch -Auto`
+# restarts (each restart would otherwise re-swap every slot, churning
+# .credentials.json / ~/.claude.json on every Ctrl-C reload).
+$Script:WarmupCooldownMs = 60000
+
+# Peer-warmup orchestrator for `sca usage -Watch -Auto` startup. Walks
+# every saved slot via Invoke-SlotSwap (the existing primitive shared
+# with `sca switch`) and restores the original active slot at the end.
+# The whole point: the credentials swap is what activates an inactive
+# slot from Anthropic's perspective, so a one-time rotation through all
+# slots anchors each slot's 5h window and lets the first poll report
+# real bucket numbers for every row instead of empty / rate-limited.
+#
+# Side-effect ladder (per peer, in order):
+#   1. Skip if state.last_warmup_at[$slot.Name] < $Script:WarmupCooldownMs
+#      old. Renderer is invoked with a "skipping" message so the user
+#      sees the cool-down.
+#   2. Render an "activating" message via $RenderProgress.
+#   3. Set-SlotWarmupTimestamp BEFORE the swap so a swap that throws
+#      still consumes the cooldown slot (prevents thrashing on a slot
+#      whose .credentials.json or ~/.claude.json writes keep failing).
+#   4. Invoke-SlotSwap (atomic-rename .credentials.json + ~/.claude.json
+#      oauthAccount substitution + state.active_slot update). A throw
+#      here is caught; the renderer surfaces it; the loop continues
+#      with the next peer.
+#
+# Restore step runs in a `finally` so a mid-loop Ctrl-C still attempts
+# to put .credentials.json back on the original active slot's bytes
+# before the outer Invoke-UsageWatch `finally` tears down the alt-screen.
+# The restore is NOT gated by cooldown (it is hygiene, not a warmup).
+#
+# Refusal cases (render one message and exit cleanly):
+#   * Fewer than 2 visible slots: nothing to rotate; no-op.
+#   * state.active_slot is set but Find-SlotByName returns null (the
+#     active slot has lost its sidecar): refuse the warmup pass so we
+#     do not silently leave the user active on the last peer. The
+#     renderer surfaces a message pointing at `sca save <name>`.
+#
+# Renderer callback signature:
+#   { Param ([string] $autoLine) <repaint the current frame with $autoLine in the [Auto] footer slot> }
+# Callback ownership lives in Invoke-UsageWatch where the DEC 2026 sync
+# envelope and alt-screen state live; making this function call back
+# into the watch's renderer keeps the per-frame composition out of the
+# orchestrator and makes the orchestrator itself unit-testable by
+# passing a mock renderer.
+function Invoke-WarmAllSlotsBySwitch {
+    Param (
+        [Parameter(Mandatory)] [scriptblock] $RenderProgress
+    )
+
+    $slots = @(Get-Slots)
+    if ($slots.Count -lt 2) {
+        # 0 or 1 slot: nothing to rotate. -Auto rotation is also a no-op
+        # under this condition, so the warmup pass is semantically
+        # vacuous here too. Do not render anything; the steady-state
+        # `[Auto] Automatic slot switching is enabled.` latch is fine.
+        return
+    }
+
+    $state         = Read-ScaState
+    $originalName  = if ($state -and $state.active_slot) { [string]$state.active_slot } else { $null }
+    $originalSlot  = if ($originalName) { Find-SlotByName -Name $originalName } else { $null }
+
+    # Sidecar-less-active refusal: state tracks an active slot but Find-
+    # SlotByName filtered it out (no sidecar). Restoring would silently
+    # leave the user on the last peer; refuse instead and surface the
+    # remediation path. The polling loop then starts on whichever slot
+    # is currently active; the user can `sca save <name>` to recapture
+    # the sidecar and try again.
+    if ($originalName -and -not $originalSlot) {
+        & $RenderProgress ("[Auto] Warmup skipped: active slot '{0}' has no identity sidecar. Run 'sca save {0}' to recapture, then re-run." -f $originalName)
+        return
+    }
+
+    $peers = if ($originalSlot) {
+        @($slots | Where-Object { $_.Path -ne $originalSlot.Path })
+    } else {
+        @($slots)
+    }
+
+    $total = $peers.Count + $(if ($originalSlot) { 1 } else { 0 })
+    $restored = $false
+    try {
+        $i = 0
+        foreach ($slot in $peers) {
+            $i++
+            $last = Get-SlotWarmupTimestamp -Name $slot.Name
+            if ($null -ne $last) {
+                $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                $age = $nowMs - $last
+                if ($age -ge 0 -and $age -lt $Script:WarmupCooldownMs) {
+                    $ago = [int][math]::Floor($age / 1000)
+                    & $RenderProgress ("[Auto] Warming up: skipping '{0}' ({1}/{2}, warmed {3}s ago)" -f $slot.Name, $i, $total, $ago)
+                    continue
+                }
+            }
+
+            & $RenderProgress ("[Auto] Warming up: activating '{0}' ({1}/{2})..." -f $slot.Name, $i, $total)
+            # Set timestamp BEFORE the swap so a swap that throws still
+            # consumes the cooldown slot (we do not want to retry a
+            # broken slot within the same minute).
+            try { Set-SlotWarmupTimestamp -Name $slot.Name } catch { Write-Verbose "Set-SlotWarmupTimestamp deferred: $_" }
+            try {
+                Invoke-SlotSwap -Slot $slot 6>$null
+            }
+            catch {
+                & $RenderProgress ("[Auto] Warming up: '{0}' swap failed: {1}" -f $slot.Name, $_.Exception.Message)
+            }
+        }
+
+        if ($originalSlot) {
+            $i++
+            & $RenderProgress ("[Auto] Warming up: restoring active slot '{0}' ({1}/{2})..." -f $originalSlot.Name, $i, $total)
+            try {
+                Invoke-SlotSwap -Slot $originalSlot 6>$null
+                $restored = $true
+            }
+            catch {
+                & $RenderProgress ("[Auto] Warming up: restoring '{0}' failed: {1}" -f $originalSlot.Name, $_.Exception.Message)
+            }
+        } else {
+            # No tracked original active slot: the last peer is the new
+            # active. Mark as "restored" so the finally does not try a
+            # duplicate restore. Matches the no-active-slot rotation
+            # semantics elsewhere in the script.
+            $restored = $true
+        }
+    }
+    finally {
+        # Ctrl-C handler: if a peer swap was in flight and we never
+        # reached the explicit restore step above, attempt the restore
+        # now so the user does not return to an unexpected active slot.
+        # Silent on failure; the outer Invoke-UsageWatch finally will
+        # tear down the alt-screen anyway, and any restore error has
+        # nowhere meaningful to render. State.active_slot reflects
+        # whichever slot Invoke-SlotSwap last succeeded on, so `sca
+        # list` will show the truth after exit.
+        if ($originalSlot -and -not $restored) {
+            try { Invoke-SlotSwap -Slot $originalSlot 6>$null } catch { Write-Verbose "Warmup-finally restore failed: $_" }
+        }
+    }
+}
+
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. The redraw cadence is decoupled from
 # the poll cadence so the frame self-heals on terminal resize within
@@ -3849,6 +4107,61 @@ function Invoke-UsageWatch {
         # until the next state change. Initial value 'Enabled' shows the
         # mode is engaged before the first rotation event.
         $lastAutoFooter = if ($Auto) { '[Auto] Automatic slot switching is enabled.' } else { $null }
+
+        # -Auto startup warmup. Rotate through every saved slot via
+        # Invoke-SlotSwap so each slot is briefly the active credentials;
+        # restore the original active slot at the end. The credentials
+        # swap is what activates an inactive slot from Anthropic's
+        # perspective (verified empirically by the user against the
+        # previous /v1/messages Haiku approach, which was rejected by
+        # Anthropic-side rate-limiting). Result: the first poll's table
+        # reflects real bucket numbers for every row instead of empty
+        # buckets or `rate-limited`. Per-slot cooldown gate is enforced
+        # inside Invoke-WarmAllSlotsBySwitch via state.last_warmup_at;
+        # the Ctrl-C-safe restore lives in that function's `finally`.
+        #
+        # Renderer closure: builds a synthetic snapshot where every row
+        # carries Status='warming-up' so the table itself signals the
+        # warmup phase via the Status column. As each peer is processed
+        # the [Auto] footer updates with the per-slot progress; the
+        # table stays the same. DEC 2026 sync envelope around each
+        # repaint matches the polling loop's flicker-free contract.
+        if ($Auto) {
+            $warmingSlots = @(Get-Slots)
+            if ($warmingSlots.Count -ge 2) {
+                $warmingSnapshot = [pscustomobject]@{
+                    Results = @($warmingSlots | ForEach-Object {
+                        [pscustomobject]@{
+                            Name     = $_.Name
+                            Email    = $_.Email
+                            Path     = $_.Path
+                            IsActive = $_.IsActive
+                            Status   = 'warming-up'
+                            Data     = $null
+                        }
+                    })
+                    NoSlots          = $false
+                    HasCacheFallback = $false
+                }
+                $autoHeaderThresholdInit = if ($Auto) { $Threshold } else { 0 }
+                $renderWarmup = {
+                    Param ([string] $autoLine)
+                    Write-VTSequence "`e[?2026h`e[2J`e[H"
+                    Format-UsageFrame -Snapshot $warmingSnapshot -Footer $autoLine -AutoThreshold $autoHeaderThresholdInit
+                    Write-VTSequence "`e[?2026l"
+                }
+                # Initial frame: the steady-state [Auto] latch + a table
+                # full of 'warming up' rows. The closure repaints in
+                # place as warmup progress events fire.
+                & $renderWarmup $lastAutoFooter
+                Invoke-WarmAllSlotsBySwitch -RenderProgress $renderWarmup
+                # Reset the [Auto] latch back to the steady-state string;
+                # the warmup phase emitted transient progress messages
+                # via the renderer (those landed on screen but were not
+                # persisted to $lastAutoFooter).
+                $lastAutoFooter = '[Auto] Automatic slot switching is enabled.'
+            }
+        }
 
         while ($true) {
             $now = [DateTime]::Now

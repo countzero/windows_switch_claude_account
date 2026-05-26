@@ -47,6 +47,7 @@ The `try/finally` scope is per-`Invoke-Main`, NOT global. Tests dot-source the s
   | 7d bucket ≥ `UtilLimitPct` | `limited 7d` | Red |
   | Both buckets ≥ `UtilLimitPct` | `limited` | Red |
   | HTTP 429, no fresh cache | `rate-limited` | Yellow |
+  | `-Watch -Auto` startup warmup in flight | `warming up` | Yellow |
   | HTTP failure | `expired` / `unauthorized` / `error: …` / `no-oauth (api key or non-claude.ai slot)` | Yellow / Red / Red / DarkGray |
 
   Thresholds: `$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`. `Get-StatusColor` is the single source of truth so summary table and verbose view stay in lockstep.

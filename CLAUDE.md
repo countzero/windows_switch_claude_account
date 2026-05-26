@@ -25,7 +25,7 @@ Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`. Te
 - **Credential directory**: `%USERPROFILE%\.claude\`
 - **Active credentials**: `.credentials.json`, written by Claude Code via atomic rename on every OAuth refresh. `sca` writes it via the same atomic-rename primitive (`Set-CredentialFileAtomic`) so the file is byte-equal to the tracked slot file after every `sca save` / `sca switch` / reconcile pass.
 - **Claude Code config**: `%USERPROFILE%\.claude.json` (top-level, NOT inside `.claude\`), Claude Code's persistent config. Its top-level `oauthAccount` block is what `/status` displays as "Email:". `sca` reads this block at save time (primary identity source) and writes the destination slot's captured `oauthAccount` back to it on `sca switch`. See "`~/.claude.json` ownership" below.
-- **State file**: `%USERPROFILE%\.claude\.sca-state.json`, schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." Read with `Read-ScaState` (auto-migrates from a 1.x install on first read by hashing `.credentials.json` against existing slot files); written via `Update-ScaState`.
+- **State file**: `%USERPROFILE%\.claude\.sca-state.json`, schema v1: `{ schema, active_slot, last_sync_hash, last_warmup_at }`. Single source of truth for "which slot is active." `last_warmup_at` is an optional map of slot-name -> Unix-epoch-ms timestamps consumed by `sca usage -Watch -Auto`'s startup warmup cooldown gate; missing on legacy state files, defaulted to `@{}` by `Read-ScaState`. Read with `Read-ScaState` (auto-migrates from a 1.x install on first read by hashing `.credentials.json` against existing slot files); written via `Update-ScaState` (`active_slot` / `last_sync_hash`) and `Set-SlotWarmupTimestamp` (`last_warmup_at`).
 - **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled, only for the dedup case where slot name equals email).
 - **Identity sidecars**: `.credentials.<name>(<email>).account.json` alongside each slot file. JSON snapshot of the slot's `oauthAccount` (whitelisted: accountUuid, emailAddress, organizationUuid, displayName, organizationName) captured at save time. Restored to `~/.claude.json` on `sca switch`. **Slots without a valid sidecar are HIDDEN from `list` / `usage` / rotation and refused by `switch`**; re-running `sca save <name>` while that slot is active recaptures the sidecar.
 - **PS version**: Requires PowerShell 7.2+ (`#Requires -Version 7.2`). Uses `$PROFILE.CurrentUserAllHosts` for the install target. The 7.2 floor is the version that introduced `$PSStyle.OutputRendering`, used by no-color mode.
@@ -65,14 +65,15 @@ For color/output, table layout, watch-mode, and `/api/oauth/usage` schema detail
 
 ## Unofficial endpoints (`usage` action)
 
-The `usage` action and the reconcile / save identity-fallback path depend on six pinned constants extracted from `claude.exe` 2.1.119 (a Bun-compiled binary). They live at the top of `switch_claude_account.ps1` under the `# --- Unofficial /api/oauth/usage constants ---` comment:
+The `usage` action and the reconcile / save identity-fallback path depend on pinned constants extracted from `claude.exe` 2.1.119 (a Bun-compiled binary). They live at the top of `switch_claude_account.ps1` under the `# --- Unofficial Claude Code OAuth-flow constants ---` comment:
 
-- `$Script:UsageEndpoint`   : `https://api.anthropic.com/api/oauth/usage`
-- `$Script:ProfileEndpoint` : `https://api.anthropic.com/api/oauth/profile` (used by `Get-SlotProfile` for the email-only identity fallback when `~/.claude.json` has no `oauthAccount`)
-- `$Script:TokenEndpoint`   : `https://platform.claude.com/v1/oauth/token`
-- `$Script:OAuthClientId`   : `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude.ai subscription flow)
-- `$Script:AnthropicBeta`   : `oauth-2025-04-20`
-- `$Script:UsageUserAgent`  : `claude-code/2.1.119`
+- `$Script:UsageEndpoint`       : `https://api.anthropic.com/api/oauth/usage`
+- `$Script:ProfileEndpoint`     : `https://api.anthropic.com/api/oauth/profile` (`Get-SlotProfile`; email-only identity fallback when `~/.claude.json` has no `oauthAccount`)
+- `$Script:TokenEndpoint`       : `https://platform.claude.com/v1/oauth/token`
+- `$Script:OAuthClientId`       : `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude.ai subscription flow)
+- `$Script:AnthropicBeta`       : `oauth-2025-04-20`
+- `$Script:AnthropicApiVersion` : `2023-06-01` (sent on every authenticated request for defense-in-depth against future endpoint tightening)
+- `$Script:UsageUserAgent`      : `claude-code/2.1.119`
 
 **Undocumented and unsupported by Anthropic.** When the call starts returning 4xx after a Claude Code upgrade, re-extract from `$(Get-Command claude).Source` using the grep recipe in the script header comment, bump the constants, and re-run `tests/Invoke-Tests.ps1`. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only; they will not catch the constants drifting out of date.
 
@@ -118,6 +119,8 @@ Identity comparison: live `~/.claude.json` email vs. the tracked slot's **sideca
 ## Auto-rotation (`sca usage -Watch -Auto`)
 
 OpenCode-scoped (issue #8): requires `opencode-claude-auth >= 1.5.4`, which re-reads `.credentials.json` on cache miss so a swap propagates without restarting OpenCode. Claude Code itself is NOT supported (its in-memory `~/.claude.json` cache would race the swap); `-Auto` refuses at startup AND re-checks `Test-ClaudeRunning` before every rotation. Trigger: `Get-AutoRotationDecision` compares the active slot's `max(five_hour.utilization, seven_day.utilization)` (null bucket = 0%) against `-Threshold` (default 95, range 1..100; the 5-pt margin absorbs `/api/oauth/usage` reporting lag). At or above → walk peer slots in alphabetical wrap order (matches `Get-NextSlotName`), skip non-ok HTTP rows and peers themselves at/above threshold, swap into the first eligible peer via `Invoke-SlotSwap` (the extracted core shared with `Invoke-SwitchAction`). No eligible peer → render `[Auto] No free slot available! Cooling down for <delta>` with the soonest future reset across all slots/buckets. UI: right-aligned `▶ switching slot at N%` header indicator (glyph white + text DarkGray; silent fallback when terminal too narrow) plus an extra blank line under the header when `-Auto` is set, plus a latched `[Auto]` footer line per frame (`Enabled` / `Rotated from "A" to "B" at HH:mm:ss` / `No free slot available! Cooling down for X` / `Rotation refused! Claude Code is running.` / `Rotation failed! <message>`).
+
+**Startup warmup**: on `-Auto` entry, `Invoke-WarmAllSlotsBySwitch` walks `Invoke-SlotSwap` through every saved slot in alphabetical order and restores the original active slot. Anchors each slot's 5h window so the first poll's table reflects real bucket numbers instead of `—` or `rate-limited` for inactive peers. Skipped when fewer than 2 slots are saved. UI: a synthetic snapshot with `Status='warming-up'` (renders `warming up`, yellow) painted inside the DEC 2026 sync envelope; per-slot progress on the `[Auto]` footer line. Per-slot 60 s cooldown stored in `state.last_warmup_at[<name>]` (`$Script:WarmupCooldownMs`); timestamp written BEFORE the swap so a failing slot still consumes its slot. Restore step is not gated by cooldown. Sidecar-less-active refusal: `state.active_slot` set but `Find-SlotByName` null → render `[Auto] Warmup skipped: active slot 'X' has no identity sidecar. Run 'sca save X' to recapture` and start polling. Ctrl-C safety: a `finally` in `Invoke-WarmAllSlotsBySwitch` attempts a best-effort restore before the watch loop's alt-screen teardown.
 
 ## Testing
 

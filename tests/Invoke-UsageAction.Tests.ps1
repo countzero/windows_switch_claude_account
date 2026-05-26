@@ -2061,6 +2061,370 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'anthropic-version header propagation' {
+        # Defense-in-depth: assert that every authenticated request adds
+        # the anthropic-version header so a future tightening at any
+        # endpoint does not silently break the script. Mirrors the
+        # constants-block decision documented in $Script:AnthropicApi-
+        # Version's docstring.
+
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+            $script:PastMs   = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+        }
+
+        It 'Get-SlotUsage sends anthropic-version on /api/oauth/usage' {
+            $payload = @{
+                claudeAiOauth = @{ accessToken = 'sk-fresh'; refreshToken = 'rt-fresh'; expiresAt = $script:FutureMs }
+            } | ConvertTo-Json -Depth 10 -Compress
+            $path = Join-Path $script:CredDirPath '.credentials.usage-ver(u@test.local).json'
+            Set-Content -LiteralPath $path -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $script:capturedHeaders = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:capturedHeaders = $Headers
+                return [pscustomobject]@{}
+            }
+
+            Get-SlotUsage -SlotPath $path | Out-Null
+
+            $script:capturedHeaders['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
+        }
+
+        It 'Get-SlotProfile sends anthropic-version on /api/oauth/profile' {
+            $payload = @{
+                claudeAiOauth = @{ accessToken = 'sk-fresh'; refreshToken = 'rt-fresh'; expiresAt = $script:FutureMs }
+            } | ConvertTo-Json -Depth 10 -Compress
+            $path = Join-Path $script:CredDirPath '.credentials.profile-ver(p@test.local).json'
+            Set-Content -LiteralPath $path -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $script:capturedHeaders = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                $script:capturedHeaders = $Headers
+                return [pscustomobject]@{ account = [pscustomobject]@{ email = 'p@test.local' } }
+            }
+
+            Get-SlotProfile -SlotPath $path | Out-Null
+
+            $script:capturedHeaders['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
+        }
+
+        It 'Update-SlotTokens sends anthropic-version on /v1/oauth/token' {
+            $payload = @{
+                claudeAiOauth = @{ accessToken = 'sk-OLD'; refreshToken = 'rt-OLD'; expiresAt = $script:PastMs }
+            } | ConvertTo-Json -Depth 10 -Compress
+            $path = Join-Path $script:CredDirPath '.credentials.token-ver(t@test.local).json'
+            Set-Content -LiteralPath $path -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $script:capturedHeaders = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:capturedHeaders = $Headers
+                return [pscustomobject]@{ access_token = 'sk-NEW'; refresh_token = 'rt-NEW'; expires_in = 3600 }
+            }
+
+            Update-SlotTokens -SlotPath $path | Out-Null
+
+            $script:capturedHeaders['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
+        }
+    }
+
+    Context "'warming-up' status renders as 'warming up' in the table" {
+        # The synthetic snapshot built by Invoke-UsageWatch's `-Auto`
+        # startup carries Status='warming-up' on every row; that status
+        # must (a) render as the space-separated 'warming up' label in
+        # the Status column and (b) map to Yellow via Get-StatusColor.
+
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+        }
+
+        It 'Format-UsageTable renders warming-up rows with "warming up" in the Status column' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Email 'alpha@test.local' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Email 'bravo@test.local' | Out-Null
+
+            $synth = @(Get-Slots) | ForEach-Object {
+                [pscustomobject]@{
+                    Name     = $_.Name
+                    Email    = $_.Email
+                    Path     = $_.Path
+                    IsActive = $_.IsActive
+                    Status   = 'warming-up'
+                    Data     = $null
+                }
+            }
+
+            $out = Format-UsageTable -Results $synth 6>&1 | Out-String
+
+            # Each row carries the rendered label 'warming up'. Two
+            # occurrences (one per slot row), surrounded by the
+            # column boundary so we don't accidentally match a stray
+            # word elsewhere in the table.
+            ([regex]::Matches($out, '\bwarming up\b')).Count | Should -Be 2
+            # Session / Week cells render as the no-data sentinel because
+            # synthetic rows carry Data = $null.
+            $out | Should -Match '—'
+        }
+
+        It 'Get-StatusColor maps "warming up" to Yellow' {
+            Get-StatusColor -Label 'warming up' -IsActive $false | Should -Be 'Yellow'
+            Get-StatusColor -Label 'warming up' -IsActive $true  | Should -Be 'Yellow'
+        }
+    }
+
+    Context 'Invoke-WarmAllSlotsBySwitch' {
+        # The orchestrator behind `-Auto` startup warmup. Tests focus on:
+        #   * slot enumeration / restore semantics
+        #   * per-slot cooldown gate (1 attempt per slot per minute)
+        #   * sidecar-less-active refusal
+        #   * Ctrl-C-safe restore via finally
+        #   * renderer callback contract
+
+        BeforeAll {
+            # Pester 5 scoping: functions defined in BeforeAll live for
+            # every It in this Context; inline `function` declarations
+            # would only exist for the BeforeEach that defined them.
+            # The body builds a real claudeAiOauth slot + paired sidecar
+            # so Invoke-SlotSwap's ~/.claude.json substitution path has
+            # parsable inputs even when the test mocks the swap itself.
+            function New-WarmupSlot {
+                Param ([string] $Name, [string] $Email = "$Name@test.local")
+                $payload = @{
+                    claudeAiOauth = @{
+                        accessToken  = "sk-ant-oat-$Name"
+                        refreshToken = "sk-ant-ort-$Name"
+                        expiresAt    = $script:FutureMs
+                    }
+                } | ConvertTo-Json -Depth 10 -Compress
+                return New-SlotPair -CredDir $script:CredDirPath -Name $Name -Email $Email -Content $payload
+            }
+        }
+
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+        }
+
+        It 'no-ops when 0 slots are saved (renderer never invoked, no swap calls)' {
+            $script:rendered = @()
+            Mock Invoke-SlotSwap -MockWith { throw 'should not be called' }
+            $cb = { Param ([string] $a) $script:rendered += $a }
+
+            { Invoke-WarmAllSlotsBySwitch -RenderProgress $cb } | Should -Not -Throw
+
+            $script:rendered.Count | Should -Be 0
+            Should -Invoke Invoke-SlotSwap -Times 0 -Exactly
+        }
+
+        It 'no-ops when only 1 slot is saved (renderer never invoked, no swap calls)' {
+            New-WarmupSlot -Name 'solo' | Out-Null
+            Update-ScaState -ActiveSlot 'solo' -LastSyncHash 'h' | Out-Null
+
+            $script:rendered = @()
+            Mock Invoke-SlotSwap -MockWith { throw 'should not be called' }
+            $cb = { Param ([string] $a) $script:rendered += $a }
+
+            { Invoke-WarmAllSlotsBySwitch -RenderProgress $cb } | Should -Not -Throw
+
+            $script:rendered.Count | Should -Be 0
+            Should -Invoke Invoke-SlotSwap -Times 0 -Exactly
+        }
+
+        It '2 slots, slot-A active: swap to slot-B then restore to slot-A' {
+            New-WarmupSlot -Name 'slot-A' | Out-Null
+            New-WarmupSlot -Name 'slot-B' | Out-Null
+            Update-ScaState -ActiveSlot 'slot-A' -LastSyncHash 'h' | Out-Null
+
+            $script:swappedTo = @()
+            Mock Invoke-SlotSwap -MockWith { $script:swappedTo += $Slot.Name }
+            $script:rendered = @()
+            $cb = { Param ([string] $a) $script:rendered += $a }
+
+            Invoke-WarmAllSlotsBySwitch -RenderProgress $cb
+
+            $script:swappedTo.Count | Should -Be 2
+            $script:swappedTo[0] | Should -Be 'slot-B'
+            $script:swappedTo[1] | Should -Be 'slot-A'
+            $script:rendered[0]   | Should -Match "activating 'slot-B' \(1/2\)"
+            $script:rendered[1]   | Should -Match "restoring active slot 'slot-A' \(2/2\)"
+        }
+
+        It '3 slots, b active: alphabetical peer walk a -> c then restore b' {
+            foreach ($n in @('a','b','c')) { New-WarmupSlot -Name $n | Out-Null }
+            Update-ScaState -ActiveSlot 'b' -LastSyncHash 'h' | Out-Null
+
+            $script:swappedTo = @()
+            Mock Invoke-SlotSwap -MockWith { $script:swappedTo += $Slot.Name }
+
+            Invoke-WarmAllSlotsBySwitch -RenderProgress { Param ([string] $a) }
+
+            $script:swappedTo | Should -Be @('a','c','b')
+        }
+
+        It 'cooldown: a slot warmed less than 60s ago is skipped; renderer reports the skip' {
+            New-WarmupSlot -Name 'fresh' | Out-Null
+            New-WarmupSlot -Name 'cold'  | Out-Null
+            Update-ScaState -ActiveSlot 'cold' -LastSyncHash 'h' | Out-Null
+            # Pre-populate fresh's cooldown at 30s ago.
+            $state = Read-ScaState
+            $state.last_warmup_at['fresh'] = [DateTimeOffset]::UtcNow.AddSeconds(-30).ToUnixTimeMilliseconds()
+            Write-ScaState -State $state
+
+            $script:swappedTo = @()
+            Mock Invoke-SlotSwap -MockWith { $script:swappedTo += $Slot.Name }
+            $script:rendered = @()
+
+            Invoke-WarmAllSlotsBySwitch -RenderProgress { Param ([string] $a) $script:rendered += $a }
+
+            # fresh is skipped (cooldown); only the restore-to-cold swap fires.
+            $script:swappedTo.Count | Should -Be 1
+            $script:swappedTo[0] | Should -Be 'cold'
+            ($script:rendered | Where-Object { $_ -match "skipping 'fresh'" }).Count | Should -Be 1
+        }
+
+        It 'cooldown: a slot warmed more than 60s ago is warmed normally' {
+            New-WarmupSlot -Name 'stale' | Out-Null
+            New-WarmupSlot -Name 'cold'  | Out-Null
+            Update-ScaState -ActiveSlot 'cold' -LastSyncHash 'h' | Out-Null
+            # Pre-populate stale's cooldown at 90s ago.
+            $state = Read-ScaState
+            $state.last_warmup_at['stale'] = [DateTimeOffset]::UtcNow.AddSeconds(-90).ToUnixTimeMilliseconds()
+            Write-ScaState -State $state
+
+            $script:swappedTo = @()
+            Mock Invoke-SlotSwap -MockWith { $script:swappedTo += $Slot.Name }
+
+            Invoke-WarmAllSlotsBySwitch -RenderProgress { Param ([string] $a) }
+
+            # stale is warmed; restore to cold runs.
+            $script:swappedTo | Should -Be @('stale','cold')
+        }
+
+        It 'cooldown does NOT apply to the restore step (active slot freshly written gets restored anyway)' {
+            New-WarmupSlot -Name 'peer'   | Out-Null
+            New-WarmupSlot -Name 'active' | Out-Null
+            Update-ScaState -ActiveSlot 'active' -LastSyncHash 'h' | Out-Null
+            # Pre-populate the active slot's cooldown at 5s ago -- well
+            # within the 60s window -- to verify the restore step
+            # bypasses the gate.
+            $state = Read-ScaState
+            $state.last_warmup_at['active'] = [DateTimeOffset]::UtcNow.AddSeconds(-5).ToUnixTimeMilliseconds()
+            Write-ScaState -State $state
+
+            $script:swappedTo = @()
+            Mock Invoke-SlotSwap -MockWith { $script:swappedTo += $Slot.Name }
+
+            Invoke-WarmAllSlotsBySwitch -RenderProgress { Param ([string] $a) }
+
+            # peer warmed, active restored.
+            $script:swappedTo | Should -Be @('peer','active')
+        }
+
+        It 'records last_warmup_at BEFORE the swap so a swap that throws still consumes the cooldown' {
+            New-WarmupSlot -Name 'broken' | Out-Null
+            New-WarmupSlot -Name 'active' | Out-Null
+            Update-ScaState -ActiveSlot 'active' -LastSyncHash 'h' | Out-Null
+
+            Mock Invoke-SlotSwap -ParameterFilter { $Slot.Name -eq 'broken' } -MockWith {
+                throw [System.Exception]::new('synthetic swap failure')
+            }
+            Mock Invoke-SlotSwap -ParameterFilter { $Slot.Name -eq 'active' } -MockWith { }
+
+            $script:rendered = @()
+            Invoke-WarmAllSlotsBySwitch -RenderProgress { Param ([string] $a) $script:rendered += $a }
+
+            # The failed swap left a cooldown timestamp behind so a
+            # rapid restart will skip the broken slot rather than
+            # retrying it within 60s.
+            $stamp = Get-SlotWarmupTimestamp -Name 'broken'
+            $stamp | Should -BeGreaterThan 0
+            # The renderer received a failure message.
+            ($script:rendered | Where-Object { $_ -match "'broken' swap failed: .*synthetic swap failure" }).Count | Should -Be 1
+        }
+
+        It 'sidecar-less active slot refuses the warmup and exits cleanly (no swaps)' {
+            # Two slots, but the "active" one in state has no sidecar so
+            # Get-Slots filters it out and Find-SlotByName returns null.
+            New-WarmupSlot -Name 'visible' | Out-Null
+            # Sidecar-less slot file (no paired .account.json).
+            $orphanPayload = @{
+                claudeAiOauth = @{ accessToken = 'sk-orphan'; refreshToken = 'rt-orphan'; expiresAt = $script:FutureMs }
+            } | ConvertTo-Json -Depth 10 -Compress
+            Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.ghost(g@test.local).json') -Value $orphanPayload -NoNewline -Encoding utf8NoBOM
+            Update-ScaState -ActiveSlot 'ghost' -LastSyncHash 'h' | Out-Null
+
+            # Need at least 2 visible slots for the warmup to even start
+            # the iteration, so add a second visible slot.
+            New-WarmupSlot -Name 'second' | Out-Null
+
+            Mock Invoke-SlotSwap -MockWith { throw 'should not be called when active slot has no sidecar' }
+            $script:rendered = @()
+
+            Invoke-WarmAllSlotsBySwitch -RenderProgress { Param ([string] $a) $script:rendered += $a }
+
+            # One refusal message; no swaps.
+            ($script:rendered | Where-Object { $_ -match "Warmup skipped: active slot 'ghost' has no identity sidecar" }).Count | Should -Be 1
+            Should -Invoke Invoke-SlotSwap -Times 0 -Exactly
+        }
+
+        It 'finally restores the original active slot when a peer swap throws and aborts the loop' {
+            # Simulate Ctrl-C / pipeline-stop semantics: the FIRST peer
+            # swap throws a non-IO exception that bubbles out of the
+            # try block; the inner catch swallows the message into
+            # $script:rendered AND continues, but the finally block
+            # still runs at function exit. The contract under test is
+            # the simpler one: when the orchestrator's main body
+            # completes normally (peers iterated, restore step ran),
+            # the finally's "if not restored" branch is a no-op. We
+            # exercise the finally explicitly by forcing the restore
+            # step itself to throw, which leaves $restored = $false.
+            New-WarmupSlot -Name 'peer'   | Out-Null
+            New-WarmupSlot -Name 'active' | Out-Null
+            Update-ScaState -ActiveSlot 'active' -LastSyncHash 'h' | Out-Null
+
+            $script:swappedTo = @()
+            $script:restoreCallCount = 0
+            Mock Invoke-SlotSwap -ParameterFilter { $Slot.Name -eq 'peer' } -MockWith {
+                $script:swappedTo += 'peer'
+            }
+            Mock Invoke-SlotSwap -ParameterFilter { $Slot.Name -eq 'active' } -MockWith {
+                $script:restoreCallCount++
+                if ($script:restoreCallCount -eq 1) {
+                    # First restore attempt fails (the main body's swap).
+                    throw [System.Exception]::new('first restore fails')
+                }
+                # Finally-block retry succeeds.
+                $script:swappedTo += 'active'
+            }
+
+            Invoke-WarmAllSlotsBySwitch -RenderProgress { Param ([string] $a) }
+
+            # Peer swap ran; main-body restore threw; finally retried
+            # and recorded the second active swap.
+            $script:swappedTo | Should -Be @('peer','active')
+            $script:restoreCallCount | Should -Be 2
+        }
+
+        It 'no active slot in state: walks all N slots; no restore at the end' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            # No Update-ScaState call -> state.active_slot is null.
+
+            $script:swappedTo = @()
+            Mock Invoke-SlotSwap -MockWith { $script:swappedTo += $Slot.Name }
+
+            Invoke-WarmAllSlotsBySwitch -RenderProgress { Param ([string] $a) }
+
+            # 3 peer swaps, no restore. Order is alphabetical.
+            $script:swappedTo | Should -Be @('a','b','c')
+        }
+    }
+
     AfterAll {
         $env:USERPROFILE = $script:OriginalUserProfile
         $global:PROFILE  = $script:OriginalProfile

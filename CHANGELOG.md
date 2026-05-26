@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-05-26
+
+### Added
+- `sca usage -Watch -Auto` warms every saved slot at startup by briefly switching to each one via `Invoke-SlotSwap`, then restoring the original active slot. Anchors each slot's 5h window so the first poll's Status column reports real bucket numbers instead of empty `—` cells or `rate-limited` from cold slots. Visible to the user as `warming up` (yellow) in the Status column with per-slot progress on the `[Auto]` footer line; no flashed output before the alt-screen UI appears.
+- Per-slot warmup cooldown: `Invoke-WarmAllSlotsBySwitch` records each attempt in `state.last_warmup_at` and skips slots warmed less than 60 seconds ago. Prevents thrashing across rapid `-Watch -Auto` restarts. The state file's schema stays at `1`; the new `last_warmup_at` field is additive and missing on legacy files.
+- `anthropic-version: 2023-06-01` header sent on every authenticated request (`Get-SlotUsage`, `Get-SlotProfile`, `Update-SlotTokens`). The OAuth-namespaced endpoints accept calls without it today; sending it uniformly insulates the script from a future tightening at any endpoint.
+
+### Fixed
+- Sidecar-less active slot during `-Watch -Auto` startup: the warmup pass now refuses with a one-line advisory pointing at `sca save <name>` instead of silently rotating the user onto the last peer slot.
+- Ctrl-C mid-warmup: a `finally` inside the warmup orchestrator attempts to restore the original active slot before the watch loop's outer alt-screen teardown runs, so an interrupted startup does not leave `.credentials.json` on an unexpected peer.
+
 ## [2.2.1] - 2026-05-20
 
 ### Fixed

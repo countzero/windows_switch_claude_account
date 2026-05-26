@@ -305,6 +305,115 @@ Describe 'switch_claude_account' {
             $r.active_slot    | Should -Be 'work'
             $r.last_sync_hash | Should -Be 'h1'
         }
+
+        # Defense-in-depth: Update-ScaState must not clobber the
+        # last_warmup_at map when a caller mutates active_slot /
+        # last_sync_hash. The two cooldown helpers and the swap
+        # primitive both write the state file; a regression here
+        # would silently empty the cooldown map on every swap.
+        It 'preserves last_warmup_at across an active_slot / last_sync_hash update' {
+            Set-SlotWarmupTimestamp -Name 'slot-1'
+            Update-ScaState -ActiveSlot 'slot-2' -LastSyncHash 'h-new' | Out-Null
+
+            $r = Read-ScaState
+            $r.active_slot                   | Should -Be 'slot-2'
+            $r.last_sync_hash                | Should -Be 'h-new'
+            $r.last_warmup_at['slot-1']      | Should -BeGreaterThan 0
+        }
+
+        # Update-ScaState's no-current-state branch (line 'creates a
+        # fresh state file when none exists' above) must seed the new
+        # last_warmup_at field with @{} so a later Set-SlotWarmupTimestamp
+        # has somewhere to write. Without this seed the next Read /
+        # Write cycle would silently drop a Set-SlotWarmupTimestamp
+        # call made between two Update-ScaState calls.
+        It 'seeds last_warmup_at = @{} when no state file exists' {
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'h1' | Out-Null
+
+            $r = Read-ScaState
+            $null -eq $r.last_warmup_at | Should -BeFalse
+            $r.last_warmup_at -is [hashtable] | Should -BeTrue
+            $r.last_warmup_at.Count | Should -Be 0
+        }
+    }
+
+    Context 'Get-/Set-SlotWarmupTimestamp' {
+        # The cooldown helpers behind Invoke-WarmAllSlotsBySwitch.
+        # Set-SlotWarmupTimestamp must round-trip through the state file
+        # and Get-SlotWarmupTimestamp must return $null when no record
+        # exists. The Set helper intentionally writes "now" rather than
+        # accepting a timestamp parameter; backdating the cooldown clock
+        # would defeat the per-slot rate-limit's whole point.
+
+        It 'Get returns $null when no state file exists' {
+            Get-SlotWarmupTimestamp -Name 'slot-1' | Should -BeNullOrEmpty
+        }
+
+        It 'Get returns $null when state file exists but slot has no entry' {
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'h1' | Out-Null
+            Get-SlotWarmupTimestamp -Name 'slot-X' | Should -BeNullOrEmpty
+        }
+
+        It 'Set then Get round-trips a millisecond timestamp via the state file' {
+            $before = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            Set-SlotWarmupTimestamp -Name 'slot-1'
+            $after = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+
+            $stamp = Get-SlotWarmupTimestamp -Name 'slot-1'
+            $stamp | Should -BeGreaterOrEqual $before
+            $stamp | Should -BeLessOrEqual $after
+        }
+
+        It 'Set on multiple slots persists independent timestamps' {
+            Set-SlotWarmupTimestamp -Name 'slot-1'
+            Start-Sleep -Milliseconds 5
+            Set-SlotWarmupTimestamp -Name 'slot-2'
+
+            $s1 = Get-SlotWarmupTimestamp -Name 'slot-1'
+            $s2 = Get-SlotWarmupTimestamp -Name 'slot-2'
+            $s1 | Should -BeLessThan $s2
+        }
+
+        It 'Set updates an existing slot timestamp (cooldown clock restart)' {
+            Set-SlotWarmupTimestamp -Name 'slot-1'
+            $first = Get-SlotWarmupTimestamp -Name 'slot-1'
+            Start-Sleep -Milliseconds 20
+            Set-SlotWarmupTimestamp -Name 'slot-1'
+            $second = Get-SlotWarmupTimestamp -Name 'slot-1'
+
+            $second | Should -BeGreaterThan $first
+        }
+
+        # Coexistence contract: Set-SlotWarmupTimestamp must not disturb
+        # active_slot / last_sync_hash. A regression here would mean
+        # every warmup attempt corrupts the user's tracked active slot.
+        It 'Set preserves active_slot and last_sync_hash' {
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'h-orig' | Out-Null
+            Set-SlotWarmupTimestamp -Name 'slot-1'
+
+            $r = Read-ScaState
+            $r.active_slot    | Should -Be 'work'
+            $r.last_sync_hash | Should -Be 'h-orig'
+        }
+
+        # Read-ScaState must normalize last_warmup_at to a hashtable even
+        # when the state file was written by an older sca version (no
+        # such field on disk). Without the @{} default, Get-SlotWarmup-
+        # Timestamp would throw NullReferenceException on legacy state.
+        It 'Read normalizes a legacy state file (no last_warmup_at field) to an empty map' {
+            $legacyJson = '{"schema":1,"active_slot":"work","last_sync_hash":"h-legacy"}'
+            Set-Content -LiteralPath $StateFile -Value $legacyJson -NoNewline -Encoding utf8NoBOM
+
+            $r = Read-ScaState
+            $r.active_slot     | Should -Be 'work'
+            $null -eq $r.last_warmup_at | Should -BeFalse
+            $r.last_warmup_at -is [hashtable] | Should -BeTrue
+            $r.last_warmup_at.Count | Should -Be 0
+
+            # And Set on the legacy state lifts it to the new shape.
+            Set-SlotWarmupTimestamp -Name 'slot-1'
+            (Read-ScaState).last_warmup_at['slot-1'] | Should -BeGreaterThan 0
+        }
     }
 
     AfterAll {
