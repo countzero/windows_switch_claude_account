@@ -1296,6 +1296,86 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Update-SlotTokens (429 retry behavior)' {
+        # Retry-with-backoff around /v1/oauth/token. The endpoint's
+        # per-token rate limiter unlocks within seconds, so a 429
+        # on the first attempt should not stick; we retry up to
+        # $Script:TokenRefreshRetryMax times before giving up.
+        # Common.ps1 zeroes $Script:TokenRefreshRetryDelayMs so the
+        # tests do not consume real wall-clock time inside Start-Sleep.
+
+        BeforeEach {
+            $script:credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:credDir -Force | Out-Null
+            $script:slot = Join-Path $script:credDir '.credentials.retry.json'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'OLD'
+                    refreshToken = 'RT'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:slot -Value $payload -NoNewline
+        }
+
+        It '429 then 200 on retry: succeeds, slot file updated, two token-endpoint calls' {
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                if ($script:attempts -eq 1) {
+                    $resp  = [pscustomobject]@{ StatusCode = 429 }
+                    $inner = [System.Exception]::new('429 Too Many Requests')
+                    $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                    throw $inner
+                }
+                return [pscustomobject]@{
+                    access_token  = 'NEW'
+                    refresh_token = 'NEW-RT'
+                    expires_in    = 3600
+                }
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } | Should -Not -Throw
+
+            $script:attempts | Should -Be 2
+            $after = Get-Content -LiteralPath $script:slot -Raw | ConvertFrom-Json
+            $after.claudeAiOauth.accessToken  | Should -Be 'NEW'
+            $after.claudeAiOauth.refreshToken | Should -Be 'NEW-RT'
+        }
+
+        It 'persistent 429 across all attempts: throws (no infinite loop); RetryMax attempts made' {
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } |
+                Should -Throw -ExpectedMessage '*429*'
+
+            # Exactly RetryMax (default 3) attempts were made before
+            # giving up. Defends against off-by-one in the retry loop.
+            $script:attempts | Should -Be $Script:TokenRefreshRetryMax
+        }
+
+        It 'non-429 failure on first attempt: throws immediately (no retry)' {
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                throw [System.Exception]::new('refresh_token invalid')
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } |
+                Should -Throw -ExpectedMessage '*refresh_token invalid*'
+
+            # No retry for non-429 (avoids hammering a deterministic 4xx).
+            $script:attempts | Should -Be 1
+        }
+    }
+
     Context 'New-AutoSaveSlot (sidecar-write failure advisory)' {
         # Direct test for the New-AutoSaveSlot helper's catch path:
         # when Write-Sidecar throws, the function must NOT throw; it

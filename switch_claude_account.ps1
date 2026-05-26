@@ -161,7 +161,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '2.3.0'
+$Script:ScriptVersion = '2.3.1'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -210,6 +210,20 @@ $Script:AnthropicApiVersion = "2023-06-01"
 $Script:UsageUserAgent      = "claude-code/2.1.119"
 $Script:UsageTimeoutSec     = 5
 $Script:ProfileTimeoutSec   = 10
+
+# Retry policy for /v1/oauth/token on a 429 response. Empirically the
+# refresh endpoint's per-token rate limiter has a short cooldown
+# (~seconds): a slot whose access token expired days ago is "stuck"
+# only until one retry slips through. Three total attempts with
+# exponential backoff (2 s, then 4 s) gives a ~6 s worst-case extra
+# latency per stuck slot, which the watch loop absorbs inside the 60 s
+# poll cadence. Without retry the same slot showed `rate-limited`
+# every poll until the user happened to invoke another sca command
+# during the brief unlock window; the retry collapses that gap.
+# Tunable for tests (Pester overrides them to zero so mocked 429 paths
+# run instantly).
+$Script:TokenRefreshRetryMax     = 3
+$Script:TokenRefreshRetryDelayMs = 2000
 
 # Cache of the last successful /api/oauth/usage response per slot path.
 # Used as a fallback when the endpoint returns 429 (rate limited) so the
@@ -350,7 +364,7 @@ function Set-CredentialFileAtomic {
 # missing version. last_sync_hash and active_slot may be $null (initial
 # state where reconcile has not yet captured any sync). last_warmup_at
 # is an optional map of slot-name -> Unix-epoch-ms timestamps consumed
-# by Invoke-WarmAllSlotsBySwitch's per-slot cooldown gate; missing /
+# by Invoke-WarmAllSlots's per-slot cooldown gate; missing /
 # empty -> emit `{}` so the file shape stays stable across writes.
 function Write-ScaState {
     Param (
@@ -512,7 +526,7 @@ function Update-ScaState {
 
 # Read one slot's last warmup-attempt timestamp from the state file.
 # Returns [int64] Unix-epoch-ms, or $null when no record exists for that
-# slot. Used by Invoke-WarmAllSlotsBySwitch's per-slot cooldown gate.
+# slot. Used by Invoke-WarmAllSlots's per-slot cooldown gate.
 function Get-SlotWarmupTimestamp {
     Param ([Parameter(Mandatory)] [string] $Name)
 
@@ -2058,12 +2072,35 @@ function Update-SlotTokens {
         'User-Agent'        = $Script:UsageUserAgent
     }
 
-    $resp = Invoke-RestMethod -Method Post `
-                              -Uri $Script:TokenEndpoint `
-                              -Headers $headers `
-                              -Body $body `
-                              -TimeoutSec $Script:UsageTimeoutSec `
-                              -ErrorAction Stop
+    # 429 retry loop. The token endpoint's per-token rate limiter
+    # unlocks within ~seconds, so a short exponential backoff
+    # (2 s, 4 s) recovers a stuck slot inside one watch-loop tick
+    # without surfacing a spurious 'rate-limited' status. Non-429
+    # exceptions rethrow on the first failure (no point retrying a
+    # 4xx with a malformed request or a 5xx with a server-side
+    # problem). Tests override $Script:TokenRefreshRetryDelayMs to
+    # zero so the mocked 429 paths complete instantly.
+    $resp = $null
+    for ($attempt = 1; $attempt -le $Script:TokenRefreshRetryMax; $attempt++) {
+        try {
+            $resp = Invoke-RestMethod -Method Post `
+                                      -Uri $Script:TokenEndpoint `
+                                      -Headers $headers `
+                                      -Body $body `
+                                      -TimeoutSec $Script:UsageTimeoutSec `
+                                      -ErrorAction Stop
+            break
+        }
+        catch {
+            $is429 = Test-Is429 $_.Exception
+            if (-not $is429 -or $attempt -ge $Script:TokenRefreshRetryMax) {
+                throw
+            }
+            # Exponential backoff: 2 s, 4 s, 8 s ... capped by RetryMax.
+            $sleepMs = $Script:TokenRefreshRetryDelayMs * [Math]::Pow(2, $attempt - 1)
+            Start-Sleep -Milliseconds ([int]$sleepMs)
+        }
+    }
 
     if (-not $resp.access_token) {
         throw "OAuth refresh succeeded but response missing access_token."
@@ -2893,7 +2930,7 @@ function Format-UsageTable {
             'error'        { "error: $(Format-StatusErrorTail $r.Error)" }
             'rate-limited' { 'rate-limited' }
             # 'warming-up' is the transient label rendered while
-            # Invoke-WarmAllSlotsBySwitch is iterating slots on `-Watch
+            # Invoke-WarmAllSlots is iterating slots on `-Watch
             # -Auto` startup. Synthetic snapshot rows carry it; the
             # first real poll replaces them with one of the HTTP states
             # above. The hyphenated internal value renders space-
@@ -3855,149 +3892,150 @@ function Invoke-AutoRotationStep {
 # round number.
 $Script:UsageWatchMinInterval = 60
 
-# Minimum gap between consecutive Invoke-WarmAllSlotsBySwitch attempts
-# against the same slot. Tracked per-slot via state.last_warmup_at;
-# Invoke-WarmAllSlotsBySwitch skips a peer that was warmed less than
-# this many milliseconds ago. Prevents thrashing on rapid `-Watch -Auto`
-# restarts (each restart would otherwise re-swap every slot, churning
-# .credentials.json / ~/.claude.json on every Ctrl-C reload).
+# Minimum gap between consecutive Invoke-WarmAllSlots attempts against
+# the same slot. Tracked per-slot via state.last_warmup_at; the loop
+# skips a slot warmed less than this many milliseconds ago. Prevents
+# burning ~6 s of retries against a permanently-stuck slot on every
+# rapid `-Watch -Auto` restart inside the unlock window.
 $Script:WarmupCooldownMs = 60000
 
-# Peer-warmup orchestrator for `sca usage -Watch -Auto` startup. Walks
-# every saved slot via Invoke-SlotSwap (the existing primitive shared
-# with `sca switch`) and restores the original active slot at the end.
-# The whole point: the credentials swap is what activates an inactive
-# slot from Anthropic's perspective, so a one-time rotation through all
-# slots anchors each slot's 5h window and lets the first poll report
-# real bucket numbers for every row instead of empty / rate-limited.
+# Inter-slot spacing during the warmup loop. After each slot is
+# probed, sleep this many milliseconds before moving to the next.
+# Cheap insurance against per-IP burst rate-limits on
+# /v1/oauth/token: 300 ms between calls keeps two-slot pools well
+# under typical burst thresholds while adding only ~300 ms * (N-1)
+# of startup latency. Tunable for tests (Pester overrides to zero).
+$Script:WarmupSpacingMs = 300
+
+# Token-refresh-warmup orchestrator for `sca usage -Watch -Auto`
+# startup. For each saved slot, call Update-SlotTokens when the
+# slot's access token is at or near expiry. Update-SlotTokens
+# already retries 429s with backoff (see $Script:TokenRefreshRetryMax),
+# so a "stuck" slot whose refresh-endpoint cooldown is in flight
+# self-recovers inside the warmup pass instead of returning
+# `rate-limited` on the first poll and waiting for the user to
+# happen to re-run sca during the brief unlock window.
 #
-# Side-effect ladder (per peer, in order):
+# No credentials swap. The previous design (swap to each peer in
+# turn, then restore) was a no-op from Anthropic's perspective:
+# rewriting .credentials.json locally does not generate any
+# observable event server-side, so it cannot "anchor" or
+# "activate" anything. The real activation lever is a successful
+# /v1/oauth/token call against the slot's refresh_token, which
+# this loop now performs directly.
+#
+# Side-effect ladder (per slot, in order):
 #   1. Skip if state.last_warmup_at[$slot.Name] < $Script:WarmupCooldownMs
-#      old. Renderer is invoked with a "skipping" message so the user
-#      sees the cool-down.
-#   2. Render an "activating" message via $RenderProgress.
-#   3. Set-SlotWarmupTimestamp BEFORE the swap so a swap that throws
-#      still consumes the cooldown slot (prevents thrashing on a slot
-#      whose .credentials.json or ~/.claude.json writes keep failing).
-#   4. Invoke-SlotSwap (atomic-rename .credentials.json + ~/.claude.json
-#      oauthAccount substitution + state.active_slot update). A throw
-#      here is caught; the renderer surfaces it; the loop continues
-#      with the next peer.
-#
-# Restore step runs in a `finally` so a mid-loop Ctrl-C still attempts
-# to put .credentials.json back on the original active slot's bytes
-# before the outer Invoke-UsageWatch `finally` tears down the alt-screen.
-# The restore is NOT gated by cooldown (it is hygiene, not a warmup).
+#      old. Renderer surfaces the cooldown.
+#   2. Render a "refreshing" message via $RenderProgress.
+#   3. Set-SlotWarmupTimestamp BEFORE the network call so a
+#      Update-SlotTokens that throws still consumes the cooldown
+#      slot (no retry-thrashing within the same minute against a
+#      slot whose refresh_token Anthropic has invalidated).
+#   4. If Get-SlotOAuth.ExpiresAt is in the past or within the
+#      same 60 s grace window Get-SlotUsage uses, call
+#      Update-SlotTokens (which retries 429s internally). Throw
+#      caught; renderer surfaces it; the loop continues with the
+#      next slot. Fresh tokens are silently skipped (no point
+#      burning a refresh on a slot Claude Code refreshed seconds
+#      ago).
+#   5. Start-Sleep $Script:WarmupSpacingMs before the next slot.
 #
 # Refusal cases (render one message and exit cleanly):
-#   * Fewer than 2 visible slots: nothing to rotate; no-op.
-#   * state.active_slot is set but Find-SlotByName returns null (the
-#     active slot has lost its sidecar): refuse the warmup pass so we
-#     do not silently leave the user active on the last peer. The
-#     renderer surfaces a message pointing at `sca save <name>`.
+#   * Zero visible slots: nothing to warm; no-op.
 #
 # Renderer callback signature:
 #   { Param ([string] $autoLine) <repaint the current frame with $autoLine in the [Auto] footer slot> }
-# Callback ownership lives in Invoke-UsageWatch where the DEC 2026 sync
-# envelope and alt-screen state live; making this function call back
-# into the watch's renderer keeps the per-frame composition out of the
-# orchestrator and makes the orchestrator itself unit-testable by
-# passing a mock renderer.
-function Invoke-WarmAllSlotsBySwitch {
+# Callback ownership lives in Invoke-UsageWatch where the DEC 2026
+# sync envelope and alt-screen state live; making this function
+# call back into the watch's renderer keeps the per-frame
+# composition out of the orchestrator and makes the orchestrator
+# itself unit-testable by passing a mock renderer.
+function Invoke-WarmAllSlots {
     Param (
         [Parameter(Mandatory)] [scriptblock] $RenderProgress
     )
 
     $slots = @(Get-Slots)
-    if ($slots.Count -lt 2) {
-        # 0 or 1 slot: nothing to rotate. -Auto rotation is also a no-op
-        # under this condition, so the warmup pass is semantically
-        # vacuous here too. Do not render anything; the steady-state
-        # `[Auto] Automatic slot switching is enabled.` latch is fine.
+    if ($slots.Count -lt 1) {
+        # No slots: nothing to warm. The polling loop itself will
+        # render the "no slots saved yet" frame; we have no useful
+        # message to add here.
         return
     }
 
-    $state         = Read-ScaState
-    $originalName  = if ($state -and $state.active_slot) { [string]$state.active_slot } else { $null }
-    $originalSlot  = if ($originalName) { Find-SlotByName -Name $originalName } else { $null }
+    $total = $slots.Count
+    $i = 0
+    foreach ($slot in $slots) {
+        $i++
 
-    # Sidecar-less-active refusal: state tracks an active slot but Find-
-    # SlotByName filtered it out (no sidecar). Restoring would silently
-    # leave the user on the last peer; refuse instead and surface the
-    # remediation path. The polling loop then starts on whichever slot
-    # is currently active; the user can `sca save <name>` to recapture
-    # the sidecar and try again.
-    if ($originalName -and -not $originalSlot) {
-        & $RenderProgress ("[Auto] Warmup skipped: active slot '{0}' has no identity sidecar. Run 'sca save {0}' to recapture, then re-run." -f $originalName)
-        return
-    }
-
-    $peers = if ($originalSlot) {
-        @($slots | Where-Object { $_.Path -ne $originalSlot.Path })
-    } else {
-        @($slots)
-    }
-
-    $total = $peers.Count + $(if ($originalSlot) { 1 } else { 0 })
-    $restored = $false
-    try {
-        $i = 0
-        foreach ($slot in $peers) {
-            $i++
-            $last = Get-SlotWarmupTimestamp -Name $slot.Name
-            if ($null -ne $last) {
-                $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-                $age = $nowMs - $last
-                if ($age -ge 0 -and $age -lt $Script:WarmupCooldownMs) {
-                    $ago = [int][math]::Floor($age / 1000)
-                    & $RenderProgress ("[Auto] Warming up: skipping '{0}' ({1}/{2}, warmed {3}s ago)" -f $slot.Name, $i, $total, $ago)
-                    continue
-                }
+        # Cooldown gate: if this slot was warmed less than
+        # $Script:WarmupCooldownMs ago, skip. Prevents burning
+        # retry budget on a slot whose refresh_token Anthropic
+        # has refused multiple times in a row.
+        $last = Get-SlotWarmupTimestamp -Name $slot.Name
+        if ($null -ne $last) {
+            $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $age = $nowMs - $last
+            if ($age -ge 0 -and $age -lt $Script:WarmupCooldownMs) {
+                $ago = [int][math]::Floor($age / 1000)
+                & $RenderProgress ("[Auto] Warming up: skipping '{0}' ({1}/{2}, warmed {3}s ago)" -f $slot.Name, $i, $total, $ago)
+                continue
             }
+        }
 
-            & $RenderProgress ("[Auto] Warming up: activating '{0}' ({1}/{2})..." -f $slot.Name, $i, $total)
-            # Set timestamp BEFORE the swap so a swap that throws still
-            # consumes the cooldown slot (we do not want to retry a
-            # broken slot within the same minute).
+        # Read the slot's current OAuth material. A slot without
+        # claudeAiOauth (api-key-only or otherwise malformed) is
+        # surfaced and skipped; the polling loop will render its
+        # `no-oauth` status row a second later.
+        $oauth = $null
+        try { $oauth = Get-SlotOAuth -SlotPath $slot.Path }
+        catch {
+            & $RenderProgress ("[Auto] Warming up: reading '{0}' failed: {1}" -f $slot.Name, $_.Exception.Message)
             try { Set-SlotWarmupTimestamp -Name $slot.Name } catch { Write-Verbose "Set-SlotWarmupTimestamp deferred: $_" }
-            try {
-                Invoke-SlotSwap -Slot $slot 6>$null
-            }
-            catch {
-                & $RenderProgress ("[Auto] Warming up: '{0}' swap failed: {1}" -f $slot.Name, $_.Exception.Message)
-            }
+            continue
+        }
+        if (-not $oauth.HasOAuth) {
+            & $RenderProgress ("[Auto] Warming up: skipping '{0}' ({1}/{2}, no OAuth material)" -f $slot.Name, $i, $total)
+            try { Set-SlotWarmupTimestamp -Name $slot.Name } catch { Write-Verbose "Set-SlotWarmupTimestamp deferred: $_" }
+            continue
         }
 
-        if ($originalSlot) {
-            $i++
-            & $RenderProgress ("[Auto] Warming up: restoring active slot '{0}' ({1}/{2})..." -f $originalSlot.Name, $i, $total)
-            try {
-                Invoke-SlotSwap -Slot $originalSlot 6>$null
-                $restored = $true
-            }
-            catch {
-                & $RenderProgress ("[Auto] Warming up: restoring '{0}' failed: {1}" -f $originalSlot.Name, $_.Exception.Message)
-            }
-        } else {
-            # No tracked original active slot: the last peer is the new
-            # active. Mark as "restored" so the finally does not try a
-            # duplicate restore. Matches the no-active-slot rotation
-            # semantics elsewhere in the script.
-            $restored = $true
+        # Fresh-token shortcut: skip the network call when the
+        # access token has > 60 s of life remaining. Matches the
+        # same expiry threshold Get-SlotUsage uses (line 2215);
+        # keeping both in lockstep means the first poll after
+        # warmup never duplicates the refresh decision.
+        $threshold = [DateTime]::UtcNow.AddSeconds(60)
+        if ($oauth.ExpiresAt -and $oauth.ExpiresAt -gt $threshold) {
+            & $RenderProgress ("[Auto] Warming up: skipping '{0}' ({1}/{2}, token already fresh)" -f $slot.Name, $i, $total)
+            try { Set-SlotWarmupTimestamp -Name $slot.Name } catch { Write-Verbose "Set-SlotWarmupTimestamp deferred: $_" }
+            # Still spacing-sleep so adjacent stale slots don't
+            # see a burst (unlikely path; fresh -> stale -> fresh
+            # interleaving requires unusual timing).
+            if ($i -lt $total) { Start-Sleep -Milliseconds $Script:WarmupSpacingMs }
+            continue
         }
-    }
-    finally {
-        # Ctrl-C handler: if a peer swap was in flight and we never
-        # reached the explicit restore step above, attempt the restore
-        # now so the user does not return to an unexpected active slot.
-        # Silent on failure; the outer Invoke-UsageWatch finally will
-        # tear down the alt-screen anyway, and any restore error has
-        # nowhere meaningful to render. State.active_slot reflects
-        # whichever slot Invoke-SlotSwap last succeeded on, so `sca
-        # list` will show the truth after exit.
-        if ($originalSlot -and -not $restored) {
-            try { Invoke-SlotSwap -Slot $originalSlot 6>$null } catch { Write-Verbose "Warmup-finally restore failed: $_" }
+
+        & $RenderProgress ("[Auto] Warming up: refreshing '{0}' ({1}/{2})..." -f $slot.Name, $i, $total)
+        # Set timestamp BEFORE the network call so a throw still
+        # consumes the cooldown slot (we do not want to retry a
+        # broken slot within the same minute).
+        try { Set-SlotWarmupTimestamp -Name $slot.Name } catch { Write-Verbose "Set-SlotWarmupTimestamp deferred: $_" }
+        try {
+            Update-SlotTokens -SlotPath $slot.Path 6>$null | Out-Null
         }
+        catch {
+            # Update-SlotTokens already retried 429s internally;
+            # a throw here means either persistent 429 (slot
+            # genuinely stuck for now) or a non-429 4xx/5xx /
+            # network failure. Surface the tail of the message
+            # and continue.
+            $tail = Format-StatusErrorTail $_.Exception.Message
+            & $RenderProgress ("[Auto] Warming up: '{0}' refresh failed: {1}" -f $slot.Name, $tail)
+        }
+
+        if ($i -lt $total) { Start-Sleep -Milliseconds $Script:WarmupSpacingMs }
     }
 }
 
@@ -4108,27 +4146,28 @@ function Invoke-UsageWatch {
         # mode is engaged before the first rotation event.
         $lastAutoFooter = if ($Auto) { '[Auto] Automatic slot switching is enabled.' } else { $null }
 
-        # -Auto startup warmup. Rotate through every saved slot via
-        # Invoke-SlotSwap so each slot is briefly the active credentials;
-        # restore the original active slot at the end. The credentials
-        # swap is what activates an inactive slot from Anthropic's
-        # perspective (verified empirically by the user against the
-        # previous /v1/messages Haiku approach, which was rejected by
-        # Anthropic-side rate-limiting). Result: the first poll's table
-        # reflects real bucket numbers for every row instead of empty
-        # buckets or `rate-limited`. Per-slot cooldown gate is enforced
-        # inside Invoke-WarmAllSlotsBySwitch via state.last_warmup_at;
-        # the Ctrl-C-safe restore lives in that function's `finally`.
+        # -Auto startup warmup. Refresh each saved slot's OAuth tokens
+        # via Update-SlotTokens (which retries 429s with backoff). A
+        # slot whose access token has expired and whose previous
+        # refresh attempt got rate-limited would otherwise show
+        # `rate-limited` on the first poll and stay that way until
+        # the user happens to invoke another sca command during the
+        # brief unlock window. The warmup collapses that gap so the
+        # first poll's table reflects real numbers for every slot
+        # whose refresh_token Anthropic still trusts. Per-slot
+        # cooldown gate is enforced inside Invoke-WarmAllSlots via
+        # state.last_warmup_at.
         #
-        # Renderer closure: builds a synthetic snapshot where every row
-        # carries Status='warming-up' so the table itself signals the
-        # warmup phase via the Status column. As each peer is processed
-        # the [Auto] footer updates with the per-slot progress; the
-        # table stays the same. DEC 2026 sync envelope around each
-        # repaint matches the polling loop's flicker-free contract.
+        # Renderer closure: builds a synthetic snapshot where every
+        # row carries Status='warming-up' so the table itself
+        # signals the warmup phase via the Status column. As each
+        # slot is processed the [Auto] footer updates with the
+        # per-slot progress; the table stays the same. DEC 2026
+        # sync envelope around each repaint matches the polling
+        # loop's flicker-free contract.
         if ($Auto) {
             $warmingSlots = @(Get-Slots)
-            if ($warmingSlots.Count -ge 2) {
+            if ($warmingSlots.Count -ge 1) {
                 $warmingSnapshot = [pscustomobject]@{
                     Results = @($warmingSlots | ForEach-Object {
                         [pscustomobject]@{
@@ -4150,15 +4189,15 @@ function Invoke-UsageWatch {
                     Format-UsageFrame -Snapshot $warmingSnapshot -Footer $autoLine -AutoThreshold $autoHeaderThresholdInit
                     Write-VTSequence "`e[?2026l"
                 }
-                # Initial frame: the steady-state [Auto] latch + a table
-                # full of 'warming up' rows. The closure repaints in
-                # place as warmup progress events fire.
+                # Initial frame: the steady-state [Auto] latch + a
+                # table full of 'warming up' rows. The closure
+                # repaints in place as warmup progress events fire.
                 & $renderWarmup $lastAutoFooter
-                Invoke-WarmAllSlotsBySwitch -RenderProgress $renderWarmup
-                # Reset the [Auto] latch back to the steady-state string;
-                # the warmup phase emitted transient progress messages
-                # via the renderer (those landed on screen but were not
-                # persisted to $lastAutoFooter).
+                Invoke-WarmAllSlots -RenderProgress $renderWarmup
+                # Reset the [Auto] latch back to the steady-state
+                # string; the warmup phase emitted transient
+                # progress messages via the renderer (those landed
+                # on screen but were not persisted to $lastAutoFooter).
                 $lastAutoFooter = '[Auto] Automatic slot switching is enabled.'
             }
         }

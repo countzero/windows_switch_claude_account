@@ -338,7 +338,7 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-/Set-SlotWarmupTimestamp' {
-        # The cooldown helpers behind Invoke-WarmAllSlotsBySwitch.
+        # The cooldown helpers behind Invoke-WarmAllSlots.
         # Set-SlotWarmupTimestamp must round-trip through the state file
         # and Get-SlotWarmupTimestamp must return $null when no record
         # exists. The Set helper intentionally writes "now" rather than

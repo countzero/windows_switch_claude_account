@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-05-26
+
+### Fixed
+- `sca usage -Watch -Auto` startup warmup now actually warms slots. The 2.3.0 design rotated `.credentials.json` through each slot via `Invoke-SlotSwap` and restored the original, on the premise that the swap itself "activated" each slot from Anthropic's side. This was a no-op: a local file rewrite generates no observable event server-side. Replaced with a direct refresh: `Invoke-WarmAllSlots` calls `Update-SlotTokens` for every saved slot whose access token is at or near expiry, so the first poll sees fresh bearers and returns real bucket numbers for every slot whose `refresh_token` Anthropic still trusts.
+- `Update-SlotTokens` retries `/v1/oauth/token` 429 responses up to `$Script:TokenRefreshRetryMax` times (default 3) with exponential backoff (`$Script:TokenRefreshRetryDelayMs`, default 2 s → 4 s). The refresh endpoint's per-token rate limit unlocks within seconds, so a slot whose first refresh attempt got 429d during a polling tick now self-recovers in the same tick instead of showing `rate-limited` until the user happens to invoke another sca command. Benefits every call path that triggers a refresh: `sca usage`, `sca usage -Watch`, `sca usage -Watch -Auto`, `sca switch`.
+
+### Changed
+- `Invoke-WarmAllSlotsBySwitch` renamed to `Invoke-WarmAllSlots` (the `BySwitch` suffix no longer describes what the function does). The function signature is unchanged; only the orchestrator's body and its rendered progress messages were rewritten.
+- Warmup no longer rotates `.credentials.json` or `~/.claude.json`. The Ctrl-C-safe credentials restore step and the sidecar-less-active refusal both go away with the swap; the warmup is now pure-network and leaves no state behind to roll back. A new 300 ms `$Script:WarmupSpacingMs` sleep between slots dodges per-IP burst rate limits on `/v1/oauth/token`.
+
 ## [2.3.0] - 2026-05-26
 
 ### Added

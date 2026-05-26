@@ -62,6 +62,16 @@ Mock Invoke-RestMethod -ParameterFilter {
 # The few tests that exercise the running guard override this locally.
 Mock Test-ClaudeRunning -MockWith { $false }
 
+# Collapse production sleep tunables to zero so the suite does not
+# spend real seconds inside mocked 429 paths. The retry logic is still
+# exercised end-to-end (mock invocation counts, final-status branches)
+# because $Script:TokenRefreshRetryMax stays at its production value;
+# only the wall-clock wait between attempts goes to zero. Same trick
+# for $Script:WarmupSpacingMs so the warmup loop's per-slot 300 ms
+# pacing does not multiply across many-slot tests.
+$Script:TokenRefreshRetryDelayMs = 0
+$Script:WarmupSpacingMs          = 0
+
 # --- Test fixtures --------------------------------------------------------
 #
 # New-SlotPair: build a slot file + sidecar pair as production save would
