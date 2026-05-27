@@ -3901,40 +3901,53 @@ $Script:UsageWatchMinInterval = 60
 $Script:WarmupSpacingMs       = 300
 $Script:WarmupRefreshingMinMs = 150
 
-# Build the synthetic warmup snapshot scaffold consumed by
-# Invoke-WarmAllSlots. One row per visible slot (filtered by
-# -Name when set), every row initialized with Status='warming-up'
-# and Data=$null. Returns $null when there are no slots to warm
-# (no saved slots, OR -Name matched nothing). The orchestrator's
-# caller renders the snapshot via Format-UsageFrame and passes
-# it (mutated row-by-row) to Invoke-WarmAllSlots.
+# Warmup-as-swap-then-probe orchestrator for `sca usage -Watch -Warmup`.
+# Round-robins through every saved slot in alphabetical order: per slot,
+# Invoke-SlotSwap makes it active (writes .credentials.json AND
+# ~/.claude.json's oauthAccount AND state.active_slot) and Get-SlotUsage
+# probes /api/oauth/usage as the now-active slot. Either throwing collapses
+# into Status='error' on the row; the loop continues with remaining slots.
+# A non-active slot's /api/oauth/usage may report empty bucket data until
+# the slot is made active locally; the swap is what populates cold-slot
+# numbers, the probe is what reads them. Both per slot.
 #
-# Extracted from Invoke-UsageWatch so this scaffold-building
-# logic is unit-testable without entering the alt-screen buffer.
-function New-WarmupScaffold {
-    Param ([string] $Name)
+# Builds the rendered snapshot in place: one row per slot (filtered by
+# -Name when set), each starting at Status='warming-up' with Data=$null,
+# transitioning through 'refreshing' to its real HTTP outcome. The end
+# state is the first frame of the polling loop; the caller wires it to
+# $snapshot and sets $lastPoll = now. Returns $null when no slots match.
+#
+# The original active slot is captured before the loop via Read-ScaState
+# + Find-SlotByName. A finally block restores it via one more Invoke-Slot-
+# Swap so a clean exit (or Ctrl-C, which still runs finally) returns the
+# user where they started. Restore failure logs a yellow advisory naming
+# the slot the user is now active on. No active slot captured (fresh
+# install, sidecar-hidden active) is fine: the finally guard skips the
+# restore and the user ends on the last warmed slot.
+#
+# $Repaint is invoked as: & $Repaint $snapshot.
+# Per-slot latency is bounded at $WarmupRefreshingMinMs (floors the
+# 'refreshing' label's on-screen visibility against warm-cache returns)
+# + swap + HTTP + $WarmupSpacingMs (per-IP burst guard between slots).
+function Invoke-WarmAllSlots {
+    Param (
+        [string]                             $Name,
+        [Parameter(Mandatory)] [scriptblock] $Repaint
+    )
 
     $slots = @(Get-Slots)
+    if ($Name) {
+        $safe  = Get-SafeName $Name
+        $slots = @($slots | Where-Object { $_.Name -eq $safe })
+    }
     if ($slots.Count -lt 1) { return $null }
 
-    $selected = $slots
-    if ($Name) {
-        $safe = Get-SafeName $Name
-        $selected = @($slots | Where-Object { $_.Name -eq $safe })
-    }
-    if ($selected.Count -lt 1) { return $null }
-
-    $rows = @($selected | ForEach-Object {
+    $rows = @($slots | ForEach-Object {
         [pscustomobject]@{
             Name             = $_.Name
             Email            = $_.Email
             Path             = $_.Path
             IsActive         = $_.IsActive
-            # Sidecar carried on the row so Invoke-WarmAllSlots can
-            # pass it straight to Invoke-SlotSwap without re-walking
-            # the filesystem per slot. Get-Slots already filters out
-            # sidecar-less slots, so every row here has a non-null
-            # Sidecar with an oauthAccount block.
             Sidecar          = $_.Sidecar
             Status           = 'warming-up'
             Data             = $null
@@ -3942,200 +3955,57 @@ function New-WarmupScaffold {
             IsCachedFallback = $false
         }
     })
-    return [pscustomobject]@{
-        Results          = $rows
-        NoSlots          = $false
-        HasCacheFallback = $false
-    }
-}
+    $snapshot = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false }
+    & $Repaint $snapshot
 
-# Mutate a single row's Status in the warmup snapshot's Results
-# array, looking up by slot Name. Used by Invoke-WarmAllSlots
-# during the transient 'warming-up' -> 'refreshing' transition.
-# The terminal state for each row (real HTTP outcome from
-# Get-SlotUsage) is copied via the broader Set-WarmupRowResult
-# helper below.
-function Set-WarmupRowStatus {
-    Param (
-        [Parameter(Mandatory)] [pscustomobject] $Snapshot,
-        [Parameter(Mandatory)] [string]         $Name,
-        [Parameter(Mandatory)] [string]         $Status
-    )
-    foreach ($row in $Snapshot.Results) {
-        if ($row.Name -eq $Name) {
-            $row.Status = $Status
-            return
-        }
-    }
-}
-
-# Apply a Get-SlotUsage result onto the matching snapshot row.
-# Mirrors the row construction in Get-UsageSnapshot (Status,
-# Data, Error, IsCachedFallback) so the warmup phase's terminal
-# rows are byte-identical to what a regular poll would produce.
-# Add-Member -Force tolerates rows that lack the Error /
-# IsCachedFallback properties (the scaffold sets Data only).
-function Set-WarmupRowResult {
-    Param (
-        [Parameter(Mandatory)] [pscustomobject] $Snapshot,
-        [Parameter(Mandatory)] [string]         $Name,
-        [Parameter(Mandatory)] [pscustomobject] $Result
-    )
-    foreach ($row in $Snapshot.Results) {
-        if ($row.Name -eq $Name) {
-            $row.Status = $Result.Status
-            $row.Data   = $Result.Data
-            if ($Result.PSObject.Properties.Match('Error').Count -gt 0) {
-                $row | Add-Member -NotePropertyName Error -NotePropertyValue $Result.Error -Force
-            }
-            if ($Result.PSObject.Properties.Match('IsCachedFallback').Count -gt 0) {
-                $row | Add-Member -NotePropertyName IsCachedFallback -NotePropertyValue $Result.IsCachedFallback -Force
-            }
-            return
-        }
-    }
-}
-
-# Warmup-as-swap-then-probe orchestrator for `sca usage -Watch -Warmup`.
-# Round-robins through every saved slot in alphabetical order: makes
-# the slot active via Invoke-SlotSwap (same bytes-on-disk effect as
-# `sca switch <name>`), then probes /api/oauth/usage for it. Restores
-# the original active slot in a finally block so the user ends warmup
-# where they started.
-#
-# v2.5.0 design history. v2.3.0 introduced a similar round-robin
-# (`Invoke-WarmAllSlotsBySwitch`) on the premise that the swap
-# "activated" each slot from Anthropic's side. v2.3.1's CHANGELOG
-# called that a no-op based on warm-slot measurements and replaced it
-# with a token-refresh-only design (v2.4.0's `Invoke-WarmAllSlots`).
-# v2.5.0 reinstates the round-robin under the empirical observation
-# that the v2.3.1 measurements only covered slots already primed by
-# recent manual switches; a truly cold slot's /api/oauth/usage may
-# return empty bucket data until the slot is made active. The swap
-# itself is a local file rewrite of .credentials.json plus a regex
-# substitution into ~/.claude.json's oauthAccount block; the probe
-# is what produces the row's bucket numbers. Both steps must run
-# per slot for cold-slot bucket data to populate reliably.
-#
-# UI contract: the caller passes a synthetic snapshot whose Results
-# array carries one row per slot, each with Status set to 'warming-up'
-# and Data set to $null. This function mutates each row in place
-# (refreshing -> real HTTP outcome) and calls the zero-arg $Repaint
-# closure to trigger a redraw. Aggregate bars (rendered above the
-# table by Format-UsageFrame -IncludeAggregateBars) include only the
-# rows whose Status='ok'; they grow as slots complete during warmup.
-#
-# Side-effect ladder (per slot, in order):
-#   1. Mark the row 'refreshing' + repaint.
-#   2. Start-Sleep $Script:WarmupRefreshingMinMs so the 'refreshing'
-#      cell is visible for at least the perceptual floor (~150 ms)
-#      even when Get-SlotUsage returns from a warm cache in <100 ms.
-#      Placed BEFORE the swap+probe so total per-slot latency is
-#      bounded at $WarmupRefreshingMinMs + swap + HTTP + $WarmupSpacingMs.
-#   3. Invoke-SlotSwap into this slot. Writes .credentials.json AND
-#      ~/.claude.json's oauthAccount AND state.active_slot. Either
-#      this throwing OR Get-SlotUsage throwing collapses into
-#      Status='error' on the row; the exception's message lands in
-#      the row's Error tail.
-#   4. Get-SlotUsage probes /api/oauth/usage as the now-active slot.
-#   5. Copy Status / Data / Error / IsCachedFallback onto the row.
-#      Repaint.
-#   6. Start-Sleep $Script:WarmupSpacingMs before the next slot.
-#
-# End-of-loop restore: original active slot is captured before the
-# loop via Read-ScaState + Find-SlotByName. A finally block calls
-# Invoke-SlotSwap once more with that slot, so a clean exit (or
-# Ctrl-C, which still runs finally) returns the user to where they
-# started. Restore failure logs a yellow advisory naming the slot
-# the user is now active on; the credentials swap is observable
-# through `sca list` even when the advisory is suppressed inside
-# the watch alt-buffer. No active slot captured (fresh install,
-# sidecar-hidden active) is fine: the finally guard skips the
-# restore and the user ends on the last warmed slot.
-#
-# Refusal cases (no-op, no repaint):
-#   * Zero rows in the snapshot's Results array: nothing to warm.
-#
-# Callback ownership lives in Invoke-UsageWatch where the DEC 2026
-# sync envelope and alt-screen state live; making this function
-# call back into the watch's renderer keeps the per-frame
-# composition out of the orchestrator and makes the orchestrator
-# itself unit-testable by passing a mock repaint closure.
-function Invoke-WarmAllSlots {
-    Param (
-        [Parameter(Mandatory)] [pscustomobject] $Snapshot,
-        [Parameter(Mandatory)] [scriptblock]    $Repaint
-    )
-
-    $rows = @($Snapshot.Results)
-    if ($rows.Count -lt 1) {
-        # No rows: nothing to warm. The polling loop itself will
-        # render the "no slots saved yet" frame.
-        return
-    }
-
-    # Capture original active slot for the end-of-loop restore. Null
-    # is fine: the finally guards on $origActive and silently ends on
-    # the last-warmed slot in the sidecar-hidden / fresh-install case.
     $origActive = $null
-    $origState  = Read-ScaState
-    if ($origState -and $origState.active_slot) {
-        $origActive = Find-SlotByName -Name $origState.active_slot
+    $state = Read-ScaState
+    if ($state -and $state.active_slot) {
+        $origActive = Find-SlotByName -Name $state.active_slot
     }
 
-    $total = $rows.Count
-    $i = 0
+    $last = $rows.Count - 1
     try {
-        foreach ($row in $rows) {
-            $i++
+        for ($i = 0; $i -le $last; $i++) {
+            $row = $rows[$i]
+            $row.Status = 'refreshing'
+            & $Repaint $snapshot
 
-            Set-WarmupRowStatus -Snapshot $Snapshot -Name $row.Name -Status 'refreshing'
-            & $Repaint
-
-            # Floor the on-screen visibility of the 'refreshing' label
-            # so a warm-cache Get-SlotUsage (which can return in <100 ms)
-            # doesn't flash the cell unreadably. Floor set by
-            # $Script:WarmupRefreshingMinMs (150 ms in production, 0 in
-            # tests via tests/Common.ps1). Conditional on >0 so the test
-            # override produces zero overhead, not a degenerate Start-Sleep.
+            # Conditional sleep so a test-side zero override is a no-op
+            # rather than a degenerate Start-Sleep 0.
             if ($Script:WarmupRefreshingMinMs -gt 0) {
                 Start-Sleep -Milliseconds $Script:WarmupRefreshingMinMs
             }
 
-            # Swap then probe: makes this slot active before /api/oauth/usage
-            # fires, so the probe runs as "active-slot traffic" (the v2.5.0
-            # round-robin contract). Either operation throwing collapses
-            # into Status='error' with the exception message; subsequent
-            # slots continue. 6>$null suppresses any [Switch] / [Sync]
-            # advisory Invoke-SlotSwap or Get-SlotUsage might emit so it
-            # doesn't paint outside the DEC 2026 sync envelope.
+            # 6>$null suppresses [Switch] / [Sync] advisories so they
+            # don't paint outside the DEC 2026 sync envelope.
             try {
                 Invoke-SlotSwap -Slot $row 6>$null
-                $result = Get-SlotUsage -SlotPath $row.Path 6>$null
+                $r = Get-SlotUsage -SlotPath $row.Path 6>$null
+                $row.Status           = $r.Status
+                $row.Data             = $r.Data
+                $row.Error            = $r.Error
+                $row.IsCachedFallback = [bool]$r.IsCachedFallback
             }
             catch {
-                $result = [pscustomobject]@{
-                    Status = 'error'
-                    Error  = $_.Exception.Message
-                }
+                $row.Status = 'error'
+                $row.Error  = $_.Exception.Message
             }
+            & $Repaint $snapshot
 
-            Set-WarmupRowResult -Snapshot $Snapshot -Name $row.Name -Result $result
-            & $Repaint
-
-            if ($i -lt $total) { Start-Sleep -Milliseconds $Script:WarmupSpacingMs }
+            if ($i -lt $last -and $Script:WarmupSpacingMs -gt 0) {
+                Start-Sleep -Milliseconds $Script:WarmupSpacingMs
+            }
         }
     }
     finally {
-        # Best-effort restore of the original active slot. Survives
-        # Ctrl-C (PowerShell runs finally on terminating exceptions);
-        # a process crash leaves state pointing at the last-warmed
-        # slot, recoverable by manual `sca switch`.
         if ($origActive) {
             try { Invoke-SlotSwap -Slot $origActive 6>$null }
             catch { Write-Color "[Warmup] Restore of original active slot '$($origActive.Name)' failed: $($_.Exception.Message). You are now active on '$($rows[-1].Name)'." 'Yellow' 6>$null }
         }
     }
+    $snapshot.HasCacheFallback = @($rows | Where-Object IsCachedFallback).Count -gt 0
+    return $snapshot
 }
 
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
@@ -4255,63 +4125,28 @@ function Invoke-UsageWatch {
         # mode is engaged before the first rotation event.
         $lastAutoFooter = if ($Auto) { '[Auto] Automatic slot switching is enabled.' } else { $null }
 
-        # -Warmup startup pass. Performs the first /api/oauth/usage
-        # poll serially per slot via Invoke-WarmAllSlots, with per-slot
-        # progress visible in the Status column. The end state of
-        # warmup IS the first frame of the polling loop: we hand the
-        # populated snapshot off via $snapshot = $warmingSnapshot and
-        # set $lastPoll = [DateTime]::Now so the loop's first iteration
-        # falls into the redraw branch (not the poll branch).
-        #
-        # Synthetic snapshot scaffold: every row starts with
-        # Status='warming-up', Data=$null. Invoke-WarmAllSlots calls
-        # Get-SlotUsage per slot and copies the result onto the row.
-        # The terminal Status is the real HTTP outcome ('ok' /
-        # 'rate-limited' / 'no-oauth' / 'expired' / 'unauthorized' /
-        # 'error'); there is no fake 'warmed' terminal label that
-        # could lie about a future the poll hasn't reached. DEC 2026
-        # sync envelope around each repaint matches the polling loop's
-        # flicker-free contract.
+        # -Warmup startup pass. Invoke-WarmAllSlots does the per-slot
+        # swap-then-probe round-robin and returns a populated snapshot
+        # we hand off to the polling loop as its first frame ($lastPoll
+        # = now so the loop's first iteration falls into the redraw
+        # branch, not the poll branch). Reconcile first so a cross-
+        # account swap landed since the last sca call is captured before
+        # any slot bytes are read; matches the polling loop's per-poll
+        # contract below.
         if ($Warmup) {
-            # Reconcile first so a cross-account swap that landed
-            # since the last sca call is captured into slot files
-            # before we read their bytes. Matches the polling loop's
-            # per-poll behavior (line below the warmup block). The
-            # warmup phase IS the first poll; same contract applies.
             Invoke-Reconcile 6>$null | Out-Null
 
-            $warmingSnapshot = New-WarmupScaffold -Name $Name
-            if ($null -ne $warmingSnapshot) {
-                # AutoThreshold drives the right-aligned "▶ switching
-                # slot at N%" header indicator. Only render it when
-                # -Auto is also set; a -Warmup-only run shouldn't
-                # surface the rotation header.
-                $autoHeaderThresholdInit = if ($Auto) { $Threshold } else { 0 }
-                $renderWarmup = {
-                    Write-VTSequence "`e[?2026h`e[2J`e[H"
-                    Format-UsageFrame -Name $Name -Snapshot $warmingSnapshot -Footer $lastAutoFooter -AutoThreshold $autoHeaderThresholdInit
-                    Write-VTSequence "`e[?2026l"
-                }
-                # Initial frame: every row 'warming up'. The closure
-                # repaints in place as Invoke-WarmAllSlots mutates
-                # per-row Status / Data values.
-                & $renderWarmup
-                Invoke-WarmAllSlots -Snapshot $warmingSnapshot -Repaint $renderWarmup
-                # Recompute the snapshot's HasCacheFallback flag from
-                # the now-populated rows (matches Get-UsageSnapshot).
-                $warmingSnapshot.HasCacheFallback = @($warmingSnapshot.Results | Where-Object { $_.IsCachedFallback }).Count -gt 0
-
-                # Hand the populated snapshot off to the polling loop
-                # as its first frame; set $lastPoll = now so the loop's
-                # first iteration falls into the redraw branch (not the
-                # poll branch). Without this handoff, the polling loop
-                # would immediately re-poll every slot and double the
-                # startup network IO.
-                $snapshot = $warmingSnapshot
+            # -Auto's right-aligned "▶ switching slot at N%" header
+            # indicator stays off when -Auto is absent.
+            $autoHeader = if ($Auto) { $Threshold } else { 0 }
+            $snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
+                Param ($snap)
+                Write-VTSequence "`e[?2026h`e[2J`e[H"
+                Format-UsageFrame -Name $Name -Snapshot $snap -Footer $lastAutoFooter -AutoThreshold $autoHeader
+                Write-VTSequence "`e[?2026l"
+            }
+            if ($null -ne $snapshot) {
                 $lastPoll = [DateTime]::Now
-                # Set the terminal title once based on the warmed-up
-                # snapshot so it doesn't flash empty until the polling
-                # loop's next iteration fires Write-VTSequence.
                 try {
                     Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot -Aggregate:$Auto))
                 } catch { Write-Verbose "Warmup title set deferred: $_" }

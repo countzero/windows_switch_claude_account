@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `Invoke-WarmAllSlots` now builds its own snapshot from `Get-Slots` and returns it; the caller no longer pre-builds a scaffold and threads it in. Drops `New-WarmupScaffold`, `Set-WarmupRowStatus`, and `Set-WarmupRowResult`; the three helpers were trivial wrappers for shape-building and row mutation that the orchestrator could do inline. Signature change: `Invoke-WarmAllSlots -Name <string> -Repaint <scriptblock>` (repaint invoked as `& $Repaint $snapshot`). No user-visible behavior change: round-robin order, swap-then-probe contract, perceptual-floor sleep, restore-on-exit, and Status-column transitions are all preserved.
+
 ## [2.5.0] - 2026-05-27
 
 ### Changed
