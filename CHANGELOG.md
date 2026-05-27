@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-05-27
+
+### Added
+- `-Warmup` flag on `sca usage -Watch`. Performs the first `/api/oauth/usage` poll serially per slot before entering the steady-state polling loop, with per-slot progress visible in the Status column: `warming up` (queued) -> `refreshing` (call in flight) -> the real HTTP outcome (`ok` / `rate-limited` / `no-oauth` / `expired` / `unauthorized` / `error`). End-state snapshot is handed off to the polling loop as its first frame; no immediate re-poll. Independent of `-Auto`: works with bare `-Watch` (`sca usage -Watch -Warmup`) and combines with `-Auto` (`sca usage -Watch -Auto -Warmup`). Aggregate Session/Week bars grow as `ok` rows accumulate during the warmup phase, so the layout during warmup matches the steady-state polling layout.
+
+### Changed
+- `sca usage -Watch -Auto` no longer warms slots automatically. Pass `-Warmup` to restore the prior behavior (`sca usage -Watch -Auto -Warmup`). Users who want the auto-rotation policy without the per-slot startup latency get a faster `-Auto` invocation; users who want warmup without auto-rotation can use it standalone.
+
+### Removed
+- `state.last_warmup_at` map and the `Get-SlotWarmupTimestamp` / `Set-SlotWarmupTimestamp` helpers. The previous warmup design needed a per-slot 60 s cooldown to avoid thrashing `/v1/oauth/token` across rapid `-Watch -Auto` restarts. The new warmup calls `Get-SlotUsage` (which is what the polling loop does anyway and has its own cache + retry budget), so the cooldown's premise is gone. Legacy state files carrying the field continue to parse cleanly; the field is silently ignored and dropped by the next state-mutating write. State schema stays at `1`.
+- `$Script:WarmupCooldownMs` constant.
+
 ## [2.3.1] - 2026-05-26
 
 ### Fixed

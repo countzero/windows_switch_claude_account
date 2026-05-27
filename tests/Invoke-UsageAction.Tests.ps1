@@ -2061,6 +2061,36 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Invoke-UsageAction -Warmup integration' {
+        # Action-level contract for the -Warmup flag: the runtime guard
+        # rejects -Warmup without -Watch (catches direct callers that
+        # bypass the top-level Param block's parameter-set binding),
+        # AND the flag does NOT extend the Claude-Code refusal that
+        # -Auto carries (warmup is pure-network and never writes
+        # ~/.claude.json, so Test-ClaudeRunning is not consulted).
+
+        It '-Warmup without -Watch is rejected by the runtime guard' {
+            { Invoke-UsageAction -Warmup 6>$null } | Should -Throw -ExpectedMessage '*-Warmup requires -Watch*'
+        }
+
+        It '-Watch -Warmup with Claude Code running is NOT refused (warmup never writes ~/.claude.json)' {
+            # Distinct from -Watch -Auto, which DOES refuse when Claude
+            # Code is running. -Warmup runs pure-network refresh calls
+            # against /v1/oauth/token; nothing it does competes with
+            # Claude Code's in-memory ~/.claude.json cache.
+            Mock Test-ClaudeRunning -MockWith { $true }
+
+            if (-not [Console]::IsOutputRedirected) {
+                Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
+                return
+            }
+            # The Claude-Code guard does not fire, so execution falls
+            # through to the IsOutputRedirected guard inside
+            # Invoke-UsageWatch (Pester captures stdout, so this throws).
+            { Invoke-UsageWatch -Warmup 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
+        }
+    }
+
     Context 'anthropic-version header propagation' {
         # Defense-in-depth: assert that every authenticated request adds
         # the anthropic-version header so a future tightening at any
@@ -2130,11 +2160,13 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context "'warming-up' status renders as 'warming up' in the table" {
-        # The synthetic snapshot built by Invoke-UsageWatch's `-Auto`
-        # startup carries Status='warming-up' on every row; that status
-        # must (a) render as the space-separated 'warming up' label in
-        # the Status column and (b) map to Yellow via Get-StatusColor.
+    Context "warmup status labels render correctly in the table" {
+        # The synthetic snapshot built by Invoke-UsageWatch's `-Warmup`
+        # startup carries Status='warming-up' on every row initially;
+        # Invoke-WarmAllSlots mutates each row's Status as it processes
+        # the slot. All five warmup status labels must render with the
+        # correct space-separated form in the Status column AND map to
+        # the documented color via Get-StatusColor.
 
         BeforeEach {
             $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
@@ -2169,30 +2201,192 @@ Describe 'switch_claude_account' {
             $out | Should -Match '—'
         }
 
+        It "Format-UsageTable renders 'refreshing' in the Status column" {
+            # Slot name deliberately does NOT contain the label
+            # substring so the regex matches the Status column only,
+            # not the Account column.
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Email 'alpha@test.local' | Out-Null
+
+            $synth = @(Get-Slots) | ForEach-Object {
+                [pscustomobject]@{
+                    Name     = $_.Name
+                    Email    = $_.Email
+                    Path     = $_.Path
+                    IsActive = $_.IsActive
+                    Status   = 'refreshing'
+                    Data     = $null
+                }
+            }
+
+            $out = Format-UsageTable -Results $synth 6>&1 | Out-String
+
+            ([regex]::Matches($out, '\brefreshing\b')).Count | Should -Be 1
+        }
+
         It 'Get-StatusColor maps "warming up" to Yellow' {
             Get-StatusColor -Label 'warming up' -IsActive $false | Should -Be 'Yellow'
             Get-StatusColor -Label 'warming up' -IsActive $true  | Should -Be 'Yellow'
         }
+
+        It 'Get-StatusColor maps "refreshing" to Yellow' {
+            # 'refreshing' is transient like 'warming up' -> Yellow.
+            Get-StatusColor -Label 'refreshing' -IsActive $false | Should -Be 'Yellow'
+            Get-StatusColor -Label 'refreshing' -IsActive $true  | Should -Be 'Yellow'
+        }
+    }
+
+    Context 'New-WarmupScaffold' {
+        # Builds the synthetic warmup snapshot scaffold consumed by
+        # Invoke-WarmAllSlots. Filesystem-aware (reads Get-Slots) but
+        # pure (no HTTP); a unit test can drop slot pairs and assert
+        # on the returned snapshot shape.
+
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+        }
+
+        It 'returns $null when no slots are saved' {
+            New-WarmupScaffold | Should -BeNullOrEmpty
+        }
+
+        It 'builds one row per saved slot with Status="warming-up" and Data=$null' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Email 'a@test.local' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Email 'b@test.local' | Out-Null
+
+            $snap = New-WarmupScaffold
+
+            $snap.NoSlots          | Should -BeFalse
+            $snap.HasCacheFallback | Should -BeFalse
+            $snap.Results.Count    | Should -Be 2
+            foreach ($row in $snap.Results) {
+                $row.Status           | Should -Be 'warming-up'
+                $row.Data             | Should -BeNullOrEmpty
+                $row.IsCachedFallback | Should -BeFalse
+            }
+            ($snap.Results | ForEach-Object { $_.Name }) | Should -Be @('alpha','bravo')
+        }
+
+        It '-Name filter narrows to a single slot' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Email 'a@test.local' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Email 'b@test.local' | Out-Null
+
+            $snap = New-WarmupScaffold -Name 'bravo'
+
+            $snap.Results.Count   | Should -Be 1
+            $snap.Results[0].Name | Should -Be 'bravo'
+        }
+
+        It '-Name filter returns $null when no slot matches' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Email 'a@test.local' | Out-Null
+
+            New-WarmupScaffold -Name 'missing' | Should -BeNullOrEmpty
+        }
+
+        It '-Name filter passes through Get-SafeName sanitization' {
+            # Get-SafeName replaces invalid Windows chars with _.
+            # An input with such chars should still resolve to the
+            # matching sanitized slot name.
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work_slot' -Email 'w@test.local' | Out-Null
+
+            $snap = New-WarmupScaffold -Name 'work?slot'
+
+            $snap                       | Should -Not -BeNullOrEmpty
+            $snap.Results[0].Name       | Should -Be 'work_slot'
+        }
+    }
+
+    Context 'Set-WarmupRowStatus' {
+        # The mutation helper Invoke-WarmAllSlots uses to publish per-slot
+        # state into the synthetic snapshot. Pure in-memory; no filesystem.
+
+        It 'mutates the matching row Status in place' {
+            $snap = [pscustomobject]@{
+                Results = @(
+                    [pscustomobject]@{ Name = 'a'; Status = 'warming-up' }
+                    [pscustomobject]@{ Name = 'b'; Status = 'warming-up' }
+                )
+            }
+            Set-WarmupRowStatus -Snapshot $snap -Name 'b' -Status 'refreshing'
+
+            ($snap.Results | Where-Object Name -eq 'a').Status | Should -Be 'warming-up'
+            ($snap.Results | Where-Object Name -eq 'b').Status | Should -Be 'refreshing'
+        }
+
+        It 'silently no-ops when the row is not found' {
+            $snap = [pscustomobject]@{
+                Results = @(
+                    [pscustomobject]@{ Name = 'a'; Status = 'warming-up' }
+                )
+            }
+            { Set-WarmupRowStatus -Snapshot $snap -Name 'missing' -Status 'refreshing' } | Should -Not -Throw
+            ($snap.Results | Where-Object Name -eq 'a').Status | Should -Be 'warming-up'
+        }
+    }
+
+    Context 'Set-WarmupRowResult' {
+        # Copies a Get-SlotUsage result onto the matching snapshot row.
+        # Mirrors the field set Get-UsageSnapshot would produce so the
+        # warmup phase's terminal rows are byte-identical to a normal
+        # poll's rows.
+
+        It 'copies Status / Data / Error / IsCachedFallback onto the matching row' {
+            $snap = [pscustomobject]@{
+                Results = @(
+                    [pscustomobject]@{
+                        Name             = 'a'
+                        Status           = 'refreshing'
+                        Data             = $null
+                        Error            = $null
+                        IsCachedFallback = $false
+                    }
+                )
+            }
+            $result = [pscustomobject]@{
+                Status           = 'ok'
+                Data             = [pscustomobject]@{ five_hour = $null }
+                Error            = $null
+                IsCachedFallback = $true
+            }
+
+            Set-WarmupRowResult -Snapshot $snap -Name 'a' -Result $result
+
+            $row = $snap.Results | Where-Object Name -eq 'a'
+            $row.Status           | Should -Be 'ok'
+            $row.Data             | Should -Not -BeNullOrEmpty
+            $row.IsCachedFallback | Should -BeTrue
+        }
+
+        It 'silently no-ops when the row is not found' {
+            $snap = [pscustomobject]@{
+                Results = @(
+                    [pscustomobject]@{ Name = 'a'; Status = 'refreshing'; Data = $null }
+                )
+            }
+            $result = [pscustomobject]@{ Status = 'ok'; Data = $null }
+            { Set-WarmupRowResult -Snapshot $snap -Name 'missing' -Result $result } | Should -Not -Throw
+            ($snap.Results | Where-Object Name -eq 'a').Status | Should -Be 'refreshing'
+        }
     }
 
     Context 'Invoke-WarmAllSlots' {
-        # The orchestrator behind `-Auto` startup warmup. Tests focus on:
-        #   * slot enumeration order
-        #   * fresh-token shortcut (no refresh call when token has > 60 s of life)
-        #   * stale-token path: Update-SlotTokens fires once per stale slot
-        #   * per-slot cooldown gate (1 attempt per slot per minute)
-        #   * cooldown timestamp written BEFORE the network call
-        #   * renderer callback contract
-        #   * no-OAuth slot is surfaced and skipped without a refresh attempt
-        #   * a refresh that throws does not abort the loop
+        # The orchestrator behind `-Warmup` startup. Tests focus on:
+        #   * snapshot-mutation contract: per-row Status / Data transitions
+        #   * Get-SlotUsage's outcomes (ok / rate-limited / no-oauth /
+        #     expired / unauthorized / error) land verbatim on the row
+        #   * Get-SlotUsage thrown -> Status='error' on the row
+        #   * empty snapshot -> no-op
+        #
+        # Contract (v2.4.0 redesign): warmup IS the first poll. The
+        # orchestrator calls Get-SlotUsage per slot and copies the
+        # result (Status / Data / Error / IsCachedFallback) onto the
+        # matching row in $Snapshot.Results. There are no warmup-
+        # specific terminal labels; each row's terminal Status is
+        # the real HTTP outcome the polling loop would produce.
 
         BeforeAll {
             # Pester 5 scoping: functions defined in BeforeAll live for
-            # every It in this Context; inline `function` declarations
-            # would only exist for the BeforeEach that defined them.
-            # The body builds a real claudeAiOauth slot + paired
-            # sidecar so Get-Slots returns the slot and Get-SlotOAuth
-            # reads its tokens.
+            # every It in this Context.
             function New-WarmupSlot {
                 Param (
                     [string] $Name,
@@ -2210,23 +2404,49 @@ Describe 'switch_claude_account' {
                 return New-SlotPair -CredDir $script:CredDirPath -Name $Name -Email $Email -Content $payload
             }
 
-            # Mock-friendly refresh response factory: returns a parsed
-            # JSON object shaped like Anthropic's actual /v1/oauth/token
-            # success response.
-            function New-RefreshOk {
-                Param ([string] $Suffix = 'NEW')
+            # Build a synthetic warmup snapshot for the current saved
+            # slots. Mirrors the shape Invoke-UsageWatch constructs in
+            # the production code path: one row per slot, Status set
+            # to the initial 'warming-up' state, Data $null.
+            function New-WarmupSnapshot {
+                $rows = @(Get-Slots) | ForEach-Object {
+                    [pscustomobject]@{
+                        Name             = $_.Name
+                        Email            = $_.Email
+                        Path             = $_.Path
+                        IsActive         = $_.IsActive
+                        Status           = 'warming-up'
+                        Data             = $null
+                        Error            = $null
+                        IsCachedFallback = $false
+                    }
+                }
                 return [pscustomobject]@{
-                    access_token  = "sk-ant-oat-$Suffix"
-                    refresh_token = "sk-ant-ort-$Suffix"
-                    expires_in    = 3600
+                    Results          = @($rows)
+                    NoSlots          = ($rows.Count -lt 1)
+                    HasCacheFallback = $false
                 }
             }
 
-            function New-Refresh429 {
-                $resp  = [pscustomobject]@{ StatusCode = 429 }
-                $inner = [System.Exception]::new('429 Too Many Requests')
-                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
-                return $inner
+            # Look up a row's Status by slot name.
+            function Get-RowStatus {
+                Param ($Snapshot, [string] $Name)
+                return ($Snapshot.Results | Where-Object { $_.Name -eq $Name }).Status
+            }
+
+            # Mock /api/oauth/usage success payload with bucket data.
+            function New-UsageOk {
+                Param ([int] $FiveHour = 25, [int] $SevenDay = 10)
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{
+                        utilization = $FiveHour
+                        resets_at   = (Get-Date).AddHours(2).ToString('o')
+                    }
+                    seven_day = [pscustomobject]@{
+                        utilization = $SevenDay
+                        resets_at   = (Get-Date).AddDays(5).ToString('o')
+                    }
+                }
             }
         }
 
@@ -2234,173 +2454,260 @@ Describe 'switch_claude_account' {
             $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
             $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
-            $script:PastMs   = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
         }
 
-        It 'no-ops when 0 slots are saved (renderer never invoked, no refresh calls)' {
-            $script:rendered = @()
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
-                throw 'should not be called'
+        It 'no-ops when snapshot has 0 rows (repaint never invoked, no HTTP calls)' {
+            $script:repaints = 0
+            Mock Invoke-RestMethod -MockWith { throw 'should not be called' }
+
+            # Empty snapshot (no slots saved).
+            $snap = [pscustomobject]@{
+                Results          = @()
+                NoSlots          = $true
+                HasCacheFallback = $false
             }
-            $cb = { Param ([string] $a) $script:rendered += $a }
 
-            { Invoke-WarmAllSlots -RenderProgress $cb } | Should -Not -Throw
+            { Invoke-WarmAllSlots -Snapshot $snap -Repaint { $script:repaints++ } } | Should -Not -Throw
 
-            $script:rendered.Count | Should -Be 0
-            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' }
+            $script:repaints | Should -Be 0
         }
 
-        It 'fresh tokens: every slot is skipped without a refresh; renderer reports the shortcut' {
+        It 'fresh-token slots: Get-SlotUsage returns ok; rows end Status="ok" with bucket data' {
             New-WarmupSlot -Name 'a' -ExpiresAt $script:FutureMs | Out-Null
             New-WarmupSlot -Name 'b' -ExpiresAt $script:FutureMs | Out-Null
 
-            $script:rendered = @()
+            # Mock /api/oauth/usage to return ok with data; /v1/oauth/token
+            # should NOT be called because the tokens are fresh.
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith { New-UsageOk }
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
-                throw 'should not be called when tokens are fresh'
+                throw 'token endpoint should not be called for fresh tokens'
             }
 
-            Invoke-WarmAllSlots -RenderProgress { Param ([string] $a) $script:rendered += $a }
+            $snap = New-WarmupSnapshot
+            $script:repaints = 0
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { $script:repaints++ }
 
-            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' }
-            ($script:rendered | Where-Object { $_ -match "skipping 'a' .*token already fresh" }).Count | Should -Be 1
-            ($script:rendered | Where-Object { $_ -match "skipping 'b' .*token already fresh" }).Count | Should -Be 1
+            (Get-RowStatus $snap 'a') | Should -Be 'ok'
+            (Get-RowStatus $snap 'b') | Should -Be 'ok'
+            # Each row carries bucket data from the Get-SlotUsage result.
+            ($snap.Results | Where-Object Name -eq 'a').Data.five_hour.utilization | Should -Be 25
+            ($snap.Results | Where-Object Name -eq 'b').Data.seven_day.utilization | Should -Be 10
+            # Two repaints per slot: 'refreshing' transition + terminal Status.
+            $script:repaints | Should -Be 4
         }
 
-        It 'stale tokens: each slot triggers one refresh in alphabetical order' {
-            New-WarmupSlot -Name 'a' -ExpiresAt $script:PastMs | Out-Null
-            New-WarmupSlot -Name 'b' -ExpiresAt $script:PastMs | Out-Null
-            New-WarmupSlot -Name 'c' -ExpiresAt $script:PastMs | Out-Null
+        It 'slot enumeration is alphabetical' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
 
-            $script:refreshOrder = @()
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
-                $rt = ($Body | ConvertFrom-Json).refresh_token
-                $script:refreshOrder += $rt
-                return New-RefreshOk
+            $script:order = @()
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith {
+                # Capture which slot's access token is in the Authorization header.
+                $bearer = $Headers['Authorization']
+                $script:order += ($bearer -replace '^Bearer sk-ant-oat-', '')
+                return New-UsageOk
             }
 
-            $script:rendered = @()
-            Invoke-WarmAllSlots -RenderProgress { Param ([string] $a) $script:rendered += $a }
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
 
-            # One refresh per slot, alphabetical.
-            $script:refreshOrder | Should -Be @('sk-ant-ort-a','sk-ant-ort-b','sk-ant-ort-c')
-            ($script:rendered | Where-Object { $_ -match "refreshing 'a' \(1/3\)" }).Count | Should -Be 1
-            ($script:rendered | Where-Object { $_ -match "refreshing 'b' \(2/3\)" }).Count | Should -Be 1
-            ($script:rendered | Where-Object { $_ -match "refreshing 'c' \(3/3\)" }).Count | Should -Be 1
+            $script:order | Should -Be @('a','b','c')
         }
 
-        It 'cooldown: a slot warmed less than 60 s ago is skipped (no refresh, renderer reports skip)' {
-            New-WarmupSlot -Name 'cold-stale' -ExpiresAt $script:PastMs | Out-Null
-            New-WarmupSlot -Name 'just-warmed' -ExpiresAt $script:PastMs | Out-Null
-            $state = Read-ScaState
-            if (-not $state) {
-                $state = [pscustomobject]@{
-                    schema = 1; active_slot = $null; last_sync_hash = $null
-                    last_warmup_at = @{}
-                }
-            }
-            $state.last_warmup_at['just-warmed'] = [DateTimeOffset]::UtcNow.AddSeconds(-30).ToUnixTimeMilliseconds()
-            Write-ScaState -State $state
+        It 'Get-SlotUsage returns rate-limited: row ends Status="rate-limited"' {
+            New-WarmupSlot -Name 'limited' | Out-Null
 
-            $script:refreshOrder = @()
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
-                $rt = ($Body | ConvertFrom-Json).refresh_token
-                $script:refreshOrder += $rt
-                return New-RefreshOk
+            # /api/oauth/usage returns 429. Get-SlotUsage's existing
+            # cache-miss + retry-after-5s logic surfaces this as
+            # rate-limited when the retry also fails. Start-Sleep is
+            # mocked so the suite doesn't burn the 5s wait.
+            Mock Start-Sleep -MockWith { }
+            $resp  = [pscustomobject]@{ StatusCode = 429 }
+            $inner = [System.Exception]::new('429 Too Many Requests')
+            $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith {
+                throw $inner
             }
 
-            $script:rendered = @()
-            Invoke-WarmAllSlots -RenderProgress { Param ([string] $a) $script:rendered += $a }
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
 
-            # Only the un-cooled stale slot triggers a refresh.
-            $script:refreshOrder | Should -Be @('sk-ant-ort-cold-stale')
-            ($script:rendered | Where-Object { $_ -match "skipping 'just-warmed' .*warmed \d+s ago" }).Count | Should -Be 1
+            (Get-RowStatus $snap 'limited') | Should -Be 'rate-limited'
         }
 
-        It 'cooldown: a slot warmed more than 60 s ago is refreshed normally' {
-            New-WarmupSlot -Name 'long-cooled' -ExpiresAt $script:PastMs | Out-Null
-
-            $state = Read-ScaState
-            if (-not $state) {
-                $state = [pscustomobject]@{
-                    schema = 1; active_slot = $null; last_sync_hash = $null
-                    last_warmup_at = @{}
-                }
-            }
-            $state.last_warmup_at['long-cooled'] = [DateTimeOffset]::UtcNow.AddSeconds(-90).ToUnixTimeMilliseconds()
-            Write-ScaState -State $state
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith { New-RefreshOk }
-
-            Invoke-WarmAllSlots -RenderProgress { Param ([string] $a) }
-
-            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' }
-        }
-
-        It 'records last_warmup_at BEFORE the refresh so a refresh that throws still consumes the cooldown' {
-            New-WarmupSlot -Name 'broken' -ExpiresAt $script:PastMs | Out-Null
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
-                throw [System.Exception]::new('synthetic refresh failure')
-            }
-
-            $script:rendered = @()
-            Invoke-WarmAllSlots -RenderProgress { Param ([string] $a) $script:rendered += $a }
-
-            # The failed refresh left a cooldown timestamp behind so
-            # a rapid restart will skip the broken slot rather than
-            # retrying it within 60s.
-            $stamp = Get-SlotWarmupTimestamp -Name 'broken'
-            $stamp | Should -BeGreaterThan 0
-            # Renderer received the truncated failure tail.
-            ($script:rendered | Where-Object { $_ -match "'broken' refresh failed:" }).Count | Should -Be 1
-        }
-
-        It 'no-OAuth slot: surfaced and skipped without a refresh attempt; cooldown still consumed' {
+        It 'no-OAuth slot: row ends Status="no-oauth" without any usage call' {
             # API-key-only slot has no claudeAiOauth section.
             $payload = '{"apiKey":"sk-ant-api-..."}'
             New-SlotPair -CredDir $script:CredDirPath -Name 'apikey' -Email 'a@b.com' -Content $payload | Out-Null
 
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
-                throw 'should not be called for no-OAuth slot'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith {
+                throw 'usage endpoint should not be called for no-OAuth slot'
             }
 
-            $script:rendered = @()
-            Invoke-WarmAllSlots -RenderProgress { Param ([string] $a) $script:rendered += $a }
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
 
-            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' }
-            ($script:rendered | Where-Object { $_ -match "skipping 'apikey' .*no OAuth material" }).Count | Should -Be 1
-            (Get-SlotWarmupTimestamp -Name 'apikey') | Should -BeGreaterThan 0
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+            (Get-RowStatus $snap 'apikey') | Should -Be 'no-oauth'
         }
 
-        It 'refresh-endpoint 429 (persistent across all retries): warmup surfaces failure and continues to next slot' {
-            # Slot names chosen so alphabetical iteration hits the
-            # stuck one first; the assertion below verifies the
-            # second slot still runs after the first exhausts its
-            # retry budget.
-            New-WarmupSlot -Name 'slot-a-stuck' -ExpiresAt $script:PastMs | Out-Null
-            New-WarmupSlot -Name 'slot-b-next'  -ExpiresAt $script:PastMs | Out-Null
+        It 'Get-SlotUsage throws: row ends Status="error" with the exception message' {
+            New-WarmupSlot -Name 'crash' | Out-Null
 
-            # Both slots refresh from the same mock; slot-a-stuck's
-            # refresh exhausts the retry budget (all 3 attempts 429);
-            # slot-b-next's refresh succeeds.
-            $script:tokenCalls = 0
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
-                $script:tokenCalls++
-                $rt = ($Body | ConvertFrom-Json).refresh_token
-                if ($rt -eq 'sk-ant-ort-slot-a-stuck') {
-                    throw (New-Refresh429)
-                }
-                return New-RefreshOk
+            # Replace Get-SlotUsage with a mock that throws. Done by
+            # mocking Get-SlotOAuth (Get-SlotUsage's first call) to
+            # throw an unexpected exception that gets re-thrown by
+            # Get-SlotOAuth itself rather than caught into Status='error'.
+            # Simulating the outer try/catch around Get-SlotUsage in
+            # Invoke-WarmAllSlots: we need the Get-SlotUsage call itself
+            # to throw, not just return an error result. Use a function-
+            # level mock.
+            Mock Get-SlotUsage -MockWith {
+                throw [System.Exception]::new('synthetic Get-SlotUsage failure')
             }
 
-            $script:rendered = @()
-            Invoke-WarmAllSlots -RenderProgress { Param ([string] $a) $script:rendered += $a }
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
 
-            # stuck got RetryMax attempts; next got 1.
-            $script:tokenCalls | Should -Be ($Script:TokenRefreshRetryMax + 1)
-            # stuck surfaced as a failure but next still ran.
-            ($script:rendered | Where-Object { $_ -match "'slot-a-stuck' refresh failed:" }).Count | Should -Be 1
-            ($script:rendered | Where-Object { $_ -match "refreshing 'slot-b-next' \(2/2\)" }).Count | Should -Be 1
+            (Get-RowStatus $snap 'crash') | Should -Be 'error'
+            ($snap.Results | Where-Object Name -eq 'crash').Error | Should -Match 'synthetic'
+        }
+
+        It 'mixed rates: some slots ok, others rate-limited - all surface their real outcomes' {
+            New-WarmupSlot -Name 'good' | Out-Null
+            New-WarmupSlot -Name 'limited' | Out-Null
+
+            Mock Start-Sleep -MockWith { }
+            $resp  = [pscustomobject]@{ StatusCode = 429 }
+            $inner = [System.Exception]::new('429 Too Many Requests')
+            $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith {
+                # 'limited' uses access token "sk-ant-oat-limited".
+                if ($Headers['Authorization'] -eq 'Bearer sk-ant-oat-limited') {
+                    throw $inner
+                }
+                return New-UsageOk
+            }
+
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
+
+            (Get-RowStatus $snap 'good')    | Should -Be 'ok'
+            (Get-RowStatus $snap 'limited') | Should -Be 'rate-limited'
+        }
+
+        It 'sleeps $Script:WarmupRefreshingMinMs BEFORE Get-SlotUsage per slot (minimum on-screen visibility floor)' {
+            # Pin the contract that the 'refreshing' label is visible
+            # for at least $Script:WarmupRefreshingMinMs before the
+            # HTTP call (which would otherwise overwrite it on a
+            # warm-cache fast return). Two assertions:
+            #   1. Start-Sleep was called with -Milliseconds = the
+            #      configured floor exactly once per slot.
+            #   2. The Start-Sleep call fired BEFORE Invoke-RestMethod
+            #      (ordering matters; post-HTTP would defeat the floor's
+            #      purpose). Captured via a shared event log.
+            New-WarmupSlot -Name 'a' -ExpiresAt $script:FutureMs | Out-Null
+            New-WarmupSlot -Name 'b' -ExpiresAt $script:FutureMs | Out-Null
+
+            # Promote the floor to a non-zero value for this test only.
+            # Common.ps1 zeroes it for the suite at large; we restore in
+            # finally so subsequent tests in this Context see the zero.
+            $previousFloor = $Script:WarmupRefreshingMinMs
+            $Script:WarmupRefreshingMinMs = 200
+
+            try {
+                # Shared timeline so we can check ordering (Start-Sleep
+                # fires before the slot's first Invoke-RestMethod).
+                $script:timeline = @()
+
+                # Capture Start-Sleep calls with their -Milliseconds arg
+                # AND a position marker. Pester's Mock cannot capture
+                # the call timestamp natively, but a counter-based event
+                # log is sufficient for the ordering assertion.
+                Mock Start-Sleep -MockWith {
+                    Param ($Milliseconds, $Seconds)
+                    $script:timeline += [pscustomobject]@{
+                        Kind = 'Start-Sleep'
+                        Ms   = $Milliseconds
+                    }
+                }
+
+                Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith {
+                    $script:timeline += [pscustomobject]@{
+                        Kind = 'Invoke-RestMethod'
+                        Ms   = $null
+                    }
+                    return New-UsageOk
+                }
+
+                $snap = New-WarmupSnapshot
+                Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
+
+                # Assertion 1: every slot's first Start-Sleep entry
+                # carries the configured floor. The warmup also sleeps
+                # $Script:WarmupSpacingMs between slots, but Common.ps1
+                # has that at zero for tests; the only non-zero sleeps
+                # in the timeline are the floor sleeps.
+                $floorSleeps = @($script:timeline | Where-Object {
+                    $_.Kind -eq 'Start-Sleep' -and $_.Ms -eq 200
+                })
+                $floorSleeps.Count | Should -Be 2 -Because (
+                    'Invoke-WarmAllSlots must Start-Sleep $Script:WarmupRefreshingMinMs ' +
+                    'once per slot (2 slots in this test). Found ' +
+                    "$($floorSleeps.Count) sleeps at 200 ms.")
+
+                # Assertion 2: the FIRST Start-Sleep at 200 ms fires
+                # BEFORE the FIRST Invoke-RestMethod. Walking the
+                # timeline by index: a 200 ms sleep must precede the
+                # first HTTP call (otherwise the floor is post-HTTP and
+                # defeats its purpose).
+                $firstSleepIdx = ($script:timeline | ForEach-Object { $_ } | Where-Object {
+                    $_.Kind -eq 'Start-Sleep' -and $_.Ms -eq 200
+                } | Select-Object -First 1 | ForEach-Object {
+                    [array]::IndexOf($script:timeline, $_)
+                })
+                $firstHttpIdx = ($script:timeline | ForEach-Object { $_ } | Where-Object {
+                    $_.Kind -eq 'Invoke-RestMethod'
+                } | Select-Object -First 1 | ForEach-Object {
+                    [array]::IndexOf($script:timeline, $_)
+                })
+
+                $firstSleepIdx | Should -BeLessThan $firstHttpIdx -Because (
+                    'the floor Start-Sleep must fire BEFORE the per-slot ' +
+                    'Invoke-RestMethod call; post-HTTP sleep would not floor ' +
+                    "the 'refreshing' label's on-screen visibility.")
+            }
+            finally {
+                $Script:WarmupRefreshingMinMs = $previousFloor
+            }
+        }
+
+        It 'skips the floor Start-Sleep when $Script:WarmupRefreshingMinMs is 0 (test override is zero-overhead)' {
+            # Inverse of the assertion above. Common.ps1 sets the floor
+            # to 0; the guarded `if (>0)` block in Invoke-WarmAllSlots
+            # must skip Start-Sleep entirely so the suite does not incur
+            # degenerate Start-Sleep calls.
+            New-WarmupSlot -Name 'a' -ExpiresAt $script:FutureMs | Out-Null
+
+            # Confirm Common.ps1 zeroed the constant (defense-in-depth
+            # vs. test leakage from the prior It).
+            $Script:WarmupRefreshingMinMs | Should -Be 0
+
+            $script:zeroSleepCalls = 0
+            Mock Start-Sleep -MockWith {
+                Param ($Milliseconds, $Seconds)
+                if ($Milliseconds -eq 0) { $script:zeroSleepCalls++ }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith { New-UsageOk }
+
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
+
+            $script:zeroSleepCalls | Should -Be 0 -Because (
+                'with $Script:WarmupRefreshingMinMs = 0 the guarded `if (>0)` ' +
+                'block must skip Start-Sleep entirely; a degenerate Start-Sleep 0 ' +
+                'would surface as a counted call here.')
         }
     }
 
