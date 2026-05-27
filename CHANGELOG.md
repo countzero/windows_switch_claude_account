@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-05-27
+
+### Changed
+- `sca usage -Watch -Warmup` round-robins through every saved slot before entering the steady-state polling loop: per slot in alphabetical order, `Invoke-SlotSwap` makes it active (writes `.credentials.json` + `~/.claude.json` `oauthAccount` + `state.active_slot`), then `Get-SlotUsage` probes `/api/oauth/usage` as the now-active slot, then the next slot. A `finally` block restores the original active slot via one more swap so the user ends warmup where they started. Reinstates the v2.3.0 design that was removed in v2.3.1. The v2.3.1 CHANGELOG called the round-robin a no-op based on warm-slot measurements; v2.5.0 reverses that under the empirical observation that the measurement only covered slots already primed by recent manual switches, and a truly cold slot's `/api/oauth/usage` can return empty bucket data until the slot is made active locally. Swap and probe failures both surface as `Status='error'` with the exception message in the row's Error tail; the loop continues with the remaining slots.
+- `Test-ClaudeRunning` guard extended to `-Warmup` (pre-loop refusal). Mirrors `-Auto`'s existing guard since both flags now write `~/.claude.json`'s `oauthAccount` block, which Claude Code keeps in an in-memory cache. Combined guard message branches on whether `-Auto` or `-Warmup` triggered it.
+- `New-WarmupScaffold` row projection carries the slot's `Sidecar` so `Invoke-WarmAllSlots` can pass the row straight to `Invoke-SlotSwap` without re-walking the filesystem per slot.
+
 ## [2.4.0] - 2026-05-27
 
 ### Added

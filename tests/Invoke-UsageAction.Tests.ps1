@@ -2065,28 +2065,38 @@ Describe 'switch_claude_account' {
         # Action-level contract for the -Warmup flag: the runtime guard
         # rejects -Warmup without -Watch (catches direct callers that
         # bypass the top-level Param block's parameter-set binding),
-        # AND the flag does NOT extend the Claude-Code refusal that
-        # -Auto carries (warmup is pure-network and never writes
-        # ~/.claude.json, so Test-ClaudeRunning is not consulted).
+        # AND -Watch -Warmup with Claude Code running is refused at
+        # startup (v2.5.0: warmup writes ~/.claude.json's oauthAccount
+        # block via Invoke-SlotSwap, same race as -Auto).
 
         It '-Warmup without -Watch is rejected by the runtime guard' {
             { Invoke-UsageAction -Warmup 6>$null } | Should -Throw -ExpectedMessage '*-Warmup requires -Watch*'
         }
 
-        It '-Watch -Warmup with Claude Code running is NOT refused (warmup never writes ~/.claude.json)' {
-            # Distinct from -Watch -Auto, which DOES refuse when Claude
-            # Code is running. -Warmup runs pure-network refresh calls
-            # against /v1/oauth/token; nothing it does competes with
-            # Claude Code's in-memory ~/.claude.json cache.
+        It '-Watch -Warmup with Claude Code running throws at startup before entering the alt-screen buffer' {
+            # v2.5.0: warmup performs Invoke-SlotSwap per slot in a
+            # round-robin, which writes ~/.claude.json. Same race as
+            # -Auto against Claude Code's in-memory ~/.claude.json
+            # cache, so the same pre-loop guard applies. Test mirrors
+            # the -Auto version above; the throw message names the
+            # specific flag.
             Mock Test-ClaudeRunning -MockWith { $true }
 
+            { Invoke-UsageWatch -Warmup 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*sca usage -Warmup*'
+        }
+
+        It '-Watch -Warmup with Claude Code NOT running passes the startup guard and short-circuits on IsOutputRedirected' {
+            # Test-ClaudeRunning's default mock returns $false. The guard
+            # silently passes; the IsOutputRedirected guard throws next
+            # because Pester's stdout is redirected. On an interactive
+            # terminal (test runner invoked without redirection),
+            # IsOutputRedirected is $false and the alt-screen would
+            # blank the terminal; skip in that case (same pattern as
+            # the -Auto sibling test above).
             if (-not [Console]::IsOutputRedirected) {
                 Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
                 return
             }
-            # The Claude-Code guard does not fire, so execution falls
-            # through to the IsOutputRedirected guard inside
-            # Invoke-UsageWatch (Pester captures stdout, so this throws).
             { Invoke-UsageWatch -Warmup 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
         }
     }
@@ -2406,8 +2416,10 @@ Describe 'switch_claude_account' {
 
             # Build a synthetic warmup snapshot for the current saved
             # slots. Mirrors the shape Invoke-UsageWatch constructs in
-            # the production code path: one row per slot, Status set
-            # to the initial 'warming-up' state, Data $null.
+            # the production code path (New-WarmupScaffold): one row
+            # per slot, Sidecar carried so Invoke-WarmAllSlots can
+            # pass the row to Invoke-SlotSwap, Status set to
+            # 'warming-up', Data $null.
             function New-WarmupSnapshot {
                 $rows = @(Get-Slots) | ForEach-Object {
                     [pscustomobject]@{
@@ -2415,6 +2427,7 @@ Describe 'switch_claude_account' {
                         Email            = $_.Email
                         Path             = $_.Path
                         IsActive         = $_.IsActive
+                        Sidecar          = $_.Sidecar
                         Status           = 'warming-up'
                         Data             = $null
                         Error            = $null
@@ -2454,6 +2467,14 @@ Describe 'switch_claude_account' {
             $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
             $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+
+            # Default Invoke-SlotSwap mock: no-op success. Production
+            # warmup calls this per slot (v2.5.0 round-robin), but the
+            # orchestration tests in this Context are about loop
+            # contract, not swap mechanics. Tests that assert on swap
+            # behavior (call order, restore, failure mid-loop) override
+            # this mock locally.
+            Mock Invoke-SlotSwap -MockWith { }
         }
 
         It 'no-ops when snapshot has 0 rows (repaint never invoked, no HTTP calls)' {
@@ -2708,6 +2729,120 @@ Describe 'switch_claude_account' {
                 'with $Script:WarmupRefreshingMinMs = 0 the guarded `if (>0)` ' +
                 'block must skip Start-Sleep entirely; a degenerate Start-Sleep 0 ' +
                 'would surface as a counted call here.')
+        }
+
+        # v2.5.0 swap-then-probe round-robin contract. The orchestrator
+        # now calls Invoke-SlotSwap before each slot's Get-SlotUsage so
+        # the probe runs as "active-slot traffic", then restores the
+        # original active slot in a finally block. These tests pin the
+        # call shape (per-slot + final restore), the alphabetical order
+        # of swap calls, and the resilience to mid-loop swap failure.
+
+        It 'calls Invoke-SlotSwap once per slot in alphabetical order before each Get-SlotUsage' {
+            # The Mock from BeforeEach is a no-op success. Override
+            # locally to record the slot name passed to each swap call.
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith { New-UsageOk }
+
+            New-WarmupSlot -Name 'c' | Out-Null
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
+
+            # First three entries: alphabetical round-robin. The fourth
+            # entry is the end-of-loop restore (no original active slot
+            # in this test setup -> no restore call). Assert the first
+            # three explicitly so this test stays focused on round-robin
+            # order; restore behavior has its own test below.
+            $script:swapNames[0..2] | Should -Be @('a', 'b', 'c')
+        }
+
+        It 'restores the original active slot via one final Invoke-SlotSwap after the loop' {
+            # Set up a state file marking slot 'a' as the original
+            # active slot, so Invoke-WarmAllSlots's capture pass picks
+            # it up. The restore call should reference slot 'a' even
+            # though the loop ends on slot 'b' (alphabetically last).
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith { New-UsageOk }
+
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
+
+            # Expected call order: a (round-robin), b (round-robin), a (restore).
+            $script:swapNames | Should -Be @('a', 'b', 'a')
+        }
+
+        It 'skips the final restore swap when no original active slot is captured' {
+            # No state file written: Read-ScaState returns $null,
+            # $origActive stays $null, the finally block silently skips
+            # the restore. User ends on the last-warmed slot.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            $script:swapCount = 0
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapCount++
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith { New-UsageOk }
+
+            $snap = New-WarmupSnapshot
+            Invoke-WarmAllSlots -Snapshot $snap -Repaint { }
+
+            # Exactly 2 swaps (one per slot, no restore). If the
+            # restore fired the count would be 3.
+            $script:swapCount | Should -Be 2
+        }
+
+        It 'mid-loop Invoke-SlotSwap failure marks the row Status="error", continues with remaining slots, and still runs the restore' {
+            # Throw on slot 'b', succeed on others. The orchestrator
+            # should: surface 'b' as Status='error' with the exception
+            # message, still process 'c', and still run the final
+            # restore swap.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+                if ($Slot.Name -eq 'b') {
+                    throw [System.Exception]::new('synthetic swap failure on b')
+                }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith { New-UsageOk }
+
+            $snap = New-WarmupSnapshot
+            { Invoke-WarmAllSlots -Snapshot $snap -Repaint { } } | Should -Not -Throw
+
+            (Get-RowStatus $snap 'a') | Should -Be 'ok'
+            (Get-RowStatus $snap 'b') | Should -Be 'error'
+            ($snap.Results | Where-Object Name -eq 'b').Error | Should -Match 'synthetic'
+            (Get-RowStatus $snap 'c') | Should -Be 'ok'
+
+            # Call order: a (round-robin), b (round-robin, throws),
+            # c (round-robin), a (restore).
+            $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
         }
     }
 
