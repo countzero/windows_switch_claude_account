@@ -6,8 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-05-28
+
 ### Changed
-- `Invoke-WarmAllSlots` now builds its own snapshot from `Get-Slots` and returns it; the caller no longer pre-builds a scaffold and threads it in. Drops `New-WarmupScaffold`, `Set-WarmupRowStatus`, and `Set-WarmupRowResult`; the three helpers were trivial wrappers for shape-building and row mutation that the orchestrator could do inline. Signature change: `Invoke-WarmAllSlots -Name <string> -Repaint <scriptblock>` (repaint invoked as `& $Repaint $snapshot`). No user-visible behavior change: round-robin order, swap-then-probe contract, perceptual-floor sleep, restore-on-exit, and Status-column transitions are all preserved.
+- **BREAKING**: `sca usage -Watch -Warmup` now sends a billable `/v1/messages` request per slot to open each slot's server-side 5h usage window, replacing v2.5.0's `/api/oauth/usage` probe. Cost: ~2 tokens per slot per warmup on the pinned Haiku model (`claude-haiku-4-5`), fractions of a cent. Subsequent `/api/oauth/usage` polls then return real bucket data instead of empty / rate-limited responses for cold slots. The v2.5.0 swap-then-probe rationale claimed the local swap was sufficient to prime cold-slot bucket data; that claim is retracted. Empirically the 5h window is server-side state keyed on actual billable requests within the window; only a real `/v1/messages` call opens it. `-Warmup` remains opt-in.
+- Status column vocabulary: per-slot in-flight warmup label renamed `refreshing` → `priming`. Internal field `$Script:WarmupRefreshingMinMs` renamed to `$Script:WarmupPrimingMinMs` (visibility floor for the new label).
+- Probe-after-prime dropped: warmup ends at the prime call. The watch loop's first poll lands within ~1 s of warmup completion and renders real bucket data then; the extra `/api/oauth/usage` round-trip per slot was redundant.
+- `Invoke-WarmAllSlots` now builds its own snapshot from `Get-Slots` and returns it; the caller no longer pre-builds a scaffold and threads it in. Drops `New-WarmupScaffold`, `Set-WarmupRowStatus`, and `Set-WarmupRowResult`; the three helpers were trivial wrappers for shape-building and row mutation that the orchestrator could do inline. Signature: `Invoke-WarmAllSlots -Name <string> -Repaint <scriptblock>` (repaint invoked as `& $Repaint $snapshot`).
+
+### Added
+- `Invoke-SlotPrime` helper. Sends a minimal billable `/v1/messages` request (input "." + `max_tokens=1`, ~2 tokens total) for a slot to open its server-side 5h session window. Mirrors `Get-SlotUsage`'s status vocabulary (`ok` / `no-oauth` / `expired` / `rate-limited` / `unauthorized` / `error`) but returns no `Data` payload (the prime is for the side effect). Used exclusively by `Invoke-WarmAllSlots`.
+- `$Script:MessagesEndpoint`, `$Script:PrimeModel` (pinned to `claude-haiku-4-5`), `$Script:PrimeTimeoutSec` constants under the unofficial-endpoints block. Drifts with Anthropic model deprecations; same re-extraction recipe as the existing constants.
 
 ## [2.5.0] - 2026-05-27
 

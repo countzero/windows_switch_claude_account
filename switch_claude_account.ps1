@@ -107,16 +107,20 @@ Param (
     [ValidateRange(1, 100)]
     [int] $Threshold = 95,
 
-    # -Warmup: in `sca usage -Watch`, pre-refresh every saved slot's
-    # OAuth tokens via Invoke-WarmAllSlots before the first poll. Bound
-    # to the 'Watch' parameter set so the binder rejects -Warmup without
+    # -Warmup: in `sca usage -Watch`, prime every saved slot before the
+    # first poll. For each slot in alphabetical order, Invoke-WarmAllSlots
+    # makes the slot active (Invoke-SlotSwap) then sends a minimal
+    # billable /v1/messages request (Invoke-SlotPrime) so Anthropic opens
+    # a server-side 5h session window for the slot. Subsequent
+    # /api/oauth/usage polls then return real bucket data instead of
+    # empty/rate-limited responses. Cost: ~2 tokens per slot per warmup
+    # on the pinned Haiku model (fractions of a cent). Bound to the
+    # 'Watch' parameter set so the binder rejects -Warmup without
     # -Watch. Independent of -Auto: works with bare -Watch and with
-    # -Watch -Auto. Without -Warmup, the watch loop polls immediately
-    # and any slot whose access token expired during /v1/oauth/token's
-    # per-token rate-limit window shows `rate-limited` on the first
-    # frame until the next poll lands inside the unlock window. Pure
-    # network operation; never writes ~/.claude.json, so the
-    # Test-ClaudeRunning guard is not extended.
+    # -Watch -Auto. The pre-loop Test-ClaudeRunning guard refuses to
+    # operate when Claude Code is running because the per-slot swap
+    # writes ~/.claude.json's oauthAccount, which Claude Code keeps in
+    # an in-memory cache.
     [Parameter(ParameterSetName = 'Watch')]
     [switch] $Warmup,
 
@@ -174,7 +178,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '2.5.0'
+$Script:ScriptVersion = '3.0.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -210,6 +214,7 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 # flow and does not accept our refresh tokens.
 $Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
 $Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
+$Script:MessagesEndpoint    = "https://api.anthropic.com/v1/messages"
 $Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
 $Script:OAuthClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 $Script:AnthropicBeta       = "oauth-2025-04-20"
@@ -223,6 +228,17 @@ $Script:AnthropicApiVersion = "2023-06-01"
 $Script:UsageUserAgent      = "claude-code/2.1.119"
 $Script:UsageTimeoutSec     = 5
 $Script:ProfileTimeoutSec   = 10
+# Priming model + timeout for Invoke-SlotPrime. /v1/messages accepts the
+# claudeAiOauth bearer when paired with the same anthropic-beta header
+# the OAuth-namespaced endpoints use; the OAuth client flow is allowed
+# to call the standard messages API. Pin Haiku as the cheapest current
+# model so each prime costs ~2 tokens (1 in, 1 out). Drifts when
+# Anthropic deprecates the pinned model id; same maintenance recipe as
+# the constants above. /v1/messages can be slower than /api/oauth/usage
+# (model load on cold path), so the timeout is more generous than
+# $UsageTimeoutSec.
+$Script:PrimeModel          = "claude-haiku-4-5"
+$Script:PrimeTimeoutSec     = 15
 
 # Retry policy for /v1/oauth/token on a 429 response. Empirically the
 # refresh endpoint's per-token rate limiter has a short cooldown
@@ -883,10 +899,10 @@ function Show-Help {
         "  $cmd usage                             # show Session + Week usage for every slot",
         "  $cmd usage -Watch                      # live refresh; 60s polls; Ctrl-C to quit",
         "  $cmd usage -Watch -Interval 300        # slower refresh (floor is 60s)",
-        "  $cmd usage -Watch -Warmup              # pre-refresh slot tokens before polling",
+        "  $cmd usage -Watch -Warmup              # prime all slots (billable; ~2 tokens/slot on Haiku)",
         "  $cmd usage -Watch -Auto                # auto-rotate when active slot hits 95% (OpenCode only)",
         "  $cmd usage -Watch -Auto -Threshold 90  # rotate earlier (default is 95%)",
-        "  $cmd usage -Watch -Auto -Warmup        # auto-rotate and warm up all available slots",
+        "  $cmd usage -Watch -Auto -Warmup        # auto-rotate and prime all available slots",
         "  $cmd usage -Json                       # emit usage as JSON for scripting",
         "  $cmd usage -NoColor                    # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
         "",
@@ -2418,6 +2434,117 @@ function Get-SlotProfile {
     return [pscustomobject]@{ Status = 'ok'; Email = $email }
 }
 
+# Send a minimal billable request to /v1/messages so Anthropic opens a
+# server-side 5h session window for this slot. Subsequent /api/oauth/usage
+# calls against the slot then return real bucket data instead of an empty
+# response (or 429, depending on the account's state). Cost: ~2 tokens
+# per call on the pinned Haiku model (1 input "." + max_tokens=1 output).
+# Used exclusively by Invoke-WarmAllSlots when `sca usage -Watch -Warmup`
+# is set.
+#
+# Returns the same status vocabulary as Get-SlotUsage so the warmup
+# orchestrator can copy the result onto the row without translation:
+#   @{ Status = 'ok' }                                # 2xx; window opened
+#   @{ Status = 'no-oauth' }                          # slot has no claudeAiOauth
+#   @{ Status = 'expired'; Error = <msg> }            # token expired AND refresh failed (non-429)
+#   @{ Status = 'rate-limited' }                      # 429 from refresh OR messages endpoint
+#   @{ Status = 'unauthorized' }                      # 401/403 from messages endpoint
+#   @{ Status = 'error'; Error = <msg> }              # network / shape / other
+#
+# Unlike Get-SlotUsage there is no Data payload (the prime is for the
+# side effect, not the response body) and no per-slot cache (the response
+# carries nothing worth replaying). 429 handling mirrors Get-SlotUsage's
+# token-endpoint catch but without the cache fallback path: a clean
+# 'rate-limited' status is the only signal available.
+function Invoke-SlotPrime {
+    Param (
+        [String] $SlotPath
+    )
+
+    # Suppress PowerShell's 'Web request' progress activity so it does
+    # not paint over the watch loop's alt-screen buffer. Same rationale
+    # as Get-SlotUsage / Get-SlotProfile / Update-SlotTokens.
+    $ProgressPreference = 'SilentlyContinue'
+
+    try {
+        $info = Get-SlotOAuth -SlotPath $SlotPath
+    }
+    catch {
+        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
+    }
+
+    if (-not $info.HasOAuth) {
+        return [pscustomobject]@{ Status = 'no-oauth' }
+    }
+
+    $accessToken = $info.AccessToken
+
+    # Refresh if expired OR within a 60s grace window; mirrors
+    # Get-SlotUsage / Get-SlotProfile.
+    $threshold = [DateTime]::UtcNow.AddSeconds(60)
+    if ($info.ExpiresAt -and $info.ExpiresAt -lt $threshold) {
+        try {
+            $accessToken = Update-SlotTokens -SlotPath $SlotPath
+        }
+        catch {
+            # 429 from the token endpoint -> clean 'rate-limited' status
+            # rather than 'expired: <long 429 message>'. No cache to fall
+            # back on (priming is fire-and-forget; nothing useful to
+            # replay).
+            if (Test-Is429 $_.Exception) {
+                return [pscustomobject]@{ Status = 'rate-limited' }
+            }
+            return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
+        }
+    }
+
+    $headers = @{
+        'Authorization'     = "Bearer $accessToken"
+        'anthropic-beta'    = $Script:AnthropicBeta
+        'anthropic-version' = $Script:AnthropicApiVersion
+        'Content-Type'      = 'application/json'
+        'User-Agent'        = $Script:UsageUserAgent
+    }
+
+    # Minimal billable payload. `max_tokens=1` caps output; content is a
+    # single "." so the input is one token. Aggregate cost: ~2 tokens
+    # per slot per warmup on the pinned Haiku model (fractions of a cent).
+    $body = [pscustomobject]@{
+        model      = $Script:PrimeModel
+        max_tokens = 1
+        messages   = @(
+            [pscustomobject]@{
+                role    = 'user'
+                content = '.'
+            }
+        )
+    } | ConvertTo-Json -Depth 5 -Compress
+
+    try {
+        Invoke-RestMethod -Method Post `
+                          -Uri $Script:MessagesEndpoint `
+                          -Headers $headers `
+                          -Body $body `
+                          -TimeoutSec $Script:PrimeTimeoutSec `
+                          -ErrorAction Stop | Out-Null
+        return [pscustomobject]@{ Status = 'ok' }
+    }
+    catch {
+        $status = $null
+        $resp   = $_.Exception.Response
+        if ($resp -and $resp.StatusCode) {
+            $status = [int]$resp.StatusCode
+        }
+        if ($status -eq 401 -or $status -eq 403) {
+            return [pscustomobject]@{ Status = 'unauthorized' }
+        }
+        if ($status -eq 429) {
+            return [pscustomobject]@{ Status = 'rate-limited' }
+        }
+        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
+    }
+}
+
 # Coerce a reset-timestamp value (ISO-8601 string, DateTime, DateTimeOffset,
 # or null/empty) to a [DateTimeOffset], or $null on missing / unparseable
 # input. Centralizes the parser shared by Format-ResetDelta /
@@ -2655,13 +2782,13 @@ function Get-StatusColor {
         # the user immediately knows the row is in flight, not in
         # steady state.
         '^warming up'    { return 'Yellow' }
-        # 'refreshing' is the per-slot in-flight state during the
-        # warmup pass: the /api/oauth/usage call is running for this
-        # row right now. Once the call completes, the row transitions
-        # directly to a real HTTP status ('ok' / 'rate-limited' /
-        # 'no-oauth' / 'expired' / 'unauthorized' / 'error'), which
-        # are already mapped above.
-        '^refreshing$'   { return 'Yellow' }
+        # 'priming' is the per-slot in-flight state during the warmup
+        # pass: Invoke-SlotPrime's /v1/messages POST is running for
+        # this row right now. Once the call completes, the row
+        # transitions directly to a real HTTP status ('ok' /
+        # 'rate-limited' / 'no-oauth' / 'expired' / 'unauthorized' /
+        # 'error'), which are already mapped above.
+        '^priming$'      { return 'Yellow' }
         default          { return 'Gray' }
     }
 }
@@ -2906,15 +3033,15 @@ function Format-UsageTable {
             # 'warming-up' is the transient initial label rendered when
             # Invoke-WarmAllSlots starts iterating slots on `-Watch
             # -Warmup` startup. Synthetic snapshot rows carry it; the
-            # warmup pass mutates each row's Status to 'refreshing'
-            # while its /api/oauth/usage call is in flight, then to the
+            # warmup pass mutates each row's Status to 'priming'
+            # while its /v1/messages call is in flight, then to the
             # real HTTP outcome ('ok' / 'rate-limited' / 'no-oauth' /
             # 'expired' / 'unauthorized' / 'error') once the call
             # returns. The hyphenated internal value renders space-
             # separated to match the existing label convention
             # ('rate limited' / 'limited 5h' / 'near limit').
             'warming-up'    { 'warming up' }
-            'refreshing'    { 'refreshing' }
+            'priming'       { 'priming' }
             default         { [string]$r.Status }
         }
 
@@ -3487,8 +3614,9 @@ function Invoke-UsageAction {
         # reporting lags real consumption; range enforced by
         # [ValidateRange(1,100)] on the top-level Param block.
         [int]    $Threshold = 95,
-        # -Warmup: pre-refresh every saved slot's OAuth tokens before the
-        # first poll. Requires -Watch. Independent of -Auto.
+        # -Warmup: prime every saved slot via a billable /v1/messages
+        # request before the first poll. Requires -Watch. Independent
+        # of -Auto.
         [switch] $Warmup
     )
 
@@ -3881,39 +4009,50 @@ function Invoke-AutoRotationStep {
 $Script:UsageWatchMinInterval = 60
 
 # Inter-slot spacing during the warmup loop. After each slot is
-# probed, sleep this many milliseconds before moving to the next.
-# Cheap insurance against per-IP burst rate-limits on
-# /api/oauth/usage: 300 ms between calls keeps two-slot pools well
-# under typical burst thresholds while adding only ~300 ms * (N-1)
-# of startup latency. Tunable for tests (Pester overrides to zero).
+# primed, sleep this many milliseconds before moving to the next.
+# Cheap insurance against per-IP burst rate-limits on /v1/messages:
+# 300 ms between calls keeps two-slot pools well under typical burst
+# thresholds while adding only ~300 ms * (N-1) of startup latency.
+# Tunable for tests (Pester overrides to zero).
 #
-# Minimum on-screen visibility for the per-slot transient 'refreshing'
-# row state during warmup. The 'refreshing' label is painted into the
-# frame, then Get-SlotUsage runs (HTTP), then the terminal-status
-# label replaces it. Without this floor, a warm-cache or fast-LAN
-# Get-SlotUsage can return in <100 ms, flashing the 'refreshing'
-# cell unreadably. 150 ms is the perceptual lower bound for a label
-# the user is meant to read; below that the eye sees a flicker
-# rather than a state. Sleep is placed BEFORE Get-SlotUsage (not
-# after) so the floor adds at most one 150 ms * N latency penalty
-# regardless of HTTP timing, and stacks linearly with $WarmupSpacingMs
-# rather than racing it. Tunable for tests (Pester overrides to zero).
-$Script:WarmupSpacingMs       = 300
-$Script:WarmupRefreshingMinMs = 150
+# Minimum on-screen visibility for the per-slot transient 'priming'
+# row state during warmup. The 'priming' label is painted into the
+# frame, then Invoke-SlotPrime runs (HTTP POST to /v1/messages), then
+# the terminal-status label replaces it. Without this floor, a fast-
+# LAN prime can return in <100 ms, flashing the 'priming' cell
+# unreadably. 150 ms is the perceptual lower bound for a label the
+# user is meant to read; below that the eye sees a flicker rather
+# than a state. Sleep is placed BEFORE Invoke-SlotPrime (not after)
+# so the floor adds at most one 150 ms * N latency penalty regardless
+# of HTTP timing, and stacks linearly with $WarmupSpacingMs rather
+# than racing it. Tunable for tests (Pester overrides to zero).
+$Script:WarmupSpacingMs    = 300
+$Script:WarmupPrimingMinMs = 150
 
-# Warmup-as-swap-then-probe orchestrator for `sca usage -Watch -Warmup`.
+# Warmup-as-swap-then-prime orchestrator for `sca usage -Watch -Warmup`.
 # Round-robins through every saved slot in alphabetical order: per slot,
 # Invoke-SlotSwap makes it active (writes .credentials.json AND
-# ~/.claude.json's oauthAccount AND state.active_slot) and Get-SlotUsage
-# probes /api/oauth/usage as the now-active slot. Either throwing collapses
+# ~/.claude.json's oauthAccount AND state.active_slot) and Invoke-SlotPrime
+# sends a minimal billable /v1/messages request so Anthropic opens a
+# server-side 5h session window for the slot. Either throwing collapses
 # into Status='error' on the row; the loop continues with remaining slots.
-# A non-active slot's /api/oauth/usage may report empty bucket data until
-# the slot is made active locally; the swap is what populates cold-slot
-# numbers, the probe is what reads them. Both per slot.
+#
+# Why billable priming instead of an /api/oauth/usage probe: a non-active
+# slot's /api/oauth/usage returns empty bucket data (or 429) until a
+# server-side 5h session window has been opened, which only a billable
+# request can do. v2.5.0's swap-then-probe rationale was wrong; this
+# entry retracts that claim. Cost: ~2 tokens per slot per warmup on the
+# pinned Haiku model (fractions of a cent).
+#
+# No probe-after-prime: the watch loop's first poll runs within ~1 s of
+# warmup completion and renders real bucket data then. Skipping the
+# probe halves the per-slot HTTP traffic during warmup and makes the
+# terminal warmup status the prime's outcome (the thing that matters),
+# not a downstream probe.
 #
 # Builds the rendered snapshot in place: one row per slot (filtered by
 # -Name when set), each starting at Status='warming-up' with Data=$null,
-# transitioning through 'refreshing' to its real HTTP outcome. The end
+# transitioning through 'priming' to its real HTTP outcome. The end
 # state is the first frame of the polling loop; the caller wires it to
 # $snapshot and sets $lastPoll = now. Returns $null when no slots match.
 #
@@ -3923,11 +4062,11 @@ $Script:WarmupRefreshingMinMs = 150
 # user where they started. Restore failure logs a yellow advisory naming
 # the slot the user is now active on. No active slot captured (fresh
 # install, sidecar-hidden active) is fine: the finally guard skips the
-# restore and the user ends on the last warmed slot.
+# restore and the user ends on the last primed slot.
 #
 # $Repaint is invoked as: & $Repaint $snapshot.
-# Per-slot latency is bounded at $WarmupRefreshingMinMs (floors the
-# 'refreshing' label's on-screen visibility against warm-cache returns)
+# Per-slot latency is bounded at $WarmupPrimingMinMs (floors the
+# 'priming' label's on-screen visibility against fast-LAN returns)
 # + swap + HTTP + $WarmupSpacingMs (per-IP burst guard between slots).
 function Invoke-WarmAllSlots {
     Param (
@@ -3968,24 +4107,24 @@ function Invoke-WarmAllSlots {
     try {
         for ($i = 0; $i -le $last; $i++) {
             $row = $rows[$i]
-            $row.Status = 'refreshing'
+            $row.Status = 'priming'
             & $Repaint $snapshot
 
             # Conditional sleep so a test-side zero override is a no-op
             # rather than a degenerate Start-Sleep 0.
-            if ($Script:WarmupRefreshingMinMs -gt 0) {
-                Start-Sleep -Milliseconds $Script:WarmupRefreshingMinMs
+            if ($Script:WarmupPrimingMinMs -gt 0) {
+                Start-Sleep -Milliseconds $Script:WarmupPrimingMinMs
             }
 
             # 6>$null suppresses [Switch] / [Sync] advisories so they
             # don't paint outside the DEC 2026 sync envelope.
             try {
                 Invoke-SlotSwap -Slot $row 6>$null
-                $r = Get-SlotUsage -SlotPath $row.Path 6>$null
-                $row.Status           = $r.Status
-                $row.Data             = $r.Data
-                $row.Error            = $r.Error
-                $row.IsCachedFallback = [bool]$r.IsCachedFallback
+                $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
+                $row.Status = $r.Status
+                $row.Error  = $r.Error
+                # Invoke-SlotPrime returns no Data payload; the watch
+                # loop's first poll will populate bucket numbers.
             }
             catch {
                 $row.Status = 'error'
@@ -4004,7 +4143,6 @@ function Invoke-WarmAllSlots {
             catch { Write-Color "[Warmup] Restore of original active slot '$($origActive.Name)' failed: $($_.Exception.Message). You are now active on '$($rows[-1].Name)'." 'Yellow' 6>$null }
         }
     }
-    $snapshot.HasCacheFallback = @($rows | Where-Object IsCachedFallback).Count -gt 0
     return $snapshot
 }
 
@@ -4060,19 +4198,19 @@ function Invoke-UsageWatch {
         # -Threshold: utilization percentage (1..100) at or above which
         # -Auto fires a rotation. Ignored when -Auto is absent.
         [int]    $Threshold = 95,
-        # -Warmup: pre-refresh every saved slot's OAuth tokens via
-        # Invoke-WarmAllSlots before the first poll. Independent of
-        # -Auto: works with bare -Watch and with -Watch -Auto. See the
-        # warmup block below the alt-screen entry for the synthetic
-        # snapshot + Status-column mechanics.
+        # -Warmup: prime every saved slot via a billable /v1/messages
+        # request through Invoke-WarmAllSlots before the first poll.
+        # Independent of -Auto: works with bare -Watch and with -Watch
+        # -Auto. See the warmup block below the alt-screen entry for
+        # the synthetic snapshot + Status-column mechanics.
         [switch] $Warmup
     )
 
     # Pre-loop Claude Code guard for -Auto and -Warmup. Both write
     # ~/.claude.json's oauthAccount block via Invoke-SlotSwap (-Auto
     # during the in-loop rotation step; -Warmup during the per-slot
-    # round-robin restored in v2.5.0). Claude Code keeps that block
-    # in an in-memory cache; racing its flush would clobber our update.
+    # swap-then-prime round-robin). Claude Code keeps that block in an
+    # in-memory cache; racing its flush would clobber our update.
     # Same guard / wording as Invoke-SwitchAction so the user sees a
     # consistent message regardless of entry point. -Auto additionally
     # re-checks Test-ClaudeRunning before every rotation attempt to
