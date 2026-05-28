@@ -2186,28 +2186,31 @@ function Get-CachedUsageOrNull {
     return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
 }
 
-# Call /api/oauth/usage for one slot. Auto-refreshes a token that is
-# expired or within 60s of expiry. Returns:
-#   @{ Status = 'ok';           Data = <parsed response> }
-#   @{ Status = 'ok'; Data; IsCachedFallback = $true }      # served from cache after a 429
-#   @{ Status = 'no-oauth' }                                # slot has no claudeAiOauth
-#   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed (non-429)
-#   @{ Status = 'rate-limited' }                            # 429 from refresh OR usage endpoint, no fresh cache
-#   @{ Status = 'unauthorized' }                            # 401/403 from usage endpoint
-#   @{ Status = 'error';   Error = <msg> }                  # network / shape / other
-# Never throws to callers; surfaces every failure mode as a Status value
-# so Invoke-UsageAction can render mixed-health tables without aborting.
-function Get-SlotUsage {
-    Param (
-        [String] $SlotPath
-    )
-
-    # Suppress PowerShell's built-in 'Web request' progress activity
-    # (Write-Progress / stream 4) so it does not paint over the watch
-    # loop's alt-screen buffer between frames. See Update-SlotTokens
-    # for the full rationale; the same suppression is applied
-    # identically here and in Get-SlotProfile.
-    $ProgressPreference = 'SilentlyContinue'
+# Read a slot's OAuth tokens and return a non-expired access token,
+# refreshing via /v1/oauth/token first if the cached token is past or
+# within 60s of its expiry. Shared prelude for Get-SlotUsage,
+# Get-SlotProfile, and Invoke-SlotPrime; collapses three near-identical
+# 30-line blocks that previously each did Get-SlotOAuth + HasOAuth gate
+# + 60s expiry threshold + Update-SlotTokens with 429-as-rate-limited /
+# non-429-as-expired catches.
+#
+# Returns one of:
+#   @{ Status = 'ok'; AccessToken = <string> }     # caller proceeds with HTTP
+#   @{ Status = 'no-oauth' }                       # slot has no claudeAiOauth
+#   @{ Status = 'rate-limited' }                   # 429 from /v1/oauth/token
+#   @{ Status = 'expired'; Error = <msg> }         # token expired + refresh failed (non-429)
+#   @{ Status = 'error';   Error = <msg> }         # Get-SlotOAuth threw (corrupt slot file etc.)
+#
+# Callers translate the non-ok statuses straight into their own return
+# values. Get-SlotUsage additionally checks $Script:SlotUsageCache for a
+# fresh entry before returning 'rate-limited' (the cache-fallback path);
+# the other two callers have no cache and return the helper's result
+# verbatim.
+#
+# Does NOT set $ProgressPreference: Get-SlotOAuth performs no HTTP, and
+# Update-SlotTokens sets it inside its own scope.
+function Resolve-SlotAccessToken {
+    Param ([String] $SlotPath)
 
     try {
         $info = Get-SlotOAuth -SlotPath $SlotPath
@@ -2231,24 +2234,58 @@ function Get-SlotUsage {
             $accessToken = Update-SlotTokens -SlotPath $SlotPath
         }
         catch {
-            # 429 from the token endpoint shares the rate-limit policy
-            # with the usage endpoint below: serve fresh cached usage
-            # data when available, otherwise surface a clean
-            # 'rate-limited' status. No retry; the token endpoint shares
-            # an upstream limiter with the usage endpoint, so a 5s sleep
-            # would just extend the user's wait without changing the
-            # outcome (and the watch loop will retry on its 60s tick).
+            # 429 from the token endpoint: surface a clean 'rate-limited'
+            # status. No retry; the token endpoint shares an upstream
+            # limiter with the usage endpoint, so a 5s sleep would just
+            # extend the user's wait without changing the outcome.
             if (Test-Is429 $_.Exception) {
-                $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
-                if ($cached) { return $cached }
                 return [pscustomobject]@{ Status = 'rate-limited' }
             }
             # Non-429 refresh failure (timeout, 4xx other than 429, 5xx,
-            # malformed JSON, …): the token IS expired and we couldn't
+            # malformed JSON, ...): the token IS expired and we couldn't
             # refresh it, so 'expired' remains the accurate label.
             return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
         }
     }
+
+    return [pscustomobject]@{ Status = 'ok'; AccessToken = $accessToken }
+}
+
+# Call /api/oauth/usage for one slot. Auto-refreshes a token that is
+# expired or within 60s of expiry via Resolve-SlotAccessToken. Returns:
+#   @{ Status = 'ok';           Data = <parsed response> }
+#   @{ Status = 'ok'; Data; IsCachedFallback = $true }      # served from cache after a 429
+#   @{ Status = 'no-oauth' }                                # slot has no claudeAiOauth
+#   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed (non-429)
+#   @{ Status = 'rate-limited' }                            # 429 from refresh OR usage endpoint, no fresh cache
+#   @{ Status = 'unauthorized' }                            # 401/403 from usage endpoint
+#   @{ Status = 'error';   Error = <msg> }                  # network / shape / other
+# Never throws to callers; surfaces every failure mode as a Status value
+# so Invoke-UsageAction can render mixed-health tables without aborting.
+function Get-SlotUsage {
+    Param (
+        [String] $SlotPath
+    )
+
+    # Suppress PowerShell's built-in 'Web request' progress activity
+    # (Write-Progress / stream 4) so it does not paint over the watch
+    # loop's alt-screen buffer between frames. See Update-SlotTokens
+    # for the full rationale; same suppression is applied identically
+    # in Get-SlotProfile / Invoke-SlotPrime.
+    $ProgressPreference = 'SilentlyContinue'
+
+    # Resolve a non-expired access token (refresh if needed). Rate-
+    # limited from the token endpoint gets the cache-fallback path here;
+    # other non-ok statuses return verbatim.
+    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
+    if ($tok.Status -ne 'ok') {
+        if ($tok.Status -eq 'rate-limited') {
+            $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
+            if ($cached) { return $cached }
+        }
+        return $tok
+    }
+    $accessToken = $tok.AccessToken
 
     $headers = @{
         'Authorization'     = "Bearer $accessToken"
@@ -2356,46 +2393,17 @@ function Get-SlotProfile {
         [String] $SlotPath
     )
 
-    # Suppress PowerShell's built-in 'Web request' progress activity
-    # (Write-Progress / stream 4) so it does not paint over the watch
-    # loop's alt-screen buffer between frames. See Update-SlotTokens
-    # for the full rationale; the same suppression is applied
-    # identically here and in Get-SlotUsage.
+    # See Get-SlotUsage for the $ProgressPreference rationale; same
+    # suppression here for the /api/oauth/profile HTTP call below.
     $ProgressPreference = 'SilentlyContinue'
 
-    try {
-        $info = Get-SlotOAuth -SlotPath $SlotPath
-    }
-    catch {
-        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
-    }
-
-    if (-not $info.HasOAuth) {
-        return [pscustomobject]@{ Status = 'no-oauth' }
-    }
-
-    $accessToken = $info.AccessToken
-
-    # Share the expiry-threshold and refresh logic with Get-SlotUsage so
-    # both endpoints behave identically under token rotation.
-    $threshold = [DateTime]::UtcNow.AddSeconds(60)
-    if ($info.ExpiresAt -and $info.ExpiresAt -lt $threshold) {
-        try {
-            $accessToken = Update-SlotTokens -SlotPath $SlotPath
-        }
-        catch {
-            # Mirror Get-SlotUsage's 429 handling: if the token endpoint
-            # is rate-limited, surface a clean 'rate-limited' status
-            # rather than 'expired: <long 429 message>'. There is no
-            # profile cache to fall back on (Get-SlotProfile is no-cache
-            # by design; see this function's docstring), so the
-            # rate-limited status is the only signal we can give.
-            if (Test-Is429 $_.Exception) {
-                return [pscustomobject]@{ Status = 'rate-limited' }
-            }
-            return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
-        }
-    }
+    # Resolve a non-expired access token; non-ok statuses (including
+    # 429-as-rate-limited from the token endpoint) return verbatim. No
+    # profile cache to fall back on (Get-SlotProfile is no-cache by
+    # design; see the function docstring above).
+    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
+    if ($tok.Status -ne 'ok') { return $tok }
+    $accessToken = $tok.AccessToken
 
     $headers = @{
         'Authorization'     = "Bearer $accessToken"
@@ -2461,42 +2469,16 @@ function Invoke-SlotPrime {
         [String] $SlotPath
     )
 
-    # Suppress PowerShell's 'Web request' progress activity so it does
-    # not paint over the watch loop's alt-screen buffer. Same rationale
-    # as Get-SlotUsage / Get-SlotProfile / Update-SlotTokens.
+    # See Get-SlotUsage for the $ProgressPreference rationale; same
+    # suppression here for the /v1/messages POST below.
     $ProgressPreference = 'SilentlyContinue'
 
-    try {
-        $info = Get-SlotOAuth -SlotPath $SlotPath
-    }
-    catch {
-        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
-    }
-
-    if (-not $info.HasOAuth) {
-        return [pscustomobject]@{ Status = 'no-oauth' }
-    }
-
-    $accessToken = $info.AccessToken
-
-    # Refresh if expired OR within a 60s grace window; mirrors
-    # Get-SlotUsage / Get-SlotProfile.
-    $threshold = [DateTime]::UtcNow.AddSeconds(60)
-    if ($info.ExpiresAt -and $info.ExpiresAt -lt $threshold) {
-        try {
-            $accessToken = Update-SlotTokens -SlotPath $SlotPath
-        }
-        catch {
-            # 429 from the token endpoint -> clean 'rate-limited' status
-            # rather than 'expired: <long 429 message>'. No cache to fall
-            # back on (priming is fire-and-forget; nothing useful to
-            # replay).
-            if (Test-Is429 $_.Exception) {
-                return [pscustomobject]@{ Status = 'rate-limited' }
-            }
-            return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
-        }
-    }
+    # Resolve a non-expired access token; non-ok statuses (including
+    # 429-as-rate-limited from the token endpoint) return verbatim. No
+    # cache to fall back on (priming is fire-and-forget).
+    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
+    if ($tok.Status -ne 'ok') { return $tok }
+    $accessToken = $tok.AccessToken
 
     $headers = @{
         'Authorization'     = "Bearer $accessToken"
@@ -2509,16 +2491,7 @@ function Invoke-SlotPrime {
     # Minimal billable payload. `max_tokens=1` caps output; content is a
     # single "." so the input is one token. Aggregate cost: ~2 tokens
     # per slot per warmup on the pinned Haiku model (fractions of a cent).
-    $body = [pscustomobject]@{
-        model      = $Script:PrimeModel
-        max_tokens = 1
-        messages   = @(
-            [pscustomobject]@{
-                role    = 'user'
-                content = '.'
-            }
-        )
-    } | ConvertTo-Json -Depth 5 -Compress
+    $body = '{{"model":"{0}","max_tokens":1,"messages":[{{"role":"user","content":"."}}]}}' -f $Script:PrimeModel
 
     try {
         Invoke-RestMethod -Method Post `
@@ -4081,17 +4054,21 @@ function Invoke-WarmAllSlots {
     }
     if ($slots.Count -lt 1) { return $null }
 
+    # Warmup rows omit IsCachedFallback: Invoke-SlotPrime cannot produce
+    # cached responses (no per-slot prime cache), and Format-UsageTable
+    # / Format-UsageVerbose / Format-UsageFrame all read the snapshot-
+    # level HasCacheFallback, not the per-row field. Snapshot's
+    # HasCacheFallback stays $false for the same reason.
     $rows = @($slots | ForEach-Object {
         [pscustomobject]@{
-            Name             = $_.Name
-            Email            = $_.Email
-            Path             = $_.Path
-            IsActive         = $_.IsActive
-            Sidecar          = $_.Sidecar
-            Status           = 'warming-up'
-            Data             = $null
-            Error            = $null
-            IsCachedFallback = $false
+            Name     = $_.Name
+            Email    = $_.Email
+            Path     = $_.Path
+            IsActive = $_.IsActive
+            Sidecar  = $_.Sidecar
+            Status   = 'warming-up'
+            Data     = $null
+            Error    = $null
         }
     })
     $snapshot = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false }
@@ -4117,7 +4094,15 @@ function Invoke-WarmAllSlots {
             }
 
             # 6>$null suppresses [Switch] / [Sync] advisories so they
-            # don't paint outside the DEC 2026 sync envelope.
+            # don't paint outside the DEC 2026 sync envelope. The try/
+            # catch catches Invoke-SlotSwap throws AND defends against
+            # any Invoke-SlotPrime contract violation (the prime's
+            # documented surface is non-throwing, but defense-in-depth
+            # against unexpected exceptions keeps the loop alive for
+            # the remaining slots). Normal prime failure modes route
+            # through $r.Status (rate-limited / expired / unauthorized
+            # / error) without throwing; this catch only fires on
+            # actual exceptions.
             try {
                 Invoke-SlotSwap -Slot $row 6>$null
                 $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
