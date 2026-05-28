@@ -236,7 +236,10 @@ $Script:ProfileTimeoutSec   = 10
 # Anthropic deprecates the pinned model id; same maintenance recipe as
 # the constants above. /v1/messages can be slower than /api/oauth/usage
 # (model load on cold path), so the timeout is more generous than
-# $UsageTimeoutSec.
+# $UsageTimeoutSec. Model identifier MUST be JSON-safe (no quotes /
+# backslashes): Invoke-SlotPrime inlines it into a format-string body
+# without escaping. All Anthropic model identifiers to date are
+# `[a-z0-9-]+` so this is a non-issue in practice.
 $Script:PrimeModel          = "claude-haiku-4-5"
 $Script:PrimeTimeoutSec     = 15
 

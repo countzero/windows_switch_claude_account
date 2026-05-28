@@ -2609,6 +2609,46 @@ Describe 'switch_claude_account' {
         # Mirror Get-SlotUsage's status vocabulary and refresh-on-expiry
         # behavior but POST a minimal billable /v1/messages payload.
 
+        BeforeAll {
+            # Build a slot file with an OAuth payload. Access/refresh
+            # tokens default to deterministic name-derived values so
+            # tests can assert on the Authorization header without
+            # threading the value through. ExpiresAt defaults to
+            # $script:FutureMs (set per-test in BeforeEach below); pass
+            # $script:PastMs to force a refresh.
+            function New-PrimeSlot {
+                Param (
+                    [string]         $Name,
+                    [Nullable[long]] $ExpiresAt = $null
+                )
+                if ($null -eq $ExpiresAt) { $ExpiresAt = $script:FutureMs }
+                $payload = @{
+                    claudeAiOauth = @{
+                        accessToken  = "sk-ant-oat-$Name"
+                        refreshToken = "sk-ant-ort-$Name"
+                        expiresAt    = $ExpiresAt
+                    }
+                } | ConvertTo-Json -Compress
+                return New-SlotPair -CredDir $script:CredDirPath -Name $Name -Email "$Name@test.local" -Content $payload
+            }
+
+            # Build an Invoke-RestMethod-style exception carrying a fake
+            # HttpResponse with the given StatusCode, so production
+            # catch blocks can read $_.Exception.Response.StatusCode.
+            function New-HttpError {
+                Param (
+                    [int]    $StatusCode,
+                    [string] $Message = "$StatusCode error"
+                )
+                $resp = [pscustomobject]@{ StatusCode = $StatusCode }
+                $ex   = [System.Exception]::new($Message)
+                $ex | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                return $ex
+            }
+
+            $script:TokenEndpointUri = 'https://platform.claude.com/v1/oauth/token'
+        }
+
         BeforeEach {
             $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
@@ -2617,66 +2657,44 @@ Describe 'switch_claude_account' {
         }
 
         It 'no-OAuth slot returns Status=no-oauth without HTTP' {
-            $payload = '{"apiKey":"sk-ant-api-..."}'
-            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'apikey' -Email 'a@b.com' -Content $payload
+            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'apikey' -Email 'a@b.com' -Content '{"apiKey":"sk-ant-api-..."}'
             Mock Invoke-RestMethod -MockWith { throw 'should not be called' }
 
-            $r = Invoke-SlotPrime -SlotPath $path
-            $r.Status | Should -Be 'no-oauth'
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'no-oauth'
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly
         }
 
-        It 'fresh-token slot POSTs /v1/messages and returns Status=ok' {
-            $payload = @{
-                claudeAiOauth = @{
-                    accessToken  = 'sk-ant-oat-fresh'
-                    refreshToken = 'sk-ant-ort-fresh'
-                    expiresAt    = $script:FutureMs
-                }
-            } | ConvertTo-Json -Compress
-            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'fresh' -Email 'f@test.local' -Content $payload
+        It 'fresh-token slot POSTs /v1/messages with the right headers + body and returns Status=ok' {
+            $path = New-PrimeSlot -Name 'fresh'
 
-            $script:capturedMethod = $null
-            $script:capturedUri    = $null
-            $script:capturedBody   = $null
-            $script:capturedHeaders = $null
+            $script:captured = @{}
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
-                $script:capturedMethod  = $Method
-                $script:capturedUri     = $Uri
-                $script:capturedBody    = $Body
-                $script:capturedHeaders = $Headers
+                $script:captured.Method  = $Method
+                $script:captured.Uri     = $Uri
+                $script:captured.Body    = $Body
+                $script:captured.Headers = $Headers
                 return [pscustomobject]@{ id = 'msg_x' }
             }
 
-            $r = Invoke-SlotPrime -SlotPath $path
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'ok'
+            $script:captured.Method                       | Should -Be 'Post'
+            $script:captured.Uri                          | Should -Be $Script:MessagesEndpoint
+            $script:captured.Headers['Authorization']     | Should -Be 'Bearer sk-ant-oat-fresh'
+            $script:captured.Headers['anthropic-beta']    | Should -Be $Script:AnthropicBeta
+            $script:captured.Headers['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
 
-            $r.Status                 | Should -Be 'ok'
-            $script:capturedMethod    | Should -Be 'Post'
-            $script:capturedUri       | Should -Be $Script:MessagesEndpoint
-            $script:capturedHeaders['Authorization']     | Should -Be 'Bearer sk-ant-oat-fresh'
-            $script:capturedHeaders['anthropic-beta']    | Should -Be $Script:AnthropicBeta
-            $script:capturedHeaders['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
-
-            # Body shape: pinned Haiku model, max_tokens=1, single user "." message.
-            $parsed = $script:capturedBody | ConvertFrom-Json
-            $parsed.model         | Should -Be $Script:PrimeModel
-            $parsed.max_tokens    | Should -Be 1
-            $parsed.messages.Count | Should -Be 1
+            # Body shape: pinned model, max_tokens=1, single user "." message.
+            $parsed = $script:captured.Body | ConvertFrom-Json
+            $parsed.model               | Should -Be $Script:PrimeModel
+            $parsed.max_tokens          | Should -Be 1
+            $parsed.messages.Count      | Should -Be 1
             $parsed.messages[0].role    | Should -Be 'user'
             $parsed.messages[0].content | Should -Be '.'
         }
 
-        It 'expired-token slot refreshes then primes' {
-            $payload = @{
-                claudeAiOauth = @{
-                    accessToken  = 'sk-ant-oat-OLD'
-                    refreshToken = 'sk-ant-ort-OLD'
-                    expiresAt    = $script:PastMs
-                }
-            } | ConvertTo-Json -Compress
-            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'expired' -Email 'e@test.local' -Content $payload
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+        It 'expired-token slot refreshes then primes with the new bearer' {
+            $path = New-PrimeSlot -Name 'expired' -ExpiresAt $script:PastMs
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $script:TokenEndpointUri } -MockWith {
                 return [pscustomobject]@{ access_token = 'sk-ant-oat-NEW'; refresh_token = 'sk-ant-ort-NEW'; expires_in = 3600 }
             }
             $script:capturedAuth = $null
@@ -2685,49 +2703,28 @@ Describe 'switch_claude_account' {
                 return [pscustomobject]@{ id = 'msg_x' }
             }
 
-            $r = Invoke-SlotPrime -SlotPath $path
-
-            $r.Status            | Should -Be 'ok'
-            $script:capturedAuth | Should -Be 'Bearer sk-ant-oat-NEW'
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'ok'
+            $script:capturedAuth                       | Should -Be 'Bearer sk-ant-oat-NEW'
         }
 
-        It 'token refresh 429 returns Status=rate-limited (no expired tail)' {
-            $payload = @{
-                claudeAiOauth = @{
-                    accessToken  = 'sk-ant-oat-OLD'
-                    refreshToken = 'sk-ant-ort-OLD'
-                    expiresAt    = $script:PastMs
-                }
-            } | ConvertTo-Json -Compress
-            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'stuck' -Email 's@test.local' -Content $payload
-
+        It 'token refresh 429 returns Status=rate-limited with no Error tail (no messages call)' {
+            $path = New-PrimeSlot -Name 'stuck' -ExpiresAt $script:PastMs
             Mock Start-Sleep -MockWith { }
-            $resp  = [pscustomobject]@{ StatusCode = 429 }
-            $inner = [System.Exception]::new('429 Too Many Requests')
-            $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
-                throw $inner
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $script:TokenEndpointUri } -MockWith {
+                throw (New-HttpError -StatusCode 429 -Message '429 Too Many Requests')
             }
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
                 throw 'messages endpoint should not be called when refresh 429s'
             }
 
             $r = Invoke-SlotPrime -SlotPath $path
-            $r.Status | Should -Be 'rate-limited'
+            $r.Status                       | Should -Be 'rate-limited'
             $r.PSObject.Properties['Error'] | Should -BeNullOrEmpty
         }
 
         It 'token refresh non-429 returns Status=expired with the underlying error' {
-            $payload = @{
-                claudeAiOauth = @{
-                    accessToken  = 'sk-ant-oat-OLD'
-                    refreshToken = 'sk-ant-ort-OLD'
-                    expiresAt    = $script:PastMs
-                }
-            } | ConvertTo-Json -Compress
-            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'broken' -Email 'b@test.local' -Content $payload
-
-            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+            $path = New-PrimeSlot -Name 'broken' -ExpiresAt $script:PastMs
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $script:TokenEndpointUri } -MockWith {
                 throw [System.Exception]::new('synthetic refresh failure')
             }
 
@@ -2737,57 +2734,25 @@ Describe 'switch_claude_account' {
         }
 
         It 'messages endpoint 401 returns Status=unauthorized' {
-            $payload = @{
-                claudeAiOauth = @{
-                    accessToken  = 'sk-ant-oat-revoked'
-                    refreshToken = 'sk-ant-ort-revoked'
-                    expiresAt    = $script:FutureMs
-                }
-            } | ConvertTo-Json -Compress
-            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'revoked' -Email 'r@test.local' -Content $payload
-
-            $resp  = [pscustomobject]@{ StatusCode = 401 }
-            $inner = [System.Exception]::new('401 Unauthorized')
-            $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+            $path = New-PrimeSlot -Name 'revoked'
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
-                throw $inner
+                throw (New-HttpError -StatusCode 401 -Message '401 Unauthorized')
             }
 
-            $r = Invoke-SlotPrime -SlotPath $path
-            $r.Status | Should -Be 'unauthorized'
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'unauthorized'
         }
 
         It 'messages endpoint 429 returns Status=rate-limited' {
-            $payload = @{
-                claudeAiOauth = @{
-                    accessToken  = 'sk-ant-oat-busy'
-                    refreshToken = 'sk-ant-ort-busy'
-                    expiresAt    = $script:FutureMs
-                }
-            } | ConvertTo-Json -Compress
-            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'busy' -Email 'b@test.local' -Content $payload
-
-            $resp  = [pscustomobject]@{ StatusCode = 429 }
-            $inner = [System.Exception]::new('429 Too Many Requests')
-            $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+            $path = New-PrimeSlot -Name 'busy'
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
-                throw $inner
+                throw (New-HttpError -StatusCode 429 -Message '429 Too Many Requests')
             }
 
-            $r = Invoke-SlotPrime -SlotPath $path
-            $r.Status | Should -Be 'rate-limited'
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'rate-limited'
         }
 
         It 'messages endpoint generic exception returns Status=error with the message' {
-            $payload = @{
-                claudeAiOauth = @{
-                    accessToken  = 'sk-ant-oat-ok'
-                    refreshToken = 'sk-ant-ort-ok'
-                    expiresAt    = $script:FutureMs
-                }
-            } | ConvertTo-Json -Compress
-            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'flaky' -Email 'f@test.local' -Content $payload
-
+            $path = New-PrimeSlot -Name 'flaky'
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
                 throw [System.Exception]::new('network down')
             }
