@@ -166,6 +166,17 @@ The terminal-tab title is updated on every poll so a backgrounded watch is glanc
 > [!NOTE]
 > The title's numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
+### Prime cold slots at startup
+
+Anthropic only reports `/api/oauth/usage` data for slots that have an open server-side 5h session window, which only a real billable request can open. Pass `-Warmup` to send a minimal `/v1/messages` request (~2 tokens on Haiku, fractions of a cent) for each saved slot before the watch loop starts, so every slot reports real bucket numbers on the first frame instead of `rate-limited`:
+
+```powershell
+sca usage -Watch -Warmup              # prime all slots, then watch
+sca usage -Watch -Auto -Warmup        # prime + auto-rotate (recommended pairing)
+```
+
+`-Warmup` refuses to operate while Claude Code is running (per-slot swap writes `~/.claude.json`). Pair with `-Auto` for the typical use case: `-Auto` needs every peer slot reporting real data to make rotation decisions.
+
 ### Auto-rotate on usage limit (OpenCode only)
 
 Add `-Auto` to the watch loop to auto-rotate to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold:
