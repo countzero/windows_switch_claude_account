@@ -4,63 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.1.0] - 2026-05-29
-
-### Changed
-- A transient `429` no longer makes a slot look dead in `sca usage`. When the usage endpoint (or the token-refresh endpoint) returns `429` and the per-slot cache holds an entry, the last-known Session/Week percentages stay on screen (served via `Get-CachedUsageOrNull -AllowStale`, marked, with the status kept at `rate-limited`) instead of collapsing to em-dash cells. `Format-UsageTable` now renders bucket percentages for any row carrying `Data`, not only `ok` rows.
-- `sca usage -Watch -Warmup` shows live bucket data on its first frame. After a successful prime, `Invoke-WarmAllSlots` now performs a verify-after-prime `Get-SlotUsage` read so the warmup snapshot carries real percentages, instead of rendering `ok (no plan data)` (empty cells) until the first poll ~60 s later. A failed prime skips the read and surfaces the prime's own outcome.
+## [2.3.0] - 2026-05-29
 
 ### Added
-- Transient-throttle advisory for the no-cache case: when a slot is `rate-limited` with no cached data to display, `Format-UsageFrame` prints a note clarifying the condition is transient and the slot is active, so an empty row is not mistaken for an unused/dead slot. Driven by a new `HasRateLimited` flag on the usage snapshot.
-- `-AllowStale` switch on `Get-CachedUsageOrNull`.
-
-## [3.0.0] - 2026-05-28
+- `sca usage -Watch -Warmup` primes every saved slot before polling so the first frame shows real Session/Week percentages instead of empty cells. Each prime sends a minimal billable `/v1/messages` request (~2 tokens per slot). Combines with `-Auto`; refused while Claude Code is running.
 
 ### Changed
-- **BREAKING**: `sca usage -Watch -Warmup` now sends a billable `/v1/messages` request per slot to open each slot's server-side 5h usage window, replacing v2.5.0's free `/api/oauth/usage` probe. Cost: ~2 tokens per slot per warmup on the pinned Haiku model, fractions of a cent. Status label renamed `refreshing` → `priming`; `Invoke-WarmAllSlots` now builds its own snapshot from `Get-Slots` (drops the `New-WarmupScaffold` / `Set-WarmupRowStatus` / `Set-WarmupRowResult` helpers and the redundant probe-after-prime). The v2.5.0 swap-then-probe rationale was empirically wrong (the 5h window is server-side state keyed on real billable requests, not local activeness) and is retracted.
-
-### Added
-- `Invoke-SlotPrime` helper and `$Script:MessagesEndpoint` / `$Script:PrimeModel` (pinned to `claude-haiku-4-5`) / `$Script:PrimeTimeoutSec` constants. `Invoke-SlotPrime` shares `Resolve-SlotAccessToken` with `Get-SlotUsage` and `Get-SlotProfile` (extracted as part of this release).
-
-## [2.5.0] - 2026-05-27
-
-### Changed
-- `sca usage -Watch -Warmup` round-robins through every saved slot before entering the steady-state polling loop: per slot in alphabetical order, `Invoke-SlotSwap` makes it active (writes `.credentials.json` + `~/.claude.json` `oauthAccount` + `state.active_slot`), then `Get-SlotUsage` probes `/api/oauth/usage` as the now-active slot, then the next slot. A `finally` block restores the original active slot via one more swap so the user ends warmup where they started. Reinstates the v2.3.0 design that was removed in v2.3.1. The v2.3.1 CHANGELOG called the round-robin a no-op based on warm-slot measurements; v2.5.0 reverses that under the empirical observation that the measurement only covered slots already primed by recent manual switches, and a truly cold slot's `/api/oauth/usage` can return empty bucket data until the slot is made active locally. Swap and probe failures both surface as `Status='error'` with the exception message in the row's Error tail; the loop continues with the remaining slots.
-- `Test-ClaudeRunning` guard extended to `-Warmup` (pre-loop refusal). Mirrors `-Auto`'s existing guard since both flags now write `~/.claude.json`'s `oauthAccount` block, which Claude Code keeps in an in-memory cache. Combined guard message branches on whether `-Auto` or `-Warmup` triggered it.
-- `New-WarmupScaffold` row projection carries the slot's `Sidecar` so `Invoke-WarmAllSlots` can pass the row straight to `Invoke-SlotSwap` without re-walking the filesystem per slot.
-
-## [2.4.0] - 2026-05-27
-
-### Added
-- `-Warmup` flag on `sca usage -Watch`. Performs the first `/api/oauth/usage` poll serially per slot before entering the steady-state polling loop, with per-slot progress visible in the Status column: `warming up` (queued) -> `refreshing` (call in flight) -> the real HTTP outcome (`ok` / `rate-limited` / `no-oauth` / `expired` / `unauthorized` / `error`). End-state snapshot is handed off to the polling loop as its first frame; no immediate re-poll. Independent of `-Auto`: works with bare `-Watch` (`sca usage -Watch -Warmup`) and combines with `-Auto` (`sca usage -Watch -Auto -Warmup`). Aggregate Session/Week bars grow as `ok` rows accumulate during the warmup phase, so the layout during warmup matches the steady-state polling layout.
-
-### Changed
-- `sca usage -Watch -Auto` no longer warms slots automatically. Pass `-Warmup` to restore the prior behavior (`sca usage -Watch -Auto -Warmup`). Users who want the auto-rotation policy without the per-slot startup latency get a faster `-Auto` invocation; users who want warmup without auto-rotation can use it standalone.
-
-### Removed
-- `state.last_warmup_at` map and the `Get-SlotWarmupTimestamp` / `Set-SlotWarmupTimestamp` helpers. The previous warmup design needed a per-slot 60 s cooldown to avoid thrashing `/v1/oauth/token` across rapid `-Watch -Auto` restarts. The new warmup calls `Get-SlotUsage` (which is what the polling loop does anyway and has its own cache + retry budget), so the cooldown's premise is gone. Legacy state files carrying the field continue to parse cleanly; the field is silently ignored and dropped by the next state-mutating write. State schema stays at `1`.
-- `$Script:WarmupCooldownMs` constant.
-
-## [2.3.1] - 2026-05-26
+- A transient `429` now keeps a slot's last-known Session/Week percentages on screen (marked, status stays `rate-limited`) instead of blanking the row to em-dashes.
 
 ### Fixed
-- `sca usage -Watch -Auto` startup warmup now actually warms slots. The 2.3.0 design rotated `.credentials.json` through each slot via `Invoke-SlotSwap` and restored the original, on the premise that the swap itself "activated" each slot from Anthropic's side. This was a no-op: a local file rewrite generates no observable event server-side. Replaced with a direct refresh: `Invoke-WarmAllSlots` calls `Update-SlotTokens` for every saved slot whose access token is at or near expiry, so the first poll sees fresh bearers and returns real bucket numbers for every slot whose `refresh_token` Anthropic still trusts.
-- `Update-SlotTokens` retries `/v1/oauth/token` 429 responses up to `$Script:TokenRefreshRetryMax` times (default 3) with exponential backoff (`$Script:TokenRefreshRetryDelayMs`, default 2 s → 4 s). The refresh endpoint's per-token rate limit unlocks within seconds, so a slot whose first refresh attempt got 429d during a polling tick now self-recovers in the same tick instead of showing `rate-limited` until the user happens to invoke another sca command. Benefits every call path that triggers a refresh: `sca usage`, `sca usage -Watch`, `sca usage -Watch -Auto`, `sca switch`.
-
-### Changed
-- `Invoke-WarmAllSlotsBySwitch` renamed to `Invoke-WarmAllSlots` (the `BySwitch` suffix no longer describes what the function does). The function signature is unchanged; only the orchestrator's body and its rendered progress messages were rewritten.
-- Warmup no longer rotates `.credentials.json` or `~/.claude.json`. The Ctrl-C-safe credentials restore step and the sidecar-less-active refusal both go away with the swap; the warmup is now pure-network and leaves no state behind to roll back. A new 300 ms `$Script:WarmupSpacingMs` sleep between slots dodges per-IP burst rate limits on `/v1/oauth/token`.
-
-## [2.3.0] - 2026-05-26
-
-### Added
-- `sca usage -Watch -Auto` warms every saved slot at startup by briefly switching to each one via `Invoke-SlotSwap`, then restoring the original active slot. Anchors each slot's 5h window so the first poll's Status column reports real bucket numbers instead of empty `—` cells or `rate-limited` from cold slots. Visible to the user as `warming up` (yellow) in the Status column with per-slot progress on the `[Auto]` footer line; no flashed output before the alt-screen UI appears.
-- Per-slot warmup cooldown: `Invoke-WarmAllSlotsBySwitch` records each attempt in `state.last_warmup_at` and skips slots warmed less than 60 seconds ago. Prevents thrashing across rapid `-Watch -Auto` restarts. The state file's schema stays at `1`; the new `last_warmup_at` field is additive and missing on legacy files.
-- `anthropic-version: 2023-06-01` header sent on every authenticated request (`Get-SlotUsage`, `Get-SlotProfile`, `Update-SlotTokens`). The OAuth-namespaced endpoints accept calls without it today; sending it uniformly insulates the script from a future tightening at any endpoint.
-
-### Fixed
-- Sidecar-less active slot during `-Watch -Auto` startup: the warmup pass now refuses with a one-line advisory pointing at `sca save <name>` instead of silently rotating the user onto the last peer slot.
-- Ctrl-C mid-warmup: a `finally` inside the warmup orchestrator attempts to restore the original active slot before the watch loop's outer alt-screen teardown runs, so an interrupted startup does not leave `.credentials.json` on an unexpected peer.
+- A `429` during token refresh retries with backoff and self-recovers within the same poll, instead of leaving the slot stuck on `rate-limited` until the next command.
 
 ## [2.2.1] - 2026-05-20
 
