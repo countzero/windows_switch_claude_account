@@ -934,6 +934,27 @@ Describe 'switch_claude_account' {
             @($snap.Results).Count | Should -Be 0
         }
 
+        It 'Get-UsageSnapshot sets HasRateLimited when a row is rate-limited' {
+            $slotPath = New-Slot -Name 'beta'
+            # Pre-seed a STALE cache entry so the 429 path returns
+            # rate-limited immediately (no 5s retry sleep, served stale).
+            $Script:SlotUsageCache[$slotPath] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 3.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $snap = Get-UsageSnapshot
+            $snap.HasRateLimited   | Should -BeTrue
+            # Stale data was served, so HasCacheFallback is also true.
+            $snap.HasCacheFallback | Should -BeTrue
+        }
+
         It 'Format-UsageFrame prints the footer under the table when -Footer is provided' {
             $snap = [pscustomobject]@{
                 Results = @([pscustomobject]@{ Name = 'alpha'; IsActive = $false; Status = 'ok';
@@ -949,6 +970,59 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'HELLO-FROM-FOOTER'
             # Footer sits after the data row.
             ($out.IndexOf('alpha')) | Should -BeLessThan ($out.IndexOf('HELLO-FROM-FOOTER'))
+        }
+
+        It 'Format-UsageTable renders bucket percentages for a rate-limited row that carries cached data' {
+            # A rate-limited row served from the (possibly stale) cache
+            # fallback carries last-known Data; its numbers must show so the
+            # row is not misread as a dead/unused slot.
+            $rows = @([pscustomobject]@{ Name = 'cached'; IsActive = $true; Status = 'rate-limited'; Email = 'a@x.org'
+                Data = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 42.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 73.0; resets_at = $null }
+                }
+                Error = $null; IsCachedFallback = $true })
+
+            $out = Format-UsageTable -Results $rows 6>&1 | Out-String
+
+            $out | Should -Match '\b42%'
+            $out | Should -Match '\b73%'
+            $out | Should -Match '(?m)^\s*\*?\s*cached\b.*\brate-limited\s*$'
+        }
+
+        It 'Format-UsageFrame shows the transient note for a no-cache rate-limited row' {
+            $snap = [pscustomobject]@{
+                Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
+                    Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
+                NoSlots          = $false
+                HasCacheFallback = $false
+                HasRateLimited   = $true
+            }
+
+            $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
+
+            # The em-dash data cells stay (no data to show), but the advisory
+            # makes clear it is transient and the slot is active.
+            $out | Should -Match 'transient and clears on its own'
+            $out | Should -Match 'The slot is active'
+            # The cached-data advisory must NOT fire (no cache here).
+            $out | Should -Not -Match 'displaying cached data'
+        }
+
+        It 'Format-UsageFrame prefers the cached-data advisory over the transient note when data was served' {
+            $snap = [pscustomobject]@{
+                Results = @([pscustomobject]@{ Name = 'cached'; IsActive = $true; Status = 'rate-limited';
+                    Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null } }
+                    Error = $null; Email = $null; IsCachedFallback = $true })
+                NoSlots          = $false
+                HasCacheFallback = $true
+                HasRateLimited   = $true
+            }
+
+            $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
+
+            $out | Should -Match 'displaying cached data'
+            $out | Should -Not -Match 'transient and clears on its own'
         }
 
         It 'Invoke-UsageAction -Watch -Json throws (mutually exclusive)' {
@@ -1802,7 +1876,7 @@ Describe 'switch_claude_account' {
             $r.Status | Should -Be 'rate-limited'
         }
 
-        It '429 with a STALE cache entry: Status=rate-limited; no retry sleep' {
+        It '429 with a STALE cache entry: Status=rate-limited; last-known data kept; no retry sleep' {
             $slot = Join-Path $script:CredDirPath '.credentials.staleC.json'
             $payload = @{ claudeAiOauth = @{
                 accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
@@ -1825,6 +1899,10 @@ Describe 'switch_claude_account' {
 
             $r = Get-SlotUsage -SlotPath $slot
             $r.Status | Should -Be 'rate-limited'
+            # Stale cache is now served (marked) so the row keeps its
+            # last-known numbers instead of collapsing to em-dashes.
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 1
             # No 5s retry sleep because the slot was already seen.
             Should -Invoke Start-Sleep -Times 0 -Exactly
         }
@@ -1860,6 +1938,27 @@ Describe 'switch_claude_account' {
             $r.Status                  | Should -Be 'ok'
             $r.IsCachedFallback        | Should -BeTrue
             $r.Data.five_hour.utilization | Should -Be 17
+        }
+
+        It '-AllowStale serves a stale entry as rate-limited+fallback (last-known numbers kept)' {
+            $slot = 'D:/stale/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 88.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            # Without -AllowStale: still $null (default freshness policy).
+            (Get-CachedUsageOrNull -SlotPath $slot) | Should -BeNullOrEmpty
+            # With -AllowStale: data is served, but status stays rate-limited
+            # so a stale reading is never mistaken for live data.
+            $r = Get-CachedUsageOrNull -SlotPath $slot -AllowStale
+            $r                            | Should -Not -BeNullOrEmpty
+            $r.Status                     | Should -Be 'rate-limited'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 88
+        }
+
+        It '-AllowStale still returns $null on a true cache miss' {
+            (Get-CachedUsageOrNull -SlotPath 'missing/path.json' -AllowStale) | Should -BeNullOrEmpty
         }
     }
 
@@ -2058,6 +2157,804 @@ Describe 'switch_claude_account' {
                 return
             }
             { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
+        }
+    }
+
+    Context 'Invoke-UsageAction -Warmup integration' {
+        # Action-level contract for the -Warmup flag: the runtime guard
+        # rejects -Warmup without -Watch (catches direct callers that
+        # bypass the top-level Param block's parameter-set binding),
+        # AND -Watch -Warmup with Claude Code running is refused at
+        # startup (v2.5.0: warmup writes ~/.claude.json's oauthAccount
+        # block via Invoke-SlotSwap, same race as -Auto).
+
+        It '-Warmup without -Watch is rejected by the runtime guard' {
+            { Invoke-UsageAction -Warmup 6>$null } | Should -Throw -ExpectedMessage '*-Warmup requires -Watch*'
+        }
+
+        It '-Watch -Warmup with Claude Code running throws at startup before entering the alt-screen buffer' {
+            # v2.5.0: warmup performs Invoke-SlotSwap per slot in a
+            # round-robin, which writes ~/.claude.json. Same race as
+            # -Auto against Claude Code's in-memory ~/.claude.json
+            # cache, so the same pre-loop guard applies. Test mirrors
+            # the -Auto version above; the throw message names the
+            # specific flag.
+            Mock Test-ClaudeRunning -MockWith { $true }
+
+            { Invoke-UsageWatch -Warmup 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*sca usage -Warmup*'
+        }
+
+        It '-Watch -Warmup with Claude Code NOT running passes the startup guard and short-circuits on IsOutputRedirected' {
+            # Test-ClaudeRunning's default mock returns $false. The guard
+            # silently passes; the IsOutputRedirected guard throws next
+            # because Pester's stdout is redirected. On an interactive
+            # terminal (test runner invoked without redirection),
+            # IsOutputRedirected is $false and the alt-screen would
+            # blank the terminal; skip in that case (same pattern as
+            # the -Auto sibling test above).
+            if (-not [Console]::IsOutputRedirected) {
+                Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
+                return
+            }
+            { Invoke-UsageWatch -Warmup 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
+        }
+    }
+
+    Context 'anthropic-version header propagation' {
+        # Defense-in-depth: assert that every authenticated request adds
+        # the anthropic-version header so a future tightening at any
+        # endpoint does not silently break the script. Mirrors the
+        # constants-block decision documented in $Script:AnthropicApi-
+        # Version's docstring.
+
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+            $script:PastMs   = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+        }
+
+        It 'Get-SlotUsage sends anthropic-version on /api/oauth/usage' {
+            $payload = @{
+                claudeAiOauth = @{ accessToken = 'sk-fresh'; refreshToken = 'rt-fresh'; expiresAt = $script:FutureMs }
+            } | ConvertTo-Json -Depth 10 -Compress
+            $path = Join-Path $script:CredDirPath '.credentials.usage-ver(u@test.local).json'
+            Set-Content -LiteralPath $path -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $script:capturedHeaders = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:capturedHeaders = $Headers
+                return [pscustomobject]@{}
+            }
+
+            Get-SlotUsage -SlotPath $path | Out-Null
+
+            $script:capturedHeaders['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
+        }
+
+        It 'Get-SlotProfile sends anthropic-version on /api/oauth/profile' {
+            $payload = @{
+                claudeAiOauth = @{ accessToken = 'sk-fresh'; refreshToken = 'rt-fresh'; expiresAt = $script:FutureMs }
+            } | ConvertTo-Json -Depth 10 -Compress
+            $path = Join-Path $script:CredDirPath '.credentials.profile-ver(p@test.local).json'
+            Set-Content -LiteralPath $path -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $script:capturedHeaders = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                $script:capturedHeaders = $Headers
+                return [pscustomobject]@{ account = [pscustomobject]@{ email = 'p@test.local' } }
+            }
+
+            Get-SlotProfile -SlotPath $path | Out-Null
+
+            $script:capturedHeaders['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
+        }
+
+        It 'Update-SlotTokens sends anthropic-version on /v1/oauth/token' {
+            $payload = @{
+                claudeAiOauth = @{ accessToken = 'sk-OLD'; refreshToken = 'rt-OLD'; expiresAt = $script:PastMs }
+            } | ConvertTo-Json -Depth 10 -Compress
+            $path = Join-Path $script:CredDirPath '.credentials.token-ver(t@test.local).json'
+            Set-Content -LiteralPath $path -Value $payload -NoNewline -Encoding utf8NoBOM
+
+            $script:capturedHeaders = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:capturedHeaders = $Headers
+                return [pscustomobject]@{ access_token = 'sk-NEW'; refresh_token = 'rt-NEW'; expires_in = 3600 }
+            }
+
+            Update-SlotTokens -SlotPath $path | Out-Null
+
+            $script:capturedHeaders['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
+        }
+    }
+
+    Context "warmup status labels render correctly in the table" {
+        # The synthetic snapshot built by Invoke-UsageWatch's `-Warmup`
+        # startup carries Status='warming-up' on every row initially;
+        # Invoke-WarmAllSlots mutates each row's Status as it processes
+        # the slot. All warmup status labels must render with the
+        # correct space-separated form in the Status column AND map to
+        # the documented color via Get-StatusColor.
+
+        BeforeEach {
+            $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+        }
+
+        It 'Format-UsageTable renders warming-up rows with "warming up" in the Status column' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Email 'alpha@test.local' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Email 'bravo@test.local' | Out-Null
+
+            $synth = @(Get-Slots) | ForEach-Object {
+                [pscustomobject]@{
+                    Name     = $_.Name
+                    Email    = $_.Email
+                    Path     = $_.Path
+                    IsActive = $_.IsActive
+                    Status   = 'warming-up'
+                    Data     = $null
+                }
+            }
+
+            $out = Format-UsageTable -Results $synth 6>&1 | Out-String
+
+            # Each row carries the rendered label 'warming up'. Two
+            # occurrences (one per slot row), surrounded by the
+            # column boundary so we don't accidentally match a stray
+            # word elsewhere in the table.
+            ([regex]::Matches($out, '\bwarming up\b')).Count | Should -Be 2
+            # Session / Week cells render as the no-data sentinel because
+            # synthetic rows carry Data = $null.
+            $out | Should -Match '—'
+        }
+
+        It "Format-UsageTable renders 'priming' in the Status column" {
+            # Slot name deliberately does NOT contain the label
+            # substring so the regex matches the Status column only,
+            # not the Account column.
+            New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Email 'alpha@test.local' | Out-Null
+
+            $synth = @(Get-Slots) | ForEach-Object {
+                [pscustomobject]@{
+                    Name     = $_.Name
+                    Email    = $_.Email
+                    Path     = $_.Path
+                    IsActive = $_.IsActive
+                    Status   = 'priming'
+                    Data     = $null
+                }
+            }
+
+            $out = Format-UsageTable -Results $synth 6>&1 | Out-String
+
+            ([regex]::Matches($out, '\bpriming\b')).Count | Should -Be 1
+        }
+
+        It 'Get-StatusColor maps "warming up" to Yellow' {
+            Get-StatusColor -Label 'warming up' -IsActive $false | Should -Be 'Yellow'
+            Get-StatusColor -Label 'warming up' -IsActive $true  | Should -Be 'Yellow'
+        }
+
+        It 'Get-StatusColor maps "priming" to Yellow' {
+            # 'priming' is transient like 'warming up' -> Yellow.
+            Get-StatusColor -Label 'priming' -IsActive $false | Should -Be 'Yellow'
+            Get-StatusColor -Label 'priming' -IsActive $true  | Should -Be 'Yellow'
+        }
+    }
+
+    Context 'Invoke-WarmAllSlots' {
+        # The orchestrator behind `-Warmup` startup. Builds its own snapshot
+        # from Get-Slots (filtered by -Name), then for each slot in
+        # alphabetical order: marks Status='priming' -> Invoke-SlotSwap
+        # makes it active -> Invoke-SlotPrime POSTs a minimal billable
+        # /v1/messages request to open the slot's 5h server-side session
+        # window -> copies result onto the row. Returns the populated
+        # snapshot; the caller hands it off to the polling loop as its
+        # first frame. A finally block restores the original active slot
+        # captured before the loop.
+
+        BeforeAll {
+            function New-WarmupSlot {
+                Param (
+                    [string] $Name,
+                    [string] $Email = "$Name@test.local",
+                    [Nullable[long]] $ExpiresAt = $null
+                )
+                if ($null -eq $ExpiresAt) { $ExpiresAt = $script:FutureMs }
+                $payload = @{
+                    claudeAiOauth = @{
+                        accessToken  = "sk-ant-oat-$Name"
+                        refreshToken = "sk-ant-ort-$Name"
+                        expiresAt    = $ExpiresAt
+                    }
+                } | ConvertTo-Json -Depth 10 -Compress
+                return New-SlotPair -CredDir $script:CredDirPath -Name $Name -Email $Email -Content $payload
+            }
+
+            # Look up a row's Status by slot name.
+            function Get-RowStatus {
+                Param ($Snapshot, [string] $Name)
+                return ($Snapshot.Results | Where-Object { $_.Name -eq $Name }).Status
+            }
+
+            # Mock /v1/messages success payload. Invoke-SlotPrime
+            # discards the response body (the prime is for the side
+            # effect), so the shape just needs to NOT throw through
+            # Invoke-RestMethod.
+            function New-PrimeOk {
+                return [pscustomobject]@{
+                    id      = 'msg_test'
+                    type    = 'message'
+                    role    = 'assistant'
+                    content = @([pscustomobject]@{ type = 'text'; text = '.' })
+                }
+            }
+        }
+
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+
+            # Default Invoke-SlotSwap mock: no-op success. Tests that
+            # assert on swap behavior (call order, restore, failure
+            # mid-loop) override this mock locally.
+            Mock Invoke-SlotSwap -MockWith { }
+
+            # Default /api/oauth/usage mock for the verify-after-prime read:
+            # a successful prime now triggers a Get-SlotUsage call so the
+            # warmup frame shows live percentages. Returns small valid
+            # buckets; tests that assert specific usage outcomes override
+            # this locally (a later mock with the same Uri filter wins).
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 1.0; resets_at = $null }
+                }
+            }
+        }
+
+        It 'returns $null when no slots are saved' {
+            $script:repaints = 0
+            Mock Invoke-RestMethod -MockWith { throw 'should not be called' }
+
+            $result = Invoke-WarmAllSlots -Name '' -Repaint { $script:repaints++ }
+
+            $result          | Should -BeNullOrEmpty
+            $script:repaints | Should -Be 0
+        }
+
+        It '-Name filter returns $null when no slot matches' {
+            New-WarmupSlot -Name 'alpha' | Out-Null
+            Invoke-WarmAllSlots -Name 'missing' -Repaint { } | Should -BeNullOrEmpty
+        }
+
+        It '-Name filter passes through Get-SafeName sanitization (narrows to the sanitized slot name)' {
+            # Get-SafeName replaces invalid Windows chars with _. The
+            # filter should still resolve to the sanitized slot name.
+            New-WarmupSlot -Name 'work_slot' -Email 'w@test.local' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+
+            $snap = Invoke-WarmAllSlots -Name 'work?slot' -Repaint { }
+
+            $snap                 | Should -Not -BeNullOrEmpty
+            $snap.Results.Count   | Should -Be 1
+            $snap.Results[0].Name | Should -Be 'work_slot'
+        }
+
+        It 'fresh-token slots: prime ok then verify-after-prime populates live bucket data' {
+            New-WarmupSlot -Name 'a' -ExpiresAt $script:FutureMs | Out-Null
+            New-WarmupSlot -Name 'b' -ExpiresAt $script:FutureMs | Out-Null
+
+            # Mock /v1/messages to return ok; /v1/oauth/token should NOT
+            # be called because the tokens are fresh. /api/oauth/usage is
+            # mocked in BeforeEach (the verify-after-prime read).
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw 'token endpoint should not be called for fresh tokens'
+            }
+
+            $script:repaints = 0
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { $script:repaints++ }
+
+            (Get-RowStatus $snap 'a') | Should -Be 'ok'
+            (Get-RowStatus $snap 'b') | Should -Be 'ok'
+            # After an ok prime the verify-after-prime usage read populates
+            # the row with live bucket data, so the first frame shows real
+            # percentages instead of 'ok (no plan data)'.
+            ($snap.Results | Where-Object Name -eq 'a').Data.five_hour.utilization | Should -Be 5
+            ($snap.Results | Where-Object Name -eq 'b').Data.seven_day.utilization | Should -Be 1
+            # Repaints: 1 (initial 'warming-up' frame) + 2 per slot
+            # ('priming' + terminal) = 1 + 4 = 5.
+            $script:repaints | Should -Be 5
+        }
+
+        It 'slot enumeration is alphabetical' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+
+            $script:order = @()
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                # Capture which slot's access token is in the Authorization header.
+                $bearer = $Headers['Authorization']
+                $script:order += ($bearer -replace '^Bearer sk-ant-oat-', '')
+                return New-PrimeOk
+            }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $script:order | Should -Be @('a','b','c')
+        }
+
+        It 'Invoke-SlotPrime returns rate-limited: row ends Status="rate-limited"' {
+            New-WarmupSlot -Name 'limited' | Out-Null
+
+            Mock Start-Sleep -MockWith { }
+            $resp  = [pscustomobject]@{ StatusCode = 429 }
+            $inner = [System.Exception]::new('429 Too Many Requests')
+            $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                throw $inner
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            (Get-RowStatus $snap 'limited') | Should -Be 'rate-limited'
+            # A failed prime skips the verify-after-prime usage read: the
+            # prime's own outcome is the signal, and a usage call would not
+            # add information.
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+        }
+
+        It 'verify-after-prime: an ok prime triggers exactly one usage read per slot' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            (Get-RowStatus $snap 'a') | Should -Be 'ok'
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+        }
+
+        It 'no-OAuth slot: row ends Status="no-oauth" without any messages call' {
+            $payload = '{"apiKey":"sk-ant-api-..."}'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'apikey' -Email 'a@b.com' -Content $payload | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                throw 'messages endpoint should not be called for no-OAuth slot'
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq $Script:MessagesEndpoint }
+            (Get-RowStatus $snap 'apikey') | Should -Be 'no-oauth'
+        }
+
+        It 'Invoke-SlotPrime throws: row ends Status="error" with the exception message' {
+            New-WarmupSlot -Name 'crash' | Out-Null
+
+            Mock Invoke-SlotPrime -MockWith {
+                throw [System.Exception]::new('synthetic Invoke-SlotPrime failure')
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            (Get-RowStatus $snap 'crash') | Should -Be 'error'
+            ($snap.Results | Where-Object Name -eq 'crash').Error | Should -Match 'synthetic'
+        }
+
+        It 'mixed rates: some slots ok, others rate-limited - all surface their real outcomes' {
+            New-WarmupSlot -Name 'good' | Out-Null
+            New-WarmupSlot -Name 'limited' | Out-Null
+
+            Mock Start-Sleep -MockWith { }
+            $resp  = [pscustomobject]@{ StatusCode = 429 }
+            $inner = [System.Exception]::new('429 Too Many Requests')
+            $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                if ($Headers['Authorization'] -eq 'Bearer sk-ant-oat-limited') {
+                    throw $inner
+                }
+                return New-PrimeOk
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            (Get-RowStatus $snap 'good')    | Should -Be 'ok'
+            (Get-RowStatus $snap 'limited') | Should -Be 'rate-limited'
+        }
+
+        It 'sleeps $Script:WarmupPrimingMinMs BEFORE Invoke-SlotPrime per slot (minimum on-screen visibility floor)' {
+            # Pin the contract that the 'priming' label is visible
+            # for at least $Script:WarmupPrimingMinMs before the HTTP
+            # call (which would otherwise overwrite it on a fast-LAN
+            # return).
+            New-WarmupSlot -Name 'a' -ExpiresAt $script:FutureMs | Out-Null
+            New-WarmupSlot -Name 'b' -ExpiresAt $script:FutureMs | Out-Null
+
+            # Promote the floor to a non-zero value for this test only.
+            $previousFloor = $Script:WarmupPrimingMinMs
+            $Script:WarmupPrimingMinMs = 200
+
+            try {
+                $script:timeline = @()
+                Mock Start-Sleep -MockWith {
+                    Param ($Milliseconds, $Seconds)
+                    $script:timeline += [pscustomobject]@{ Kind = 'Start-Sleep'; Ms = $Milliseconds }
+                }
+                Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                    $script:timeline += [pscustomobject]@{ Kind = 'Invoke-RestMethod'; Ms = $null }
+                    return New-PrimeOk
+                }
+
+                Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+                # Floor sleep fires once per slot.
+                $floorSleeps = @($script:timeline | Where-Object {
+                    $_.Kind -eq 'Start-Sleep' -and $_.Ms -eq 200
+                })
+                $floorSleeps.Count | Should -Be 2 -Because (
+                    'Invoke-WarmAllSlots must Start-Sleep $Script:WarmupPrimingMinMs ' +
+                    "once per slot (2 slots in this test). Found $($floorSleeps.Count) sleeps at 200 ms.")
+
+                # First 200 ms sleep precedes first HTTP call.
+                $firstSleepIdx = ($script:timeline | ForEach-Object { $_ } | Where-Object {
+                    $_.Kind -eq 'Start-Sleep' -and $_.Ms -eq 200
+                } | Select-Object -First 1 | ForEach-Object {
+                    [array]::IndexOf($script:timeline, $_)
+                })
+                $firstHttpIdx = ($script:timeline | ForEach-Object { $_ } | Where-Object {
+                    $_.Kind -eq 'Invoke-RestMethod'
+                } | Select-Object -First 1 | ForEach-Object {
+                    [array]::IndexOf($script:timeline, $_)
+                })
+
+                $firstSleepIdx | Should -BeLessThan $firstHttpIdx -Because (
+                    'the floor Start-Sleep must fire BEFORE the per-slot ' +
+                    "Invoke-RestMethod call; post-HTTP sleep would not floor the 'priming' label's visibility.")
+            }
+            finally {
+                $Script:WarmupPrimingMinMs = $previousFloor
+            }
+        }
+
+        It 'skips the floor Start-Sleep when $Script:WarmupPrimingMinMs is 0 (test override is zero-overhead)' {
+            New-WarmupSlot -Name 'a' -ExpiresAt $script:FutureMs | Out-Null
+            $Script:WarmupPrimingMinMs | Should -Be 0
+
+            $script:zeroSleepCalls = 0
+            Mock Start-Sleep -MockWith {
+                Param ($Milliseconds, $Seconds)
+                if ($Milliseconds -eq 0) { $script:zeroSleepCalls++ }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $script:zeroSleepCalls | Should -Be 0 -Because (
+                'with $Script:WarmupPrimingMinMs = 0 the guarded `if (>0)` block must skip Start-Sleep entirely.')
+        }
+
+        # Swap-then-prime round-robin contract.
+
+        It 'calls Invoke-SlotSwap once per slot in alphabetical order before each Invoke-SlotPrime' {
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+
+            New-WarmupSlot -Name 'c' | Out-Null
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            # First three entries: alphabetical round-robin. No state file
+            # means no restore call after the loop; restore behavior has
+            # its own test below.
+            $script:swapNames[0..2] | Should -Be @('a', 'b', 'c')
+        }
+
+        It 'restores the original active slot via one final Invoke-SlotSwap after the loop' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            # Expected call order: a (round-robin), b (round-robin), a (restore).
+            $script:swapNames | Should -Be @('a', 'b', 'a')
+        }
+
+        It 'skips the final restore swap when no original active slot is captured' {
+            # No state file written: Read-ScaState returns $null,
+            # $origActive stays $null, the finally block silently skips
+            # the restore. User ends on the last-primed slot.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            $script:swapCount = 0
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapCount++ }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            # 2 swaps (one per slot, no restore). If the restore fired
+            # the count would be 3.
+            $script:swapCount | Should -Be 2
+        }
+
+        It 'mid-loop Invoke-SlotSwap failure marks the row Status="error", continues with remaining slots, and still runs the restore' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+                if ($Slot.Name -eq 'b') {
+                    throw [System.Exception]::new('synthetic swap failure on b')
+                }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+
+            $snap = $null
+            { $script:snap = Invoke-WarmAllSlots -Name '' -Repaint { } } | Should -Not -Throw
+            $snap = $script:snap
+
+            (Get-RowStatus $snap 'a') | Should -Be 'ok'
+            (Get-RowStatus $snap 'b') | Should -Be 'error'
+            ($snap.Results | Where-Object Name -eq 'b').Error | Should -Match 'synthetic'
+            (Get-RowStatus $snap 'c') | Should -Be 'ok'
+
+            # Call order: a (round-robin), b (round-robin, throws),
+            # c (round-robin), a (restore).
+            $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
+        }
+
+        It 'restore-failure advisory names the actual active slot, not rows[-1], on a double swap failure' {
+            # Double failure: the LAST round-robin swap (c) throws, so the
+            # loop ends active on b (the last successful swap), and the
+            # restore swap to the original active slot (a) also throws,
+            # firing the advisory. The advisory must name b, not c
+            # (rows[-1]).
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+                # Last round-robin slot fails.
+                if ($Slot.Name -eq 'c') {
+                    throw [System.Exception]::new('synthetic swap failure on c')
+                }
+                # Second call for 'a' is the restore; let the first
+                # (round-robin) succeed so the loop progresses past a.
+                if ($Slot.Name -eq 'a' -and (@($script:swapNames | Where-Object { $_ -eq 'a' }).Count -ge 2)) {
+                    throw [System.Exception]::new('synthetic restore failure on a')
+                }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+            Mock Write-Color -MockWith { }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            # Call order: a (round-robin), b (round-robin), c (throws),
+            # a (restore, throws).
+            $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
+            Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'b'" }
+            Should -Invoke Write-Color -Times 0 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+        }
+
+        It 'restore-failure advisory names the last primed slot when every round-robin swap succeeded' {
+            # Common case: all loop swaps succeed; only the restore fails.
+            # The user is left on the last primed slot (c), and the
+            # advisory names it.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+                # Only the restore (second 'a' call) fails.
+                if ($Slot.Name -eq 'a' -and (@($script:swapNames | Where-Object { $_ -eq 'a' }).Count -ge 2)) {
+                    throw [System.Exception]::new('synthetic restore failure on a')
+                }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+            Mock Write-Color -MockWith { }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
+            Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+        }
+    }
+
+    Context 'Invoke-SlotPrime' {
+        # Direct tests for the prime helper used by Invoke-WarmAllSlots.
+        # Mirror Get-SlotUsage's status vocabulary and refresh-on-expiry
+        # behavior but POST a minimal billable /v1/messages payload.
+
+        BeforeAll {
+            # Build a slot file with an OAuth payload. Access/refresh
+            # tokens default to deterministic name-derived values so
+            # tests can assert on the Authorization header without
+            # threading the value through. ExpiresAt defaults to
+            # $script:FutureMs (set per-test in BeforeEach below); pass
+            # $script:PastMs to force a refresh.
+            function New-PrimeSlot {
+                Param (
+                    [string]         $Name,
+                    [Nullable[long]] $ExpiresAt = $null
+                )
+                if ($null -eq $ExpiresAt) { $ExpiresAt = $script:FutureMs }
+                $payload = @{
+                    claudeAiOauth = @{
+                        accessToken  = "sk-ant-oat-$Name"
+                        refreshToken = "sk-ant-ort-$Name"
+                        expiresAt    = $ExpiresAt
+                    }
+                } | ConvertTo-Json -Compress
+                return New-SlotPair -CredDir $script:CredDirPath -Name $Name -Email "$Name@test.local" -Content $payload
+            }
+
+            # Build an Invoke-RestMethod-style exception carrying a fake
+            # HttpResponse with the given StatusCode, so production
+            # catch blocks can read $_.Exception.Response.StatusCode.
+            function New-HttpError {
+                Param (
+                    [int]    $StatusCode,
+                    [string] $Message = "$StatusCode error"
+                )
+                $resp = [pscustomobject]@{ StatusCode = $StatusCode }
+                $ex   = [System.Exception]::new($Message)
+                $ex | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                return $ex
+            }
+
+            $script:TokenEndpointUri = 'https://platform.claude.com/v1/oauth/token'
+        }
+
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+            $script:PastMs   = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+        }
+
+        It 'no-OAuth slot returns Status=no-oauth without HTTP' {
+            $path = New-SlotPair -CredDir $script:CredDirPath -Name 'apikey' -Email 'a@b.com' -Content '{"apiKey":"sk-ant-api-..."}'
+            Mock Invoke-RestMethod -MockWith { throw 'should not be called' }
+
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'no-oauth'
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly
+        }
+
+        It 'fresh-token slot POSTs /v1/messages with the right headers + body and returns Status=ok' {
+            $path = New-PrimeSlot -Name 'fresh'
+
+            $script:captured = @{}
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                $script:captured.Method  = $Method
+                $script:captured.Uri     = $Uri
+                $script:captured.Body    = $Body
+                $script:captured.Headers = $Headers
+                return [pscustomobject]@{ id = 'msg_x' }
+            }
+
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'ok'
+            $script:captured.Method                       | Should -Be 'Post'
+            $script:captured.Uri                          | Should -Be $Script:MessagesEndpoint
+            $script:captured.Headers['Authorization']     | Should -Be 'Bearer sk-ant-oat-fresh'
+            $script:captured.Headers['anthropic-beta']    | Should -Be $Script:AnthropicBeta
+            $script:captured.Headers['anthropic-version'] | Should -Be $Script:AnthropicApiVersion
+
+            # Body shape: pinned model, max_tokens=1, single user "." message.
+            $parsed = $script:captured.Body | ConvertFrom-Json
+            $parsed.model               | Should -Be $Script:PrimeModel
+            $parsed.max_tokens          | Should -Be 1
+            $parsed.messages.Count      | Should -Be 1
+            $parsed.messages[0].role    | Should -Be 'user'
+            $parsed.messages[0].content | Should -Be '.'
+        }
+
+        It 'expired-token slot refreshes then primes with the new bearer' {
+            $path = New-PrimeSlot -Name 'expired' -ExpiresAt $script:PastMs
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $script:TokenEndpointUri } -MockWith {
+                return [pscustomobject]@{ access_token = 'sk-ant-oat-NEW'; refresh_token = 'sk-ant-ort-NEW'; expires_in = 3600 }
+            }
+            $script:capturedAuth = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                $script:capturedAuth = $Headers['Authorization']
+                return [pscustomobject]@{ id = 'msg_x' }
+            }
+
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'ok'
+            $script:capturedAuth                       | Should -Be 'Bearer sk-ant-oat-NEW'
+        }
+
+        It 'token refresh 429 returns Status=rate-limited with no Error tail (no messages call)' {
+            $path = New-PrimeSlot -Name 'stuck' -ExpiresAt $script:PastMs
+            Mock Start-Sleep -MockWith { }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $script:TokenEndpointUri } -MockWith {
+                throw (New-HttpError -StatusCode 429 -Message '429 Too Many Requests')
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                throw 'messages endpoint should not be called when refresh 429s'
+            }
+
+            $r = Invoke-SlotPrime -SlotPath $path
+            $r.Status                       | Should -Be 'rate-limited'
+            $r.PSObject.Properties['Error'] | Should -BeNullOrEmpty
+        }
+
+        It 'token refresh non-429 returns Status=expired with the underlying error' {
+            $path = New-PrimeSlot -Name 'broken' -ExpiresAt $script:PastMs
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $script:TokenEndpointUri } -MockWith {
+                throw [System.Exception]::new('synthetic refresh failure')
+            }
+
+            $r = Invoke-SlotPrime -SlotPath $path
+            $r.Status | Should -Be 'expired'
+            $r.Error  | Should -Match 'synthetic'
+        }
+
+        It 'messages endpoint 401 returns Status=unauthorized' {
+            $path = New-PrimeSlot -Name 'revoked'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                throw (New-HttpError -StatusCode 401 -Message '401 Unauthorized')
+            }
+
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'unauthorized'
+        }
+
+        It 'messages endpoint 429 returns Status=rate-limited' {
+            $path = New-PrimeSlot -Name 'busy'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                throw (New-HttpError -StatusCode 429 -Message '429 Too Many Requests')
+            }
+
+            (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'rate-limited'
+        }
+
+        It 'messages endpoint generic exception returns Status=error with the message' {
+            $path = New-PrimeSlot -Name 'flaky'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith {
+                throw [System.Exception]::new('network down')
+            }
+
+            $r = Invoke-SlotPrime -SlotPath $path
+            $r.Status | Should -Be 'error'
+            $r.Error  | Should -Match 'network down'
         }
     }
 

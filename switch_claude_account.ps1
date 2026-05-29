@@ -107,6 +107,23 @@ Param (
     [ValidateRange(1, 100)]
     [int] $Threshold = 95,
 
+    # -Warmup: in `sca usage -Watch`, prime every saved slot before the
+    # first poll. For each slot in alphabetical order, Invoke-WarmAllSlots
+    # makes the slot active (Invoke-SlotSwap) then sends a minimal
+    # billable /v1/messages request (Invoke-SlotPrime) so Anthropic opens
+    # a server-side 5h session window for the slot. Subsequent
+    # /api/oauth/usage polls then return real bucket data instead of
+    # empty/rate-limited responses. Cost: ~2 tokens per slot per warmup
+    # on the pinned Haiku model (fractions of a cent). Bound to the
+    # 'Watch' parameter set so the binder rejects -Warmup without
+    # -Watch. Independent of -Auto: works with bare -Watch and with
+    # -Watch -Auto. The pre-loop Test-ClaudeRunning guard refuses to
+    # operate when Claude Code is running because the per-slot swap
+    # writes ~/.claude.json's oauthAccount, which Claude Code keeps in
+    # an in-memory cache.
+    [Parameter(ParameterSetName = 'Watch')]
+    [switch] $Warmup,
+
     # -NoColor: suppress all ANSI color output for this invocation. We
     # implement no-color via two cooperating pieces:
     #   1. The `Write-Color` helper wraps every colored message string
@@ -161,7 +178,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '2.2.1'
+$Script:ScriptVersion = '2.3.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -169,17 +186,17 @@ $Script:ScriptVersion = '2.2.1'
 $MarkerStart = "# === Switch Claude Account ==="
 $MarkerEnd   = "# === End Switch Claude Account ==="
 
-# --- Unofficial /api/oauth/usage constants ---
+# --- Unofficial Claude Code OAuth-flow constants ---
 #
-# These values power the `usage` action, which replicates the live 5-hour
-# and 7-day rate-limit read that Claude Code's own `/usage` slash command
-# performs. They were extracted from claude.exe 2.1.119 (a Bun-compiled
-# binary that embeds the JS source) by string-scanning the file.
+# These values power the `usage` action, which replicates the live 5h /
+# 7d rate-limit read that Claude Code's own `/usage` slash command
+# performs. Extracted from claude.exe 2.1.119 (a Bun-compiled binary
+# that embeds the JS source) by string-scanning the file.
 #
-# This endpoint is UNDOCUMENTED and unsupported by Anthropic. Expect it
-# to break when Anthropic bumps the beta flag, rotates the OAuth client
-# id, or reshapes the response body. To re-extract after an upstream
-# change, from a PowerShell 7 prompt:
+# These endpoints are UNDOCUMENTED and unsupported by Anthropic. Expect
+# them to break when Anthropic bumps the beta flag, rotates the OAuth
+# client id, or reshapes the response body. To re-extract after an
+# upstream change, from a PowerShell 7 prompt:
 #
 #   $bin   = (Get-Command claude -ErrorAction Stop).Source
 #   $bytes = [IO.File]::ReadAllBytes($bin)
@@ -188,20 +205,57 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 #   # Profile endpoint path:  $text | Select-String '/api/oauth/profile' (function Ql)
 #   # Base API URL + TOKEN_URL + CLIENT_ID: Select-String 'TOKEN_URL:"'
 #   # Beta header value:      Select-String 'lj="oauth-'
+#   # API version header:     Select-String 'anthropic-version'
 #   # UA version convention:  Select-String 'claude-code/\$\{'
 #
 # The client id below is the Claude.ai subscription flow's client id
 # (matches the `user:sessions:claude_code` scope slot files carry); the
 # other client id in the binary (22422756-...) is for the Console API-key
 # flow and does not accept our refresh tokens.
-$Script:UsageEndpoint     = "https://api.anthropic.com/api/oauth/usage"
-$Script:ProfileEndpoint   = "https://api.anthropic.com/api/oauth/profile"
-$Script:TokenEndpoint     = "https://platform.claude.com/v1/oauth/token"
-$Script:OAuthClientId     = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-$Script:AnthropicBeta     = "oauth-2025-04-20"
-$Script:UsageUserAgent    = "claude-code/2.1.119"
-$Script:UsageTimeoutSec   = 5
-$Script:ProfileTimeoutSec = 10
+$Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
+$Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
+$Script:MessagesEndpoint    = "https://api.anthropic.com/v1/messages"
+$Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
+$Script:OAuthClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+$Script:AnthropicBeta       = "oauth-2025-04-20"
+# anthropic-version: sent on every authenticated request for defense-in-
+# depth. The OAuth-namespaced endpoints (/api/oauth/usage, /api/oauth/
+# profile, /v1/oauth/token) accept calls without it today, but if
+# Anthropic later tightens any of them the script keeps working without
+# an emergency patch. Pinned to the stable 2023-06-01 API version that
+# Claude Code itself ships with.
+$Script:AnthropicApiVersion = "2023-06-01"
+$Script:UsageUserAgent      = "claude-code/2.1.119"
+$Script:UsageTimeoutSec     = 5
+$Script:ProfileTimeoutSec   = 10
+# Priming model + timeout for Invoke-SlotPrime. /v1/messages accepts the
+# claudeAiOauth bearer when paired with the same anthropic-beta header
+# the OAuth-namespaced endpoints use; the OAuth client flow is allowed
+# to call the standard messages API. Pin Haiku as the cheapest current
+# model so each prime costs ~2 tokens (1 in, 1 out). Drifts when
+# Anthropic deprecates the pinned model id; same maintenance recipe as
+# the constants above. /v1/messages can be slower than /api/oauth/usage
+# (model load on cold path), so the timeout is more generous than
+# $UsageTimeoutSec. Model identifier MUST be JSON-safe (no quotes /
+# backslashes): Invoke-SlotPrime inlines it into a format-string body
+# without escaping. All Anthropic model identifiers to date are
+# `[a-z0-9-]+` so this is a non-issue in practice.
+$Script:PrimeModel          = "claude-haiku-4-5"
+$Script:PrimeTimeoutSec     = 15
+
+# Retry policy for /v1/oauth/token on a 429 response. Empirically the
+# refresh endpoint's per-token rate limiter has a short cooldown
+# (~seconds): a slot whose access token expired days ago is "stuck"
+# only until one retry slips through. Three total attempts with
+# exponential backoff (2 s, then 4 s) gives a ~6 s worst-case extra
+# latency per stuck slot, which the watch loop absorbs inside the 60 s
+# poll cadence. Without retry the same slot showed `rate-limited`
+# every poll until the user happened to invoke another sca command
+# during the brief unlock window; the retry collapses that gap.
+# Tunable for tests (Pester overrides them to zero so mocked 429 paths
+# run instantly).
+$Script:TokenRefreshRetryMax     = 3
+$Script:TokenRefreshRetryDelayMs = 2000
 
 # Cache of the last successful /api/oauth/usage response per slot path.
 # Used as a fallback when the endpoint returns 429 (rate limited) so the
@@ -371,6 +425,13 @@ function Write-ScaState {
 # RemoveAction's active-slot guard short-circuits when state is null;
 # Invoke-ListAction reconciles before reading state, so by then the
 # state has been bootstrapped.
+#
+# Legacy field tolerance: state files written by v2.3.0 - v2.4.0-draft
+# carry a `last_warmup_at` field. We parse the file unchanged but
+# silently ignore the field; the next state-mutating write drops it.
+# This is one-way: a downgrade to an older script reading our
+# field-less file works because v2.3.0's Read-ScaState defaults the
+# field to @{} when absent.
 #
 # Errors are swallowed so a corrupt state file or a transient migration
 # write failure does not break the tool; the next state-mutating call
@@ -841,8 +902,10 @@ function Show-Help {
         "  $cmd usage                             # show Session + Week usage for every slot",
         "  $cmd usage -Watch                      # live refresh; 60s polls; Ctrl-C to quit",
         "  $cmd usage -Watch -Interval 300        # slower refresh (floor is 60s)",
+        "  $cmd usage -Watch -Warmup              # prime all slots (billable; ~2 tokens/slot on Haiku)",
         "  $cmd usage -Watch -Auto                # auto-rotate when active slot hits 95% (OpenCode only)",
         "  $cmd usage -Watch -Auto -Threshold 90  # rotate earlier (default is 95%)",
+        "  $cmd usage -Watch -Auto -Warmup        # auto-rotate and prime all available slots",
         "  $cmd usage -Json                       # emit usage as JSON for scripting",
         "  $cmd usage -NoColor                    # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
         "",
@@ -1949,6 +2012,20 @@ function Get-SlotOAuth {
 function Update-SlotTokens {
     Param ([String] $SlotPath)
 
+    # Suppress PowerShell's built-in 'Web request' progress activity
+    # (Write-Progress / stream 4: rotating status messages including
+    # "Waiting for response..." and "Reading web response (NNN bytes)")
+    # so it does not paint the host UI between `sca usage -Watch`
+    # frames. The progress activity is host-managed and bypasses the
+    # DEC 2026 byte-stream sync envelope around each frame, so without
+    # this suppression it flashes in the alt buffer for the duration
+    # of the HTTP call. Function-scoped: PowerShell's preference-
+    # variable scope chain restores the parent value automatically on
+    # function exit (no try/finally needed). Same suppression applied
+    # identically in Get-SlotUsage and Get-SlotProfile (the other two
+    # Invoke-RestMethod call sites in the script).
+    $ProgressPreference = 'SilentlyContinue'
+
     $info = Get-SlotOAuth -SlotPath $SlotPath
     if (-not $info.HasOAuth) {
         throw "Slot '$SlotPath' has no OAuth material to refresh."
@@ -1961,17 +2038,41 @@ function Update-SlotTokens {
     } | ConvertTo-Json -Compress
 
     $headers = @{
-        'Content-Type'   = 'application/json'
-        'anthropic-beta' = $Script:AnthropicBeta
-        'User-Agent'     = $Script:UsageUserAgent
+        'Content-Type'      = 'application/json'
+        'anthropic-beta'    = $Script:AnthropicBeta
+        'anthropic-version' = $Script:AnthropicApiVersion
+        'User-Agent'        = $Script:UsageUserAgent
     }
 
-    $resp = Invoke-RestMethod -Method Post `
-                              -Uri $Script:TokenEndpoint `
-                              -Headers $headers `
-                              -Body $body `
-                              -TimeoutSec $Script:UsageTimeoutSec `
-                              -ErrorAction Stop
+    # 429 retry loop. The token endpoint's per-token rate limiter
+    # unlocks within ~seconds, so a short exponential backoff
+    # (2 s, 4 s) recovers a stuck slot inside one watch-loop tick
+    # without surfacing a spurious 'rate-limited' status. Non-429
+    # exceptions rethrow on the first failure (no point retrying a
+    # 4xx with a malformed request or a 5xx with a server-side
+    # problem). Tests override $Script:TokenRefreshRetryDelayMs to
+    # zero so the mocked 429 paths complete instantly.
+    $resp = $null
+    for ($attempt = 1; $attempt -le $Script:TokenRefreshRetryMax; $attempt++) {
+        try {
+            $resp = Invoke-RestMethod -Method Post `
+                                      -Uri $Script:TokenEndpoint `
+                                      -Headers $headers `
+                                      -Body $body `
+                                      -TimeoutSec $Script:UsageTimeoutSec `
+                                      -ErrorAction Stop
+            break
+        }
+        catch {
+            $is429 = Test-Is429 $_.Exception
+            if (-not $is429 -or $attempt -ge $Script:TokenRefreshRetryMax) {
+                throw
+            }
+            # Exponential backoff: 2 s, 4 s, 8 s ... capped by RetryMax.
+            $sleepMs = $Script:TokenRefreshRetryDelayMs * [Math]::Pow(2, $attempt - 1)
+            Start-Sleep -Milliseconds ([int]$sleepMs)
+        }
+    }
 
     if (-not $resp.access_token) {
         throw "OAuth refresh succeeded but response missing access_token."
@@ -2068,41 +2169,65 @@ function Update-SlotTokens {
 }
 
 # Look up the slot's last successful /api/oauth/usage response in the
-# per-process cache and return it wrapped as an 'ok'+IsCachedFallback
-# result IF still within $Script:UsageCacheTTL minutes of capture.
-# Returns $null on cache miss or stale entry.
+# per-process cache and return it wrapped as an IsCachedFallback result.
+# Returns $null on cache miss (or on a stale entry unless -AllowStale).
 #
 # Used by Get-SlotUsage's two 429 fallback paths (token-endpoint catch
 # and usage-endpoint catch) to collapse what would otherwise be a 4-level
-# if-contains/if-fresh/return ladder into a single helper call. Both
-# paths apply the same freshness policy: cache hits served as 'ok' keep
-# the watch display functional during rate-limited periods (usage data
-# only changes every few hours at most).
+# if-contains/if-fresh/return ladder into a single helper call.
+#
+# Freshness policy:
+#   * Fresh entry (within $Script:UsageCacheTTL minutes) -> served as
+#     'ok'+IsCachedFallback so the watch display stays fully functional
+#     during a brief rate-limit (usage data only changes every few hours).
+#   * Stale entry -> $null by default. With -AllowStale it is served as
+#     'rate-limited'+IsCachedFallback: the LAST-KNOWN percentages stay
+#     visible during a prolonged throttle (so the row keeps its numbers
+#     instead of collapsing to em-dashes and looking like a dead slot),
+#     but the status stays 'rate-limited' so the stale data is never
+#     mistaken for a live reading. The caller serves stale only as a last
+#     resort, after the fresh lookup and (where applicable) the retry have
+#     failed.
 function Get-CachedUsageOrNull {
-    Param ([String] $SlotPath)
+    Param (
+        [String] $SlotPath,
+        [switch] $AllowStale
+    )
     if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) { return $null }
-    $entry = $Script:SlotUsageCache[$SlotPath]
-    if (([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheTTL) {
-        return $null
+    $entry   = $Script:SlotUsageCache[$SlotPath]
+    $isStale = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheTTL
+    if ($isStale) {
+        if (-not $AllowStale) { return $null }
+        return [pscustomobject]@{ Status = 'rate-limited'; Data = $entry.Data; IsCachedFallback = $true }
     }
     return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
 }
 
-# Call /api/oauth/usage for one slot. Auto-refreshes a token that is
-# expired or within 60s of expiry. Returns:
-#   @{ Status = 'ok';           Data = <parsed response> }
-#   @{ Status = 'ok'; Data; IsCachedFallback = $true }      # served from cache after a 429
-#   @{ Status = 'no-oauth' }                                # slot has no claudeAiOauth
-#   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed (non-429)
-#   @{ Status = 'rate-limited' }                            # 429 from refresh OR usage endpoint, no fresh cache
-#   @{ Status = 'unauthorized' }                            # 401/403 from usage endpoint
-#   @{ Status = 'error';   Error = <msg> }                  # network / shape / other
-# Never throws to callers; surfaces every failure mode as a Status value
-# so Invoke-UsageAction can render mixed-health tables without aborting.
-function Get-SlotUsage {
-    Param (
-        [String] $SlotPath
-    )
+# Read a slot's OAuth tokens and return a non-expired access token,
+# refreshing via /v1/oauth/token first if the cached token is past or
+# within 60s of its expiry. Shared prelude for Get-SlotUsage,
+# Get-SlotProfile, and Invoke-SlotPrime; collapses three near-identical
+# 30-line blocks that previously each did Get-SlotOAuth + HasOAuth gate
+# + 60s expiry threshold + Update-SlotTokens with 429-as-rate-limited /
+# non-429-as-expired catches.
+#
+# Returns one of:
+#   @{ Status = 'ok'; AccessToken = <string> }     # caller proceeds with HTTP
+#   @{ Status = 'no-oauth' }                       # slot has no claudeAiOauth
+#   @{ Status = 'rate-limited' }                   # 429 from /v1/oauth/token
+#   @{ Status = 'expired'; Error = <msg> }         # token expired + refresh failed (non-429)
+#   @{ Status = 'error';   Error = <msg> }         # Get-SlotOAuth threw (corrupt slot file etc.)
+#
+# Callers translate the non-ok statuses straight into their own return
+# values. Get-SlotUsage additionally checks $Script:SlotUsageCache for a
+# fresh entry before returning 'rate-limited' (the cache-fallback path);
+# the other two callers have no cache and return the helper's result
+# verbatim.
+#
+# Does NOT set $ProgressPreference: Get-SlotOAuth performs no HTTP, and
+# Update-SlotTokens sets it inside its own scope.
+function Resolve-SlotAccessToken {
+    Param ([String] $SlotPath)
 
     try {
         $info = Get-SlotOAuth -SlotPath $SlotPath
@@ -2126,30 +2251,71 @@ function Get-SlotUsage {
             $accessToken = Update-SlotTokens -SlotPath $SlotPath
         }
         catch {
-            # 429 from the token endpoint shares the rate-limit policy
-            # with the usage endpoint below: serve fresh cached usage
-            # data when available, otherwise surface a clean
-            # 'rate-limited' status. No retry; the token endpoint shares
-            # an upstream limiter with the usage endpoint, so a 5s sleep
-            # would just extend the user's wait without changing the
-            # outcome (and the watch loop will retry on its 60s tick).
+            # 429 from the token endpoint: surface a clean 'rate-limited'
+            # status. No retry; the token endpoint shares an upstream
+            # limiter with the usage endpoint, so a 5s sleep would just
+            # extend the user's wait without changing the outcome.
             if (Test-Is429 $_.Exception) {
-                $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
-                if ($cached) { return $cached }
                 return [pscustomobject]@{ Status = 'rate-limited' }
             }
             # Non-429 refresh failure (timeout, 4xx other than 429, 5xx,
-            # malformed JSON, …): the token IS expired and we couldn't
+            # malformed JSON, ...): the token IS expired and we couldn't
             # refresh it, so 'expired' remains the accurate label.
             return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
         }
     }
 
+    return [pscustomobject]@{ Status = 'ok'; AccessToken = $accessToken }
+}
+
+# Call /api/oauth/usage for one slot. Auto-refreshes a token that is
+# expired or within 60s of expiry via Resolve-SlotAccessToken. Returns:
+#   @{ Status = 'ok';           Data = <parsed response> }
+#   @{ Status = 'ok'; Data; IsCachedFallback = $true }      # served from cache after a 429
+#   @{ Status = 'no-oauth' }                                # slot has no claudeAiOauth
+#   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed (non-429)
+#   @{ Status = 'rate-limited' }                            # 429 from refresh OR usage endpoint, no fresh cache
+#   @{ Status = 'unauthorized' }                            # 401/403 from usage endpoint
+#   @{ Status = 'error';   Error = <msg> }                  # network / shape / other
+# Never throws to callers; surfaces every failure mode as a Status value
+# so Invoke-UsageAction can render mixed-health tables without aborting.
+function Get-SlotUsage {
+    Param (
+        [String] $SlotPath
+    )
+
+    # Suppress PowerShell's built-in 'Web request' progress activity
+    # (Write-Progress / stream 4) so it does not paint over the watch
+    # loop's alt-screen buffer between frames. See Update-SlotTokens
+    # for the full rationale; same suppression is applied identically
+    # in Get-SlotProfile / Invoke-SlotPrime.
+    $ProgressPreference = 'SilentlyContinue'
+
+    # Resolve a non-expired access token (refresh if needed). Rate-
+    # limited from the token endpoint gets the cache-fallback path here;
+    # other non-ok statuses return verbatim.
+    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
+    if ($tok.Status -ne 'ok') {
+        if ($tok.Status -eq 'rate-limited') {
+            $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
+            if ($cached) { return $cached }
+            # Last resort: keep the last-known percentages visible (marked
+            # cached, status stays 'rate-limited') rather than dropping the
+            # row to a dead-looking em-dash line during a token-endpoint
+            # throttle.
+            $stale = Get-CachedUsageOrNull -SlotPath $SlotPath -AllowStale
+            if ($stale) { return $stale }
+        }
+        return $tok
+    }
+    $accessToken = $tok.AccessToken
+
     $headers = @{
-        'Authorization'  = "Bearer $accessToken"
-        'anthropic-beta' = $Script:AnthropicBeta
-        'Content-Type'   = 'application/json'
-        'User-Agent'     = $Script:UsageUserAgent
+        'Authorization'     = "Bearer $accessToken"
+        'anthropic-beta'    = $Script:AnthropicBeta
+        'anthropic-version' = $Script:AnthropicApiVersion
+        'Content-Type'      = 'application/json'
+        'User-Agent'        = $Script:UsageUserAgent
     }
 
     try {
@@ -2197,6 +2363,13 @@ function Get-SlotUsage {
             # exists at all, retry once after a short delay so back-to-
             # back slot polls don't all hit the rate limit simultaneously.
             if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
+                # Stale entry: serve the last-known percentages (marked
+                # cached, status stays 'rate-limited') so the row keeps its
+                # numbers during a prolonged throttle instead of collapsing
+                # to em-dashes. No retry sleep: a stale entry means we've
+                # been throttled long enough that a 5s wait won't help.
+                $stale = Get-CachedUsageOrNull -SlotPath $SlotPath -AllowStale
+                if ($stale) { return $stale }
                 return [pscustomobject]@{ Status = 'rate-limited' }
             }
             Start-Sleep -Seconds 5
@@ -2237,52 +2410,35 @@ function Get-SlotUsage {
 # update the email on a slot is to re-run `sca save`, which also re-runs
 # this call against the freshly-saved tokens.
 #
-# The HTTP call mirrors Claude Code's Ql() shape exactly: Authorization +
-# Content-Type only, no anthropic-beta / User-Agent. Deviating there for
-# "consistency" would add drift risk without benefit, since Ql() is the
-# known-good call shape.
+# The HTTP call mirrors Claude Code's Ql() shape: Authorization +
+# Content-Type, no anthropic-beta / User-Agent. The single deliberate
+# deviation is the `anthropic-version` header, which Ql() omits but
+# which we send on every authenticated request for defense-in-depth (see
+# the $Script:AnthropicApiVersion docstring up top). The OAuth-namespaced
+# endpoints accept the call with or without it today; sending it
+# uniformly insulates the script from a future tightening at this
+# endpoint without an emergency patch.
 function Get-SlotProfile {
     Param (
         [String] $SlotPath
     )
 
-    try {
-        $info = Get-SlotOAuth -SlotPath $SlotPath
-    }
-    catch {
-        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
-    }
+    # See Get-SlotUsage for the $ProgressPreference rationale; same
+    # suppression here for the /api/oauth/profile HTTP call below.
+    $ProgressPreference = 'SilentlyContinue'
 
-    if (-not $info.HasOAuth) {
-        return [pscustomobject]@{ Status = 'no-oauth' }
-    }
-
-    $accessToken = $info.AccessToken
-
-    # Share the expiry-threshold and refresh logic with Get-SlotUsage so
-    # both endpoints behave identically under token rotation.
-    $threshold = [DateTime]::UtcNow.AddSeconds(60)
-    if ($info.ExpiresAt -and $info.ExpiresAt -lt $threshold) {
-        try {
-            $accessToken = Update-SlotTokens -SlotPath $SlotPath
-        }
-        catch {
-            # Mirror Get-SlotUsage's 429 handling: if the token endpoint
-            # is rate-limited, surface a clean 'rate-limited' status
-            # rather than 'expired: <long 429 message>'. There is no
-            # profile cache to fall back on (Get-SlotProfile is no-cache
-            # by design; see this function's docstring), so the
-            # rate-limited status is the only signal we can give.
-            if (Test-Is429 $_.Exception) {
-                return [pscustomobject]@{ Status = 'rate-limited' }
-            }
-            return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
-        }
-    }
+    # Resolve a non-expired access token; non-ok statuses (including
+    # 429-as-rate-limited from the token endpoint) return verbatim. No
+    # profile cache to fall back on (Get-SlotProfile is no-cache by
+    # design; see the function docstring above).
+    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
+    if ($tok.Status -ne 'ok') { return $tok }
+    $accessToken = $tok.AccessToken
 
     $headers = @{
-        'Authorization' = "Bearer $accessToken"
-        'Content-Type'  = 'application/json'
+        'Authorization'     = "Bearer $accessToken"
+        'anthropic-version' = $Script:AnthropicApiVersion
+        'Content-Type'      = 'application/json'
     }
 
     try {
@@ -2314,6 +2470,82 @@ function Get-SlotProfile {
     }
 
     return [pscustomobject]@{ Status = 'ok'; Email = $email }
+}
+
+# Send a minimal billable request to /v1/messages so Anthropic opens a
+# server-side 5h session window for this slot. Subsequent /api/oauth/usage
+# calls against the slot then return real bucket data instead of an empty
+# response (or 429, depending on the account's state). Cost: ~2 tokens
+# per call on the pinned Haiku model (1 input "." + max_tokens=1 output).
+# Used exclusively by Invoke-WarmAllSlots when `sca usage -Watch -Warmup`
+# is set.
+#
+# Returns the same status vocabulary as Get-SlotUsage so the warmup
+# orchestrator can copy the result onto the row without translation:
+#   @{ Status = 'ok' }                                # 2xx; window opened
+#   @{ Status = 'no-oauth' }                          # slot has no claudeAiOauth
+#   @{ Status = 'expired'; Error = <msg> }            # token expired AND refresh failed (non-429)
+#   @{ Status = 'rate-limited' }                      # 429 from refresh OR messages endpoint
+#   @{ Status = 'unauthorized' }                      # 401/403 from messages endpoint
+#   @{ Status = 'error'; Error = <msg> }              # network / shape / other
+#
+# Unlike Get-SlotUsage there is no Data payload (the prime is for the
+# side effect, not the response body) and no per-slot cache (the response
+# carries nothing worth replaying). 429 handling mirrors Get-SlotUsage's
+# token-endpoint catch but without the cache fallback path: a clean
+# 'rate-limited' status is the only signal available.
+function Invoke-SlotPrime {
+    Param (
+        [String] $SlotPath
+    )
+
+    # See Get-SlotUsage for the $ProgressPreference rationale; same
+    # suppression here for the /v1/messages POST below.
+    $ProgressPreference = 'SilentlyContinue'
+
+    # Resolve a non-expired access token; non-ok statuses (including
+    # 429-as-rate-limited from the token endpoint) return verbatim. No
+    # cache to fall back on (priming is fire-and-forget).
+    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
+    if ($tok.Status -ne 'ok') { return $tok }
+    $accessToken = $tok.AccessToken
+
+    $headers = @{
+        'Authorization'     = "Bearer $accessToken"
+        'anthropic-beta'    = $Script:AnthropicBeta
+        'anthropic-version' = $Script:AnthropicApiVersion
+        'Content-Type'      = 'application/json'
+        'User-Agent'        = $Script:UsageUserAgent
+    }
+
+    # Minimal billable payload. `max_tokens=1` caps output; content is a
+    # single "." so the input is one token. Aggregate cost: ~2 tokens
+    # per slot per warmup on the pinned Haiku model (fractions of a cent).
+    $body = '{{"model":"{0}","max_tokens":1,"messages":[{{"role":"user","content":"."}}]}}' -f $Script:PrimeModel
+
+    try {
+        Invoke-RestMethod -Method Post `
+                          -Uri $Script:MessagesEndpoint `
+                          -Headers $headers `
+                          -Body $body `
+                          -TimeoutSec $Script:PrimeTimeoutSec `
+                          -ErrorAction Stop | Out-Null
+        return [pscustomobject]@{ Status = 'ok' }
+    }
+    catch {
+        $status = $null
+        $resp   = $_.Exception.Response
+        if ($resp -and $resp.StatusCode) {
+            $status = [int]$resp.StatusCode
+        }
+        if ($status -eq 401 -or $status -eq 403) {
+            return [pscustomobject]@{ Status = 'unauthorized' }
+        }
+        if ($status -eq 429) {
+            return [pscustomobject]@{ Status = 'rate-limited' }
+        }
+        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
+    }
 }
 
 # Coerce a reset-timestamp value (ISO-8601 string, DateTime, DateTimeOffset,
@@ -2546,8 +2778,21 @@ function Get-StatusColor {
         '^expired'      { return 'Yellow' }
         '^unauthorized' { return 'Red' }
         '^error'        { return 'Red' }
-         '^rate-limited' { return 'Yellow' }
-         default         { return 'Gray' }
+        '^rate-limited' { return 'Yellow' }
+        # 'warming up' is the transient -Watch -Warmup queued state
+        # (slot not yet processed). Yellow matches its "attention
+        # required" cousins (near limit, rate-limited, expired) so
+        # the user immediately knows the row is in flight, not in
+        # steady state.
+        '^warming up'    { return 'Yellow' }
+        # 'priming' is the per-slot in-flight state during the warmup
+        # pass: Invoke-SlotPrime's /v1/messages POST is running for
+        # this row right now. Once the call completes, the row
+        # transitions directly to a real HTTP status ('ok' /
+        # 'rate-limited' / 'no-oauth' / 'expired' / 'unauthorized' /
+        # 'error'), which are already mapped above.
+        '^priming$'      { return 'Yellow' }
+        default          { return 'Gray' }
     }
 }
 
@@ -2763,7 +3008,13 @@ function Format-UsageTable {
         $fiveCell  = '   —'
         $sevenCell = '   —'
 
-        if ($r.Status -eq 'ok' -and $r.Data) {
+        # Render bucket percentages whenever the row carries data, not only
+        # on 'ok'. A 'rate-limited' row served from the (possibly stale)
+        # cache fallback carries last-known Data; showing those numbers
+        # keeps the row from looking like a dead/unused slot during a
+        # transient throttle. Rows with no Data (expired / unauthorized /
+        # error / no-oauth / no-cache rate-limited) keep the em-dash.
+        if ($r.Data) {
             if ($r.Data.five_hour -and $null -ne $r.Data.five_hour.utilization) {
                 $fiveCell = Format-BucketCell $r.Data.five_hour.utilization $r.Data.five_hour.resets_at
             }
@@ -2788,7 +3039,19 @@ function Format-UsageTable {
             'unauthorized' { 'unauthorized (token revoked; run sca switch then /login)' }
             'error'        { "error: $(Format-StatusErrorTail $r.Error)" }
             'rate-limited' { 'rate-limited' }
-            default        { [string]$r.Status }
+            # 'warming-up' is the transient initial label rendered when
+            # Invoke-WarmAllSlots starts iterating slots on `-Watch
+            # -Warmup` startup. Synthetic snapshot rows carry it; the
+            # warmup pass mutates each row's Status to 'priming'
+            # while its /v1/messages call is in flight, then to the
+            # real HTTP outcome ('ok' / 'rate-limited' / 'no-oauth' /
+            # 'expired' / 'unauthorized' / 'error') once the call
+            # returns. The hyphenated internal value renders space-
+            # separated to match the existing label convention
+            # ('rate limited' / 'limited 5h' / 'near limit').
+            'warming-up'    { 'warming up' }
+            'priming'       { 'priming' }
+            default         { [string]$r.Status }
         }
 
         [pscustomobject]@{
@@ -3078,6 +3341,7 @@ function Get-UsageSnapshot {
             Results          = @()
             NoSlots          = $true
             HasCacheFallback = $false
+            HasRateLimited   = $false
         }
     }
 
@@ -3113,6 +3377,11 @@ function Get-UsageSnapshot {
         Results          = @($results)
         NoSlots          = $false
         HasCacheFallback = ($results | Where-Object { $_.IsCachedFallback }).Count -gt 0
+        # HasRateLimited drives the "transient throttle" advisory for the
+        # no-cache case, where the row has no Data to show. A row served
+        # from the cache fallback is also 'rate-limited' but is covered by
+        # the HasCacheFallback advisory branch (which takes precedence).
+        HasRateLimited   = ($results | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0
     }
 }
 
@@ -3175,6 +3444,13 @@ function Format-UsageFrame {
     # endpoint-agnostic wording.
     if ($Snapshot.HasCacheFallback) {
         Write-Color "  [Usage] Warning: Anthropic API rate limited; displaying cached data." 'Yellow'
+    }
+    elseif ($Snapshot.HasRateLimited) {
+        # No cached data to fall back on (first poll under a throttle).
+        # Make it explicit that 'rate-limited' is a transient API condition,
+        # not an unused/dead slot: the slot is active and its numbers return
+        # on the next successful poll.
+        Write-Color "  [Usage] Note: Anthropic API rate limited; this is transient and clears on its own. The slot is active." 'Yellow'
     }
 
     if ($Footer) { Format-UsageFooter $Footer } else { Write-Host '' }
@@ -3359,7 +3635,11 @@ function Invoke-UsageAction {
         # 95 leaves a small safety margin because /api/oauth/usage
         # reporting lags real consumption; range enforced by
         # [ValidateRange(1,100)] on the top-level Param block.
-        [int]    $Threshold = 95
+        [int]    $Threshold = 95,
+        # -Warmup: prime every saved slot via a billable /v1/messages
+        # request before the first poll. Requires -Watch. Independent
+        # of -Auto.
+        [switch] $Warmup
     )
 
     # The top-level Param block enforces -Json/-Watch mutual exclusion via
@@ -3377,8 +3657,15 @@ function Invoke-UsageAction {
         throw "-Auto requires -Watch; auto-rotation runs as part of the watch loop."
     }
 
+    # -Warmup requires -Watch. The top-level parameter set already enforces
+    # this for CLI invocations; the runtime guard catches direct callers
+    # (notably the test suite) that bypass Invoke-Main.
+    if ($Warmup -and -not $Watch) {
+        throw "-Warmup requires -Watch; warmup runs as part of the watch loop's startup."
+    }
+
     if ($Watch) {
-        Invoke-UsageWatch -Name $Name -Interval $Interval -Auto:$Auto -Threshold $Threshold
+        Invoke-UsageWatch -Name $Name -Interval $Interval -Auto:$Auto -Threshold $Threshold -Warmup:$Warmup
         return
     }
 
@@ -3743,6 +4030,194 @@ function Invoke-AutoRotationStep {
 # round number.
 $Script:UsageWatchMinInterval = 60
 
+# Inter-slot spacing during the warmup loop. After each slot is
+# primed, sleep this many milliseconds before moving to the next.
+# Cheap insurance against per-IP burst rate-limits on /v1/messages:
+# 300 ms between calls keeps two-slot pools well under typical burst
+# thresholds while adding only ~300 ms * (N-1) of startup latency.
+# Tunable for tests (Pester overrides to zero).
+#
+# Minimum on-screen visibility for the per-slot transient 'priming'
+# row state during warmup. The 'priming' label is painted into the
+# frame, then Invoke-SlotPrime runs (HTTP POST to /v1/messages), then
+# the terminal-status label replaces it. Without this floor, a fast-
+# LAN prime can return in <100 ms, flashing the 'priming' cell
+# unreadably. 150 ms is the perceptual lower bound for a label the
+# user is meant to read; below that the eye sees a flicker rather
+# than a state. Sleep is placed BEFORE Invoke-SlotPrime (not after)
+# so the floor adds at most one 150 ms * N latency penalty regardless
+# of HTTP timing, and stacks linearly with $WarmupSpacingMs rather
+# than racing it. Tunable for tests (Pester overrides to zero).
+$Script:WarmupSpacingMs    = 300
+$Script:WarmupPrimingMinMs = 150
+
+# Warmup-as-swap-then-prime orchestrator for `sca usage -Watch -Warmup`.
+# Round-robins through every saved slot in alphabetical order: per slot,
+# Invoke-SlotSwap makes it active (writes .credentials.json AND
+# ~/.claude.json's oauthAccount AND state.active_slot) and Invoke-SlotPrime
+# sends a minimal billable /v1/messages request so Anthropic opens a
+# server-side 5h session window for the slot. Either throwing collapses
+# into Status='error' on the row; the loop continues with remaining slots.
+#
+# Why billable priming instead of an /api/oauth/usage probe: a non-active
+# slot's /api/oauth/usage returns empty bucket data (or 429) until a
+# server-side 5h session window has been opened, which only a billable
+# request can do. v2.5.0's swap-then-probe rationale was wrong; this
+# entry retracts that claim. Cost: ~2 tokens per slot per warmup on the
+# pinned Haiku model (fractions of a cent).
+#
+# Verify-after-prime: a successful prime opens the session but returns no
+# bucket data, so the row would otherwise read 'ok (no plan data)' (empty
+# em-dash cells) until the first poll ~60 s later. After an ok prime we
+# immediately call Get-SlotUsage for the slot so the warmup frame shows
+# live percentages right away, matching what plain `sca usage` displays.
+# A failed prime (rate-limited / unauthorized / expired / no-oauth /
+# error) skips the usage read and surfaces the prime's own outcome. Cost:
+# one extra /api/oauth/usage GET per successfully primed slot.
+#
+# Builds the rendered snapshot in place: one row per slot (filtered by
+# -Name when set), each starting at Status='warming-up' with Data=$null,
+# transitioning through 'priming' to its real outcome (the prime's usage
+# read, or the prime's failure status). The end state is the first frame
+# of the polling loop; the caller wires it to $snapshot and sets
+# $lastPoll = now. Returns $null when no slots match.
+#
+# The original active slot is captured before the loop via Read-ScaState
+# + Find-SlotByName. A finally block restores it via one more Invoke-Slot-
+# Swap so a clean exit (or Ctrl-C, which still runs finally) returns the
+# user where they started. Restore failure logs a yellow advisory naming
+# the slot the user is now active on. No active slot captured (fresh
+# install, sidecar-hidden active) is fine: the finally guard skips the
+# restore and the user ends on the last primed slot.
+#
+# $Repaint is invoked as: & $Repaint $snapshot.
+# Per-slot latency is bounded at $WarmupPrimingMinMs (floors the
+# 'priming' label's on-screen visibility against fast-LAN returns)
+# + swap + HTTP + $WarmupSpacingMs (per-IP burst guard between slots).
+function Invoke-WarmAllSlots {
+    Param (
+        [string]                             $Name,
+        [Parameter(Mandatory)] [scriptblock] $Repaint
+    )
+
+    $slots = @(Get-Slots)
+    if ($Name) {
+        $safe  = Get-SafeName $Name
+        $slots = @($slots | Where-Object { $_.Name -eq $safe })
+    }
+    if ($slots.Count -lt 1) { return $null }
+
+    # Each row carries IsCachedFallback so the verify-after-prime usage
+    # read (below) can propagate a 429 cache fallback into the snapshot-
+    # level HasCacheFallback flag, keeping the warmup frame's advisory in
+    # lockstep with the polling loop's frames.
+    $rows = @($slots | ForEach-Object {
+        [pscustomobject]@{
+            Name             = $_.Name
+            Email            = $_.Email
+            Path             = $_.Path
+            IsActive         = $_.IsActive
+            Sidecar          = $_.Sidecar
+            Status           = 'warming-up'
+            Data             = $null
+            Error            = $null
+            IsCachedFallback = $false
+        }
+    })
+    $snapshot = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false; HasRateLimited = $false }
+    & $Repaint $snapshot
+
+    $origActive = $null
+    $state = Read-ScaState
+    if ($state -and $state.active_slot) {
+        $origActive = Find-SlotByName -Name $state.active_slot
+    }
+
+    # Track the slot the process is actually active on. Seeded to
+    # $origActive (the active slot before any swap) and advanced only
+    # after a successful Invoke-SlotSwap below, so it always names the
+    # live active slot even when a mid-loop swap throws (the throw skips
+    # the advance and routes to the catch). The restore-failure advisory
+    # in the finally reads it, so a double swap failure names the slot
+    # the user is genuinely left on rather than blindly assuming rows[-1].
+    $lastSwapped = $origActive
+
+    $last = $rows.Count - 1
+    try {
+        for ($i = 0; $i -le $last; $i++) {
+            $row = $rows[$i]
+            $row.Status = 'priming'
+            & $Repaint $snapshot
+
+            # Conditional sleep so a test-side zero override is a no-op
+            # rather than a degenerate Start-Sleep 0.
+            if ($Script:WarmupPrimingMinMs -gt 0) {
+                Start-Sleep -Milliseconds $Script:WarmupPrimingMinMs
+            }
+
+            # 6>$null suppresses [Switch] / [Sync] advisories so they
+            # don't paint outside the DEC 2026 sync envelope. The try/
+            # catch catches Invoke-SlotSwap throws AND defends against
+            # any Invoke-SlotPrime contract violation (the prime's
+            # documented surface is non-throwing, but defense-in-depth
+            # against unexpected exceptions keeps the loop alive for
+            # the remaining slots). Normal prime failure modes route
+            # through $r.Status (rate-limited / expired / unauthorized
+            # / error) without throwing; this catch only fires on
+            # actual exceptions.
+            try {
+                Invoke-SlotSwap -Slot $row 6>$null
+                # Swap succeeded (it throws on failure): this slot is now
+                # the live active slot. Record it for the restore advisory.
+                $lastSwapped = $row
+                $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
+                if ($r.Status -eq 'ok') {
+                    # Prime opened the session but returns no bucket data.
+                    # Read /api/oauth/usage now (verify-after-prime) so the
+                    # warmup frame shows live percentages immediately,
+                    # instead of 'ok (no plan data)' until the first poll
+                    # ~60 s later. Get-SlotUsage never throws; it returns
+                    # the real outcome (ok / rate-limited / cached / etc.).
+                    $u = Get-SlotUsage -SlotPath $row.Path 6>$null
+                    $row.Status           = $u.Status
+                    $row.Data             = $u.Data
+                    $row.Error            = $u.Error
+                    $row.IsCachedFallback = [bool]$u.IsCachedFallback
+                }
+                else {
+                    # Prime failed (rate-limited / unauthorized / expired /
+                    # no-oauth / error): surface its real outcome; a usage
+                    # read would not add signal here.
+                    $row.Status = $r.Status
+                    $row.Error  = $r.Error
+                }
+            }
+            catch {
+                $row.Status = 'error'
+                $row.Error  = $_.Exception.Message
+            }
+
+            # Keep the snapshot-level advisory flags in lockstep with the
+            # rows mutated so far, so the warmup frame's cache-fallback /
+            # transient-throttle note matches what the polling loop renders.
+            $snapshot.HasCacheFallback = (@($rows | Where-Object { $_.IsCachedFallback }).Count -gt 0)
+            $snapshot.HasRateLimited   = (@($rows | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0)
+            & $Repaint $snapshot
+
+            if ($i -lt $last -and $Script:WarmupSpacingMs -gt 0) {
+                Start-Sleep -Milliseconds $Script:WarmupSpacingMs
+            }
+        }
+    }
+    finally {
+        if ($origActive) {
+            try { Invoke-SlotSwap -Slot $origActive 6>$null }
+            catch { Write-Color "[Warmup] Restore of original active slot '$($origActive.Name)' failed: $($_.Exception.Message). You are now active on '$($lastSwapped.Name)'." 'Yellow' 6>$null }
+        }
+    }
+    return $snapshot
+}
+
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. The redraw cadence is decoupled from
 # the poll cadence so the frame self-heals on terminal resize within
@@ -3794,22 +4269,32 @@ function Invoke-UsageWatch {
         [switch] $Auto,
         # -Threshold: utilization percentage (1..100) at or above which
         # -Auto fires a rotation. Ignored when -Auto is absent.
-        [int]    $Threshold = 95
+        [int]    $Threshold = 95,
+        # -Warmup: prime every saved slot via a billable /v1/messages
+        # request through Invoke-WarmAllSlots before the first poll.
+        # Independent of -Auto: works with bare -Watch and with -Watch
+        # -Auto. See the warmup block below the alt-screen entry for
+        # the synthetic snapshot + Status-column mechanics.
+        [switch] $Warmup
     )
 
-    # Pre-loop Claude Code guard for -Auto. The credentials swap inside
-    # the loop writes to ~/.claude.json's oauthAccount block (via
-    # Invoke-SlotSwap), which Claude Code keeps in an in-memory cache;
-    # racing its flush would clobber our update. Same guard / wording
-    # as Invoke-SwitchAction so the user sees a consistent message
-    # regardless of entry point. The watch loop additionally re-checks
-    # Test-ClaudeRunning before every rotation attempt to cover the
-    # "Claude Code launched mid-watch" race.
+    # Pre-loop Claude Code guard for -Auto and -Warmup. Both write
+    # ~/.claude.json's oauthAccount block via Invoke-SlotSwap (-Auto
+    # during the in-loop rotation step; -Warmup during the per-slot
+    # swap-then-prime round-robin). Claude Code keeps that block in an
+    # in-memory cache; racing its flush would clobber our update.
+    # Same guard / wording as Invoke-SwitchAction so the user sees a
+    # consistent message regardless of entry point. -Auto additionally
+    # re-checks Test-ClaudeRunning before every rotation attempt to
+    # cover the "Claude Code launched mid-watch" race; -Warmup's window
+    # is short enough (one round-robin pass) that the pre-loop check
+    # is the only one needed.
     # Checked BEFORE the IsOutputRedirected guard so the user sees the
     # more actionable "close Claude Code" message rather than the
     # interactive-terminal one (which the test harness always hits).
-    if ($Auto -and (Test-ClaudeRunning)) {
-        throw "Claude Code is running. Close it before 'sca usage -Auto' so the credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
+    if (($Auto -or $Warmup) -and (Test-ClaudeRunning)) {
+        $flag = if ($Auto) { '-Auto' } else { '-Warmup' }
+        throw "Claude Code is running. Close it before 'sca usage $flag' so the credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
     }
 
     if ([Console]::IsOutputRedirected) {
@@ -3850,6 +4335,34 @@ function Invoke-UsageWatch {
         # mode is engaged before the first rotation event.
         $lastAutoFooter = if ($Auto) { '[Auto] Automatic slot switching is enabled.' } else { $null }
 
+        # -Warmup startup pass. Invoke-WarmAllSlots does the per-slot
+        # swap-then-probe round-robin and returns a populated snapshot
+        # we hand off to the polling loop as its first frame ($lastPoll
+        # = now so the loop's first iteration falls into the redraw
+        # branch, not the poll branch). Reconcile first so a cross-
+        # account swap landed since the last sca call is captured before
+        # any slot bytes are read; matches the polling loop's per-poll
+        # contract below.
+        if ($Warmup) {
+            Invoke-Reconcile 6>$null | Out-Null
+
+            # -Auto's right-aligned "▶ switching slot at N%" header
+            # indicator stays off when -Auto is absent.
+            $autoHeader = if ($Auto) { $Threshold } else { 0 }
+            $snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
+                Param ($snap)
+                Write-VTSequence "`e[?2026h`e[2J`e[H"
+                Format-UsageFrame -Name $Name -Snapshot $snap -Footer $lastAutoFooter -AutoThreshold $autoHeader
+                Write-VTSequence "`e[?2026l"
+            }
+            if ($null -ne $snapshot) {
+                $lastPoll = [DateTime]::Now
+                try {
+                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot -Aggregate:$Auto))
+                } catch { Write-Verbose "Warmup title set deferred: $_" }
+            }
+        }
+
         while ($true) {
             $now = [DateTime]::Now
             $dueForPoll = ($null -eq $snapshot) -or (($now - $lastPoll).TotalSeconds -ge $Interval)
@@ -3863,7 +4376,19 @@ function Invoke-UsageWatch {
                     # advisory the reconcile emits would flash on every
                     # poll and the per-frame ESC[2J would shred it anyway.
                     Invoke-Reconcile 6>$null | Out-Null
-                    $snapshot      = Get-UsageSnapshot -Name $Name
+                    # 6>$null on Get-UsageSnapshot: Update-SlotTokens
+                    # (called via Get-SlotUsage when a token is within 60s
+                    # of expiry) emits yellow [Sync] advisories on its two
+                    # unhappy paths (propagation-to-.credentials.json
+                    # failure, or active slot sidecar-orphaned). Those
+                    # Write-Host calls would land in the alt buffer
+                    # BEFORE the next frame's ESC[2J wipes it, producing
+                    # a sub-frame flash the user cannot read. Suppress
+                    # them here; the user still sees the same condition
+                    # in non-watch contexts (`sca usage`, `sca list`).
+                    # Matches the Invoke-Reconcile 6>$null above and the
+                    # Invoke-SlotSwap 6>$null inside Invoke-AutoRotationStep.
+                    $snapshot      = Get-UsageSnapshot -Name $Name 6>$null
                     $lastPollError = $null
 
                     # Update the terminal title only on a successful poll;
@@ -4039,7 +4564,7 @@ function Invoke-Main {
             "switch"    { Invoke-SwitchAction -Name $Name }
             "list"      { Invoke-ListAction }
             "remove"    { Invoke-RemoveAction -Name $Name }
-            "usage"     { Invoke-UsageAction  -Name $Name -Json:$Json -Watch:$Watch -Interval $Interval -Auto:$Auto -Threshold $Threshold }
+            "usage"     { Invoke-UsageAction  -Name $Name -Json:$Json -Watch:$Watch -Interval $Interval -Auto:$Auto -Threshold $Threshold -Warmup:$Warmup }
         }
     }
     finally {

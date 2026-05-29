@@ -4,7 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.3.0] - 2026-05-29
+
+### Added
+- `sca usage -Watch -Warmup` primes every saved slot before polling so the first frame shows real Session/Week percentages instead of empty cells. Each prime sends a minimal billable `/v1/messages` request (~2 tokens per slot). Combines with `-Auto`; refused while Claude Code is running.
+
+### Changed
+- A transient `429` now keeps a slot's last-known Session/Week percentages on screen (marked, status stays `rate-limited`) instead of blanking the row to em-dashes.
+
+### Fixed
+- A `429` during token refresh retries with backoff and self-recovers within the same poll, instead of leaving the slot stuck on `rate-limited` until the next command.
 
 ## [2.2.1] - 2026-05-20
 

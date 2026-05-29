@@ -796,6 +796,204 @@ Describe 'switch_claude_account' {
                 'regardless of OutputRendering; otherwise -Watch -NoColor ' +
                 'loses its DEC 2026 sync envelope and flickers.')
         }
+
+        It 'Invoke-UsageWatch suppresses the information stream on every nested action whose advisories would flash on screen' {
+            # AST-based static check for the sub-frame flash bug:
+            #
+            # The polling loop calls three things inside its `if ($dueForPoll)`
+            # branch that may emit Write-Color advisories on their unhappy
+            # paths:
+            #   1. Invoke-Reconcile        -> [Sync] auto-save / identity-change
+            #   2. Get-UsageSnapshot       -> [Sync] token-propagation-failed
+            #                                  / sidecar-orphaned (via
+            #                                  Update-SlotTokens inside
+            #                                  Get-SlotUsage)
+            #   3. Invoke-AutoRotationStep -> [Switch] ~/.claude.json write
+            #                                  failed (via Invoke-SlotSwap
+            #                                  inside its 'rotate' arm; the
+            #                                  inner site already wraps the
+            #                                  swap in 6>$null)
+            #
+            # All three land in the alt buffer BEFORE the frame's ESC[2J
+            # clear, so without 6>$null suppression the user sees a
+            # sub-frame flash (<100 ms) that no human can read. The
+            # outer-most call sites for #1 and #2 must therefore carry
+            # 6>$null; #3's inner site is asserted separately by the
+            # Invoke-AutoRotationStep tests.
+            #
+            # Static check rather than behavioral because Invoke-UsageWatch
+            # is an infinite loop and hard to drive in a unit test.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-UsageWatch'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+
+            # Walk the AST for actual CommandAst nodes (function calls)
+            # rather than regex-scanning the function body. Regex on
+            # body text matches comment mentions like
+            # `# (matches Get-UsageSnapshot).` which are not invocations
+            # and would produce false positives. CommandAst.GetCommandName()
+            # returns the bound command name for real invocations only.
+            $allCommands = $func.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.CommandAst]
+            }, $true)
+
+            $reconcileInvocations = @($allCommands | Where-Object {
+                $_.GetCommandName() -eq 'Invoke-Reconcile'
+            })
+            $reconcileInvocations.Count | Should -BeGreaterOrEqual 1 -Because (
+                'watch loop reconciles before reading slot bytes; expected at least one invocation')
+
+            foreach ($cmd in $reconcileInvocations) {
+                # CommandAst's Parent walks up to the enclosing pipeline;
+                # the redirection `6>$null` is held on the PipelineAst's
+                # Redirections collection. We pull the pipeline that
+                # immediately contains the command and check for the
+                # information-stream redirection.
+                $pipeline = $cmd.Parent
+                $pipeline | Should -BeOfType ([System.Management.Automation.Language.PipelineAst]) -Because (
+                    'every command sits inside a pipeline in PowerShell AST')
+
+                $hasInfoSuppression = $pipeline.PipelineElements | Where-Object {
+                    $_ -is [System.Management.Automation.Language.CommandAst] -and
+                    $_.GetCommandName() -eq 'Invoke-Reconcile'
+                } | ForEach-Object {
+                    @($_.Redirections | Where-Object {
+                        $_ -is [System.Management.Automation.Language.MergingRedirectionAst] -or
+                        $_ -is [System.Management.Automation.Language.FileRedirectionAst]
+                    } | Where-Object {
+                        # FromStream = Information (stream 6), redirected
+                        # to $null. PowerShell models `6>$null` as a
+                        # FileRedirectionAst with FromStream=Information
+                        # and Location='$null' (variable).
+                        $_.FromStream -eq [System.Management.Automation.Language.RedirectionStream]::Information
+                    }).Count -gt 0
+                }
+                $hasInfoSuppression | Should -BeTrue -Because (
+                    'every Invoke-Reconcile inside Invoke-UsageWatch must ' +
+                    'suppress information stream (6>$null); without it the ' +
+                    "[Sync] auto-save / identity-change advisories flash " +
+                    'in the alt buffer for a few milliseconds before the ' +
+                    'next frame ESC[2J wipes them.')
+            }
+
+            $snapshotInvocations = @($allCommands | Where-Object {
+                $_.GetCommandName() -eq 'Get-UsageSnapshot'
+            })
+            $snapshotInvocations.Count | Should -BeGreaterOrEqual 1 -Because (
+                'watch loop must poll usage data; expected at least one invocation')
+
+            foreach ($cmd in $snapshotInvocations) {
+                $pipeline = $cmd.Parent
+                $hasInfoSuppression = $pipeline.PipelineElements | Where-Object {
+                    $_ -is [System.Management.Automation.Language.CommandAst] -and
+                    $_.GetCommandName() -eq 'Get-UsageSnapshot'
+                } | ForEach-Object {
+                    @($_.Redirections | Where-Object {
+                        $_ -is [System.Management.Automation.Language.FileRedirectionAst] -and
+                        $_.FromStream -eq [System.Management.Automation.Language.RedirectionStream]::Information
+                    }).Count -gt 0
+                }
+                $hasInfoSuppression | Should -BeTrue -Because (
+                    'every Get-UsageSnapshot inside Invoke-UsageWatch must ' +
+                    'suppress information stream (6>$null); Update-SlotTokens ' +
+                    "(called via Get-SlotUsage) writes [Sync] yellow advisories " +
+                    'on its two unhappy paths and those would flash in the ' +
+                    'alt buffer before ESC[2J wipes them.')
+            }
+        }
+
+        It 'every function calling Invoke-RestMethod sets $ProgressPreference = SilentlyContinue' {
+            # Regression guard for the PowerShell built-in 'Web request'
+            # progress activity (Write-Progress / stream 4) flashing
+            # between watch frames.
+            #
+            # Background: Invoke-WebRequest / Invoke-RestMethod emit a
+            # progress activity by default with rotating status messages
+            # ("Waiting for response...", "Reading web response (NNN
+            # bytes)"). The host UI paints this directly to the alt
+            # buffer, bypassing the DEC 2026 byte-stream sync envelope
+            # around each watch frame. Without function-scoped
+            # $ProgressPreference = 'SilentlyContinue', it flashes for
+            # the duration of every HTTP call inside the watch loop's
+            # hot path.
+            #
+            # Fix: each function that calls Invoke-RestMethod sets
+            # $ProgressPreference = 'SilentlyContinue' at the top of
+            # its body. PowerShell's preference-variable scope chain
+            # masks the parent value for the function's duration only;
+            # no try/finally needed.
+            #
+            # Generalized contract (vs. naming the three current
+            # functions explicitly): every function whose body contains
+            # an Invoke-RestMethod call must suppress the progress
+            # activity. A future maintainer who adds a fourth HTTP-
+            # calling function will fail this test until they include
+            # the suppression line.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+
+            $allFuncs = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst]
+            }, $true)
+
+            # Filter to functions that actually invoke a web cmdlet in
+            # their body. Word-boundary match avoids false positives on
+            # docstring mentions like 'Invoke-RestMethod' in a comment;
+            # the comment-only case would still be a false positive,
+            # but commented-out HTTP calls inside a function are a
+            # pathological case not worth defending against.
+            $httpFuncs = @($allFuncs | Where-Object {
+                $_.Extent.Text -match '\bInvoke-RestMethod\b'
+            })
+            $httpFuncs.Count | Should -BeGreaterOrEqual 1 -Because (
+                'the script must contain at least one HTTP-calling function ' +
+                '(Update-SlotTokens / Get-SlotUsage / Get-SlotProfile)')
+
+            foreach ($fn in $httpFuncs) {
+                $fn.Extent.Text | Should -Match (
+                    "\`$ProgressPreference\s*=\s*'SilentlyContinue'") -Because (
+                    "function '$($fn.Name)' calls Invoke-RestMethod and " +
+                    "must set `$ProgressPreference = 'SilentlyContinue' " +
+                    "(function-scoped) so PowerShell's built-in 'Web " +
+                    "request' progress activity does not flash in the " +
+                    'alt buffer between watch frames.')
+            }
+        }
+
+        It 'Invoke-AutoRotationStep suppresses Invoke-SlotSwap information stream' {
+            # Sibling assertion to the Invoke-UsageWatch suppression
+            # check above: the rotate arm of Invoke-AutoRotationStep calls
+            # Invoke-SlotSwap, which can emit [Switch] yellow advisories
+            # when ~/.claude.json's oauthAccount update fails. Auto-mode
+            # owns its own footer line; the inner advisory would flash
+            # sub-frame on every rotation failure.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-AutoRotationStep'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-AutoRotationStep must exist'
+
+            $body = $func.Extent.Text
+            $swapCalls = [regex]::Matches($body, 'Invoke-SlotSwap[^\r\n]*')
+            $swapCalls.Count | Should -BeGreaterOrEqual 1 -Because 'rotate arm must swap'
+            foreach ($m in $swapCalls) {
+                $m.Value | Should -Match '6>\$null' -Because (
+                    'Invoke-SlotSwap inside Invoke-AutoRotationStep must ' +
+                    'suppress information stream; the [Switch] advisory ' +
+                    'on ~/.claude.json write failure would flash sub-frame ' +
+                    'before the next watch frame ESC[2J wipes it.')
+            }
+        }
     }
 
     Context 'No-color mode' {
@@ -1293,6 +1491,86 @@ Describe 'switch_claude_account' {
             $out | Should -Match "Token refreshed in slot 'active'"
             $out | Should -Match 'propagation to \.credentials\.json failed'
             $out | Should -Match 'propagation denied'
+        }
+    }
+
+    Context 'Update-SlotTokens (429 retry behavior)' {
+        # Retry-with-backoff around /v1/oauth/token. The endpoint's
+        # per-token rate limiter unlocks within seconds, so a 429
+        # on the first attempt should not stick; we retry up to
+        # $Script:TokenRefreshRetryMax times before giving up.
+        # Common.ps1 zeroes $Script:TokenRefreshRetryDelayMs so the
+        # tests do not consume real wall-clock time inside Start-Sleep.
+
+        BeforeEach {
+            $script:credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:credDir -Force | Out-Null
+            $script:slot = Join-Path $script:credDir '.credentials.retry.json'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'OLD'
+                    refreshToken = 'RT'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:slot -Value $payload -NoNewline
+        }
+
+        It '429 then 200 on retry: succeeds, slot file updated, two token-endpoint calls' {
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                if ($script:attempts -eq 1) {
+                    $resp  = [pscustomobject]@{ StatusCode = 429 }
+                    $inner = [System.Exception]::new('429 Too Many Requests')
+                    $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                    throw $inner
+                }
+                return [pscustomobject]@{
+                    access_token  = 'NEW'
+                    refresh_token = 'NEW-RT'
+                    expires_in    = 3600
+                }
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } | Should -Not -Throw
+
+            $script:attempts | Should -Be 2
+            $after = Get-Content -LiteralPath $script:slot -Raw | ConvertFrom-Json
+            $after.claudeAiOauth.accessToken  | Should -Be 'NEW'
+            $after.claudeAiOauth.refreshToken | Should -Be 'NEW-RT'
+        }
+
+        It 'persistent 429 across all attempts: throws (no infinite loop); RetryMax attempts made' {
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } |
+                Should -Throw -ExpectedMessage '*429*'
+
+            # Exactly RetryMax (default 3) attempts were made before
+            # giving up. Defends against off-by-one in the retry loop.
+            $script:attempts | Should -Be $Script:TokenRefreshRetryMax
+        }
+
+        It 'non-429 failure on first attempt: throws immediately (no retry)' {
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                throw [System.Exception]::new('refresh_token invalid')
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } |
+                Should -Throw -ExpectedMessage '*refresh_token invalid*'
+
+            # No retry for non-429 (avoids hammering a deterministic 4xx).
+            $script:attempts | Should -Be 1
         }
     }
 

@@ -305,6 +305,35 @@ Describe 'switch_claude_account' {
             $r.active_slot    | Should -Be 'work'
             $r.last_sync_hash | Should -Be 'h1'
         }
+
+    }
+
+    Context 'Legacy state-file tolerance (v2.3.0 - v2.4.0-draft compatibility)' {
+        # State files written by 2.3.0 - 2.4.0-draft carry a
+        # `last_warmup_at` field. v2.4.0 drops the cooldown machinery
+        # but must still parse those files cleanly and silently drop
+        # the field on the next state-mutating write.
+
+        It 'Read tolerates a legacy state file carrying last_warmup_at and parses the rest' {
+            $legacyJson = '{"schema":1,"active_slot":"work","last_sync_hash":"h-legacy","last_warmup_at":{"slot-1":1700000000000}}'
+            Set-Content -LiteralPath $StateFile -Value $legacyJson -NoNewline -Encoding utf8NoBOM
+
+            $r = Read-ScaState
+            $r.active_slot    | Should -Be 'work'
+            $r.last_sync_hash | Should -Be 'h-legacy'
+            # The dropped field is not exposed on the returned object.
+            ($r.PSObject.Properties.Match('last_warmup_at').Count) | Should -Be 0
+        }
+
+        It 'Next state-mutating write drops the legacy last_warmup_at field' {
+            $legacyJson = '{"schema":1,"active_slot":"work","last_sync_hash":"h-legacy","last_warmup_at":{"slot-1":1700000000000}}'
+            Set-Content -LiteralPath $StateFile -Value $legacyJson -NoNewline -Encoding utf8NoBOM
+
+            Update-ScaState -ActiveSlot 'work2' -LastSyncHash 'h-new' | Out-Null
+
+            $raw = Get-Content -LiteralPath $StateFile -Raw
+            $raw | Should -Not -Match 'last_warmup_at'
+        }
     }
 
     AfterAll {

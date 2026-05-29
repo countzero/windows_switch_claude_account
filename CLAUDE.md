@@ -25,7 +25,7 @@ Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`. Te
 - **Credential directory**: `%USERPROFILE%\.claude\`
 - **Active credentials**: `.credentials.json`, written by Claude Code via atomic rename on every OAuth refresh. `sca` writes it via the same atomic-rename primitive (`Set-CredentialFileAtomic`) so the file is byte-equal to the tracked slot file after every `sca save` / `sca switch` / reconcile pass.
 - **Claude Code config**: `%USERPROFILE%\.claude.json` (top-level, NOT inside `.claude\`), Claude Code's persistent config. Its top-level `oauthAccount` block is what `/status` displays as "Email:". `sca` reads this block at save time (primary identity source) and writes the destination slot's captured `oauthAccount` back to it on `sca switch`. See "`~/.claude.json` ownership" below.
-- **State file**: `%USERPROFILE%\.claude\.sca-state.json`, schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." Read with `Read-ScaState` (auto-migrates from a 1.x install on first read by hashing `.credentials.json` against existing slot files); written via `Update-ScaState`.
+- **State file**: `%USERPROFILE%\.claude\.sca-state.json`, schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." Read with `Read-ScaState` (auto-migrates from a 1.x install on first read by hashing `.credentials.json` against existing slot files); written via `Update-ScaState` (`active_slot` / `last_sync_hash`). State files written by a pre-release development build carry a `last_warmup_at` field that is tolerated by `Read-ScaState` and dropped by the next state-mutating write (one-way; a build that still expects the field reads our field-less files cleanly because its reader defaults the field to `@{}` when absent).
 - **Named slots**: `.credentials.<name>(<email>).json` (labeled) or `.credentials.<name>.json` (unlabeled, only for the dedup case where slot name equals email).
 - **Identity sidecars**: `.credentials.<name>(<email>).account.json` alongside each slot file. JSON snapshot of the slot's `oauthAccount` (whitelisted: accountUuid, emailAddress, organizationUuid, displayName, organizationName) captured at save time. Restored to `~/.claude.json` on `sca switch`. **Slots without a valid sidecar are HIDDEN from `list` / `usage` / rotation and refused by `switch`**; re-running `sca save <name>` while that slot is active recaptures the sidecar.
 - **PS version**: Requires PowerShell 7.2+ (`#Requires -Version 7.2`). Uses `$PROFILE.CurrentUserAllHosts` for the install target. The 7.2 floor is the version that introduced `$PSStyle.OutputRendering`, used by no-color mode.
@@ -48,7 +48,7 @@ Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`. Te
 | `switch`   | Optional      | Refuses if Claude Code is running. Reconciles first (so a pending refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json`, then atomic-writes the destination slot's captured `oauthAccount` (whitelisted fields) into `~/.claude.json`. If `<name>` omitted, rotates to the next saved slot in alphabetical order (wraps). Refuses to activate a slot with no sidecar. |
 | `list`     | No            | Reconciles first (so cross-account swaps detected since the last `sca` call surface in the marker column), then renders saved slots as `Slot \| Account` with leading active-marker column. `*` marker comes from `state.active_slot`. Sidecar-less slots silently filtered out. |
 | `remove`   | Yes           | Deletes a named slot AND its sidecar. Walks the raw filesystem (not `Get-Slots`) so sidecar-less legacy slots can be cleaned by name. Refuses to remove the slot tracked as active in state. |
-| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot for 5h / 7d plan-usage percentages. Auto-refreshes expired tokens via `Update-SlotTokens`. Accepts `-Json` for scripted output, or `-Watch` (optional `-Interval <seconds>`, floor 60) for live view. `-Watch -Auto [-Threshold <1..100>]` auto-rotates to the next eligible slot when the active slot's `max(5h, 7d)` utilization hits the threshold (default 95); refuses if Claude Code is running. With `<name>`, renders verbose single-slot block. |
+| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot for 5h / 7d plan-usage percentages. Auto-refreshes expired tokens via `Update-SlotTokens`. Accepts `-Json` for scripted output, or `-Watch` (optional `-Interval <seconds>`, floor 60) for live view. `-Watch -Auto [-Threshold <1..100>]` auto-rotates to the next eligible slot when the active slot's `max(5h, 7d)` utilization hits the threshold (default 95); refuses if Claude Code is running. `-Watch -Warmup` (independent of `-Auto`) pre-refreshes every slot's OAuth tokens before the first poll. With `<name>`, renders verbose single-slot block. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile. |
 | `uninstall`| No            | Removes wrapper function + aliases from profile. |
 | `help`     | No            | Shows detailed help. |
@@ -65,14 +65,17 @@ For color/output, table layout, watch-mode, and `/api/oauth/usage` schema detail
 
 ## Unofficial endpoints (`usage` action)
 
-The `usage` action and the reconcile / save identity-fallback path depend on six pinned constants extracted from `claude.exe` 2.1.119 (a Bun-compiled binary). They live at the top of `switch_claude_account.ps1` under the `# --- Unofficial /api/oauth/usage constants ---` comment:
+The `usage` action and the reconcile / save identity-fallback path depend on pinned constants extracted from `claude.exe` 2.1.119 (a Bun-compiled binary). They live at the top of `switch_claude_account.ps1` under the `# --- Unofficial Claude Code OAuth-flow constants ---` comment:
 
-- `$Script:UsageEndpoint`   : `https://api.anthropic.com/api/oauth/usage`
-- `$Script:ProfileEndpoint` : `https://api.anthropic.com/api/oauth/profile` (used by `Get-SlotProfile` for the email-only identity fallback when `~/.claude.json` has no `oauthAccount`)
-- `$Script:TokenEndpoint`   : `https://platform.claude.com/v1/oauth/token`
-- `$Script:OAuthClientId`   : `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude.ai subscription flow)
-- `$Script:AnthropicBeta`   : `oauth-2025-04-20`
-- `$Script:UsageUserAgent`  : `claude-code/2.1.119`
+- `$Script:UsageEndpoint`       : `https://api.anthropic.com/api/oauth/usage`
+- `$Script:ProfileEndpoint`     : `https://api.anthropic.com/api/oauth/profile` (`Get-SlotProfile`; email-only identity fallback when `~/.claude.json` has no `oauthAccount`)
+- `$Script:MessagesEndpoint`    : `https://api.anthropic.com/v1/messages` (`Invoke-SlotPrime`; billable warmup priming so Anthropic opens the slot's server-side 5h session window)
+- `$Script:TokenEndpoint`       : `https://platform.claude.com/v1/oauth/token`
+- `$Script:OAuthClientId`       : `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude.ai subscription flow)
+- `$Script:AnthropicBeta`       : `oauth-2025-04-20`
+- `$Script:AnthropicApiVersion` : `2023-06-01` (sent on every authenticated request for defense-in-depth against future endpoint tightening)
+- `$Script:UsageUserAgent`      : `claude-code/2.1.119`
+- `$Script:PrimeModel`          : `claude-haiku-4-5` (cheapest current model; drifts on Anthropic model deprecations, same re-extraction recipe as above)
 
 **Undocumented and unsupported by Anthropic.** When the call starts returning 4xx after a Claude Code upgrade, re-extract from `$(Get-Command claude).Source` using the grep recipe in the script header comment, bump the constants, and re-run `tests/Invoke-Tests.ps1`. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only; they will not catch the constants drifting out of date.
 
@@ -118,6 +121,12 @@ Identity comparison: live `~/.claude.json` email vs. the tracked slot's **sideca
 ## Auto-rotation (`sca usage -Watch -Auto`)
 
 OpenCode-scoped (issue #8): requires `opencode-claude-auth >= 1.5.4`, which re-reads `.credentials.json` on cache miss so a swap propagates without restarting OpenCode. Claude Code itself is NOT supported (its in-memory `~/.claude.json` cache would race the swap); `-Auto` refuses at startup AND re-checks `Test-ClaudeRunning` before every rotation. Trigger: `Get-AutoRotationDecision` compares the active slot's `max(five_hour.utilization, seven_day.utilization)` (null bucket = 0%) against `-Threshold` (default 95, range 1..100; the 5-pt margin absorbs `/api/oauth/usage` reporting lag). At or above → walk peer slots in alphabetical wrap order (matches `Get-NextSlotName`), skip non-ok HTTP rows and peers themselves at/above threshold, swap into the first eligible peer via `Invoke-SlotSwap` (the extracted core shared with `Invoke-SwitchAction`). No eligible peer → render `[Auto] No free slot available! Cooling down for <delta>` with the soonest future reset across all slots/buckets. UI: right-aligned `▶ switching slot at N%` header indicator (glyph white + text DarkGray; silent fallback when terminal too narrow) plus an extra blank line under the header when `-Auto` is set, plus a latched `[Auto]` footer line per frame (`Enabled` / `Rotated from "A" to "B" at HH:mm:ss` / `No free slot available! Cooling down for X` / `Rotation refused! Claude Code is running.` / `Rotation failed! <message>`).
+
+## Startup warmup (`-Warmup`)
+
+`sca usage -Watch -Warmup` (independent of `-Auto`; combines as `-Watch -Auto -Warmup`) primes every saved slot before entering the steady-state polling loop. Per slot in alphabetical order: `Invoke-SlotSwap` makes it active, then `Invoke-SlotPrime` POSTs a minimal billable `/v1/messages` request (~2 tokens on Haiku) so Anthropic opens the slot's server-side 5h session window. **Verify-after-prime**: because `Invoke-SlotPrime` returns no bucket data, an `ok` prime is immediately followed by a `Get-SlotUsage` read so the warmup frame shows live percentages right away instead of `ok (no plan data)` (empty cells) until the first poll ~60 s later; a failed prime skips the read and surfaces the prime's own outcome. A `finally` block restores the original active slot at the end. Per-slot progress in the Status column: `warming up` (queued) → `priming` (prime POST in flight) → real outcome (the verify-after-prime usage result, or the prime's failure: `rate-limited` / `no-oauth` / `expired` / `unauthorized` / `error`). The end-state snapshot IS the first frame of the polling loop. `$Script:WarmupSpacingMs` (300 ms) between slots dodges per-IP burst limits; `Test-ClaudeRunning` refuses pre-loop (the per-slot swap writes `~/.claude.json`'s `oauthAccount`).
+
+Swap failures share the `error` label with prime failures; the exception message in the row's Error tail names the failing operation. `-Name` narrows warmup to a single slot. Refused when no slots match.
 
 ## Testing
 
