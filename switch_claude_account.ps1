@@ -178,7 +178,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '3.0.0'
+$Script:ScriptVersion = '3.1.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -2169,22 +2169,36 @@ function Update-SlotTokens {
 }
 
 # Look up the slot's last successful /api/oauth/usage response in the
-# per-process cache and return it wrapped as an 'ok'+IsCachedFallback
-# result IF still within $Script:UsageCacheTTL minutes of capture.
-# Returns $null on cache miss or stale entry.
+# per-process cache and return it wrapped as an IsCachedFallback result.
+# Returns $null on cache miss (or on a stale entry unless -AllowStale).
 #
 # Used by Get-SlotUsage's two 429 fallback paths (token-endpoint catch
 # and usage-endpoint catch) to collapse what would otherwise be a 4-level
-# if-contains/if-fresh/return ladder into a single helper call. Both
-# paths apply the same freshness policy: cache hits served as 'ok' keep
-# the watch display functional during rate-limited periods (usage data
-# only changes every few hours at most).
+# if-contains/if-fresh/return ladder into a single helper call.
+#
+# Freshness policy:
+#   * Fresh entry (within $Script:UsageCacheTTL minutes) -> served as
+#     'ok'+IsCachedFallback so the watch display stays fully functional
+#     during a brief rate-limit (usage data only changes every few hours).
+#   * Stale entry -> $null by default. With -AllowStale it is served as
+#     'rate-limited'+IsCachedFallback: the LAST-KNOWN percentages stay
+#     visible during a prolonged throttle (so the row keeps its numbers
+#     instead of collapsing to em-dashes and looking like a dead slot),
+#     but the status stays 'rate-limited' so the stale data is never
+#     mistaken for a live reading. The caller serves stale only as a last
+#     resort, after the fresh lookup and (where applicable) the retry have
+#     failed.
 function Get-CachedUsageOrNull {
-    Param ([String] $SlotPath)
+    Param (
+        [String] $SlotPath,
+        [switch] $AllowStale
+    )
     if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) { return $null }
-    $entry = $Script:SlotUsageCache[$SlotPath]
-    if (([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheTTL) {
-        return $null
+    $entry   = $Script:SlotUsageCache[$SlotPath]
+    $isStale = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheTTL
+    if ($isStale) {
+        if (-not $AllowStale) { return $null }
+        return [pscustomobject]@{ Status = 'rate-limited'; Data = $entry.Data; IsCachedFallback = $true }
     }
     return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
 }
@@ -2285,6 +2299,12 @@ function Get-SlotUsage {
         if ($tok.Status -eq 'rate-limited') {
             $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
             if ($cached) { return $cached }
+            # Last resort: keep the last-known percentages visible (marked
+            # cached, status stays 'rate-limited') rather than dropping the
+            # row to a dead-looking em-dash line during a token-endpoint
+            # throttle.
+            $stale = Get-CachedUsageOrNull -SlotPath $SlotPath -AllowStale
+            if ($stale) { return $stale }
         }
         return $tok
     }
@@ -2343,6 +2363,13 @@ function Get-SlotUsage {
             # exists at all, retry once after a short delay so back-to-
             # back slot polls don't all hit the rate limit simultaneously.
             if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
+                # Stale entry: serve the last-known percentages (marked
+                # cached, status stays 'rate-limited') so the row keeps its
+                # numbers during a prolonged throttle instead of collapsing
+                # to em-dashes. No retry sleep: a stale entry means we've
+                # been throttled long enough that a 5s wait won't help.
+                $stale = Get-CachedUsageOrNull -SlotPath $SlotPath -AllowStale
+                if ($stale) { return $stale }
                 return [pscustomobject]@{ Status = 'rate-limited' }
             }
             Start-Sleep -Seconds 5
@@ -2981,7 +3008,13 @@ function Format-UsageTable {
         $fiveCell  = '   —'
         $sevenCell = '   —'
 
-        if ($r.Status -eq 'ok' -and $r.Data) {
+        # Render bucket percentages whenever the row carries data, not only
+        # on 'ok'. A 'rate-limited' row served from the (possibly stale)
+        # cache fallback carries last-known Data; showing those numbers
+        # keeps the row from looking like a dead/unused slot during a
+        # transient throttle. Rows with no Data (expired / unauthorized /
+        # error / no-oauth / no-cache rate-limited) keep the em-dash.
+        if ($r.Data) {
             if ($r.Data.five_hour -and $null -ne $r.Data.five_hour.utilization) {
                 $fiveCell = Format-BucketCell $r.Data.five_hour.utilization $r.Data.five_hour.resets_at
             }
@@ -3308,6 +3341,7 @@ function Get-UsageSnapshot {
             Results          = @()
             NoSlots          = $true
             HasCacheFallback = $false
+            HasRateLimited   = $false
         }
     }
 
@@ -3343,6 +3377,11 @@ function Get-UsageSnapshot {
         Results          = @($results)
         NoSlots          = $false
         HasCacheFallback = ($results | Where-Object { $_.IsCachedFallback }).Count -gt 0
+        # HasRateLimited drives the "transient throttle" advisory for the
+        # no-cache case, where the row has no Data to show. A row served
+        # from the cache fallback is also 'rate-limited' but is covered by
+        # the HasCacheFallback advisory branch (which takes precedence).
+        HasRateLimited   = ($results | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0
     }
 }
 
@@ -3405,6 +3444,13 @@ function Format-UsageFrame {
     # endpoint-agnostic wording.
     if ($Snapshot.HasCacheFallback) {
         Write-Color "  [Usage] Warning: Anthropic API rate limited; displaying cached data." 'Yellow'
+    }
+    elseif ($Snapshot.HasRateLimited) {
+        # No cached data to fall back on (first poll under a throttle).
+        # Make it explicit that 'rate-limited' is a transient API condition,
+        # not an unused/dead slot: the slot is active and its numbers return
+        # on the next successful poll.
+        Write-Color "  [Usage] Note: Anthropic API rate limited; this is transient and clears on its own. The slot is active." 'Yellow'
     }
 
     if ($Footer) { Format-UsageFooter $Footer } else { Write-Host '' }
@@ -4020,17 +4066,21 @@ $Script:WarmupPrimingMinMs = 150
 # entry retracts that claim. Cost: ~2 tokens per slot per warmup on the
 # pinned Haiku model (fractions of a cent).
 #
-# No probe-after-prime: the watch loop's first poll runs within ~1 s of
-# warmup completion and renders real bucket data then. Skipping the
-# probe halves the per-slot HTTP traffic during warmup and makes the
-# terminal warmup status the prime's outcome (the thing that matters),
-# not a downstream probe.
+# Verify-after-prime: a successful prime opens the session but returns no
+# bucket data, so the row would otherwise read 'ok (no plan data)' (empty
+# em-dash cells) until the first poll ~60 s later. After an ok prime we
+# immediately call Get-SlotUsage for the slot so the warmup frame shows
+# live percentages right away, matching what plain `sca usage` displays.
+# A failed prime (rate-limited / unauthorized / expired / no-oauth /
+# error) skips the usage read and surfaces the prime's own outcome. Cost:
+# one extra /api/oauth/usage GET per successfully primed slot.
 #
 # Builds the rendered snapshot in place: one row per slot (filtered by
 # -Name when set), each starting at Status='warming-up' with Data=$null,
-# transitioning through 'priming' to its real HTTP outcome. The end
-# state is the first frame of the polling loop; the caller wires it to
-# $snapshot and sets $lastPoll = now. Returns $null when no slots match.
+# transitioning through 'priming' to its real outcome (the prime's usage
+# read, or the prime's failure status). The end state is the first frame
+# of the polling loop; the caller wires it to $snapshot and sets
+# $lastPoll = now. Returns $null when no slots match.
 #
 # The original active slot is captured before the loop via Read-ScaState
 # + Find-SlotByName. A finally block restores it via one more Invoke-Slot-
@@ -4057,24 +4107,24 @@ function Invoke-WarmAllSlots {
     }
     if ($slots.Count -lt 1) { return $null }
 
-    # Warmup rows omit IsCachedFallback: Invoke-SlotPrime cannot produce
-    # cached responses (no per-slot prime cache), and Format-UsageTable
-    # / Format-UsageVerbose / Format-UsageFrame all read the snapshot-
-    # level HasCacheFallback, not the per-row field. Snapshot's
-    # HasCacheFallback stays $false for the same reason.
+    # Each row carries IsCachedFallback so the verify-after-prime usage
+    # read (below) can propagate a 429 cache fallback into the snapshot-
+    # level HasCacheFallback flag, keeping the warmup frame's advisory in
+    # lockstep with the polling loop's frames.
     $rows = @($slots | ForEach-Object {
         [pscustomobject]@{
-            Name     = $_.Name
-            Email    = $_.Email
-            Path     = $_.Path
-            IsActive = $_.IsActive
-            Sidecar  = $_.Sidecar
-            Status   = 'warming-up'
-            Data     = $null
-            Error    = $null
+            Name             = $_.Name
+            Email            = $_.Email
+            Path             = $_.Path
+            IsActive         = $_.IsActive
+            Sidecar          = $_.Sidecar
+            Status           = 'warming-up'
+            Data             = $null
+            Error            = $null
+            IsCachedFallback = $false
         }
     })
-    $snapshot = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false }
+    $snapshot = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false; HasRateLimited = $false }
     & $Repaint $snapshot
 
     $origActive = $null
@@ -4109,15 +4159,37 @@ function Invoke-WarmAllSlots {
             try {
                 Invoke-SlotSwap -Slot $row 6>$null
                 $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
-                $row.Status = $r.Status
-                $row.Error  = $r.Error
-                # Invoke-SlotPrime returns no Data payload; the watch
-                # loop's first poll will populate bucket numbers.
+                if ($r.Status -eq 'ok') {
+                    # Prime opened the session but returns no bucket data.
+                    # Read /api/oauth/usage now (verify-after-prime) so the
+                    # warmup frame shows live percentages immediately,
+                    # instead of 'ok (no plan data)' until the first poll
+                    # ~60 s later. Get-SlotUsage never throws; it returns
+                    # the real outcome (ok / rate-limited / cached / etc.).
+                    $u = Get-SlotUsage -SlotPath $row.Path 6>$null
+                    $row.Status           = $u.Status
+                    $row.Data             = $u.Data
+                    $row.Error            = $u.Error
+                    $row.IsCachedFallback = [bool]$u.IsCachedFallback
+                }
+                else {
+                    # Prime failed (rate-limited / unauthorized / expired /
+                    # no-oauth / error): surface its real outcome; a usage
+                    # read would not add signal here.
+                    $row.Status = $r.Status
+                    $row.Error  = $r.Error
+                }
             }
             catch {
                 $row.Status = 'error'
                 $row.Error  = $_.Exception.Message
             }
+
+            # Keep the snapshot-level advisory flags in lockstep with the
+            # rows mutated so far, so the warmup frame's cache-fallback /
+            # transient-throttle note matches what the polling loop renders.
+            $snapshot.HasCacheFallback = (@($rows | Where-Object { $_.IsCachedFallback }).Count -gt 0)
+            $snapshot.HasRateLimited   = (@($rows | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0)
             & $Repaint $snapshot
 
             if ($i -lt $last -and $Script:WarmupSpacingMs -gt 0) {

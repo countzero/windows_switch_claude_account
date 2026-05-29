@@ -934,6 +934,27 @@ Describe 'switch_claude_account' {
             @($snap.Results).Count | Should -Be 0
         }
 
+        It 'Get-UsageSnapshot sets HasRateLimited when a row is rate-limited' {
+            $slotPath = New-Slot -Name 'beta'
+            # Pre-seed a STALE cache entry so the 429 path returns
+            # rate-limited immediately (no 5s retry sleep, served stale).
+            $Script:SlotUsageCache[$slotPath] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 3.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $snap = Get-UsageSnapshot
+            $snap.HasRateLimited   | Should -BeTrue
+            # Stale data was served, so HasCacheFallback is also true.
+            $snap.HasCacheFallback | Should -BeTrue
+        }
+
         It 'Format-UsageFrame prints the footer under the table when -Footer is provided' {
             $snap = [pscustomobject]@{
                 Results = @([pscustomobject]@{ Name = 'alpha'; IsActive = $false; Status = 'ok';
@@ -949,6 +970,59 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'HELLO-FROM-FOOTER'
             # Footer sits after the data row.
             ($out.IndexOf('alpha')) | Should -BeLessThan ($out.IndexOf('HELLO-FROM-FOOTER'))
+        }
+
+        It 'Format-UsageTable renders bucket percentages for a rate-limited row that carries cached data' {
+            # A rate-limited row served from the (possibly stale) cache
+            # fallback carries last-known Data; its numbers must show so the
+            # row is not misread as a dead/unused slot.
+            $rows = @([pscustomobject]@{ Name = 'cached'; IsActive = $true; Status = 'rate-limited'; Email = 'a@x.org'
+                Data = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 42.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 73.0; resets_at = $null }
+                }
+                Error = $null; IsCachedFallback = $true })
+
+            $out = Format-UsageTable -Results $rows 6>&1 | Out-String
+
+            $out | Should -Match '\b42%'
+            $out | Should -Match '\b73%'
+            $out | Should -Match '(?m)^\s*\*?\s*cached\b.*\brate-limited\s*$'
+        }
+
+        It 'Format-UsageFrame shows the transient note for a no-cache rate-limited row' {
+            $snap = [pscustomobject]@{
+                Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
+                    Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
+                NoSlots          = $false
+                HasCacheFallback = $false
+                HasRateLimited   = $true
+            }
+
+            $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
+
+            # The em-dash data cells stay (no data to show), but the advisory
+            # makes clear it is transient and the slot is active.
+            $out | Should -Match 'transient and clears on its own'
+            $out | Should -Match 'The slot is active'
+            # The cached-data advisory must NOT fire (no cache here).
+            $out | Should -Not -Match 'displaying cached data'
+        }
+
+        It 'Format-UsageFrame prefers the cached-data advisory over the transient note when data was served' {
+            $snap = [pscustomobject]@{
+                Results = @([pscustomobject]@{ Name = 'cached'; IsActive = $true; Status = 'rate-limited';
+                    Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null } }
+                    Error = $null; Email = $null; IsCachedFallback = $true })
+                NoSlots          = $false
+                HasCacheFallback = $true
+                HasRateLimited   = $true
+            }
+
+            $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
+
+            $out | Should -Match 'displaying cached data'
+            $out | Should -Not -Match 'transient and clears on its own'
         }
 
         It 'Invoke-UsageAction -Watch -Json throws (mutually exclusive)' {
@@ -1802,7 +1876,7 @@ Describe 'switch_claude_account' {
             $r.Status | Should -Be 'rate-limited'
         }
 
-        It '429 with a STALE cache entry: Status=rate-limited; no retry sleep' {
+        It '429 with a STALE cache entry: Status=rate-limited; last-known data kept; no retry sleep' {
             $slot = Join-Path $script:CredDirPath '.credentials.staleC.json'
             $payload = @{ claudeAiOauth = @{
                 accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
@@ -1825,6 +1899,10 @@ Describe 'switch_claude_account' {
 
             $r = Get-SlotUsage -SlotPath $slot
             $r.Status | Should -Be 'rate-limited'
+            # Stale cache is now served (marked) so the row keeps its
+            # last-known numbers instead of collapsing to em-dashes.
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 1
             # No 5s retry sleep because the slot was already seen.
             Should -Invoke Start-Sleep -Times 0 -Exactly
         }
@@ -1860,6 +1938,27 @@ Describe 'switch_claude_account' {
             $r.Status                  | Should -Be 'ok'
             $r.IsCachedFallback        | Should -BeTrue
             $r.Data.five_hour.utilization | Should -Be 17
+        }
+
+        It '-AllowStale serves a stale entry as rate-limited+fallback (last-known numbers kept)' {
+            $slot = 'D:/stale/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 88.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            # Without -AllowStale: still $null (default freshness policy).
+            (Get-CachedUsageOrNull -SlotPath $slot) | Should -BeNullOrEmpty
+            # With -AllowStale: data is served, but status stays rate-limited
+            # so a stale reading is never mistaken for live data.
+            $r = Get-CachedUsageOrNull -SlotPath $slot -AllowStale
+            $r                            | Should -Not -BeNullOrEmpty
+            $r.Status                     | Should -Be 'rate-limited'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 88
+        }
+
+        It '-AllowStale still returns $null on a true cache miss' {
+            (Get-CachedUsageOrNull -SlotPath 'missing/path.json' -AllowStale) | Should -BeNullOrEmpty
         }
     }
 
@@ -2303,6 +2402,18 @@ Describe 'switch_claude_account' {
             # assert on swap behavior (call order, restore, failure
             # mid-loop) override this mock locally.
             Mock Invoke-SlotSwap -MockWith { }
+
+            # Default /api/oauth/usage mock for the verify-after-prime read:
+            # a successful prime now triggers a Get-SlotUsage call so the
+            # warmup frame shows live percentages. Returns small valid
+            # buckets; tests that assert specific usage outcomes override
+            # this locally (a later mock with the same Uri filter wins).
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:UsageEndpoint } -MockWith {
+                return [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 1.0; resets_at = $null }
+                }
+            }
         }
 
         It 'returns $null when no slots are saved' {
@@ -2333,12 +2444,13 @@ Describe 'switch_claude_account' {
             $snap.Results[0].Name | Should -Be 'work_slot'
         }
 
-        It 'fresh-token slots: Invoke-SlotPrime returns ok; rows end Status="ok"' {
+        It 'fresh-token slots: prime ok then verify-after-prime populates live bucket data' {
             New-WarmupSlot -Name 'a' -ExpiresAt $script:FutureMs | Out-Null
             New-WarmupSlot -Name 'b' -ExpiresAt $script:FutureMs | Out-Null
 
             # Mock /v1/messages to return ok; /v1/oauth/token should NOT
-            # be called because the tokens are fresh.
+            # be called because the tokens are fresh. /api/oauth/usage is
+            # mocked in BeforeEach (the verify-after-prime read).
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
                 throw 'token endpoint should not be called for fresh tokens'
@@ -2349,10 +2461,11 @@ Describe 'switch_claude_account' {
 
             (Get-RowStatus $snap 'a') | Should -Be 'ok'
             (Get-RowStatus $snap 'b') | Should -Be 'ok'
-            # Invoke-SlotPrime returns no Data payload; the watch loop's
-            # first poll will populate bucket numbers.
-            ($snap.Results | Where-Object Name -eq 'a').Data | Should -BeNullOrEmpty
-            ($snap.Results | Where-Object Name -eq 'b').Data | Should -BeNullOrEmpty
+            # After an ok prime the verify-after-prime usage read populates
+            # the row with live bucket data, so the first frame shows real
+            # percentages instead of 'ok (no plan data)'.
+            ($snap.Results | Where-Object Name -eq 'a').Data.five_hour.utilization | Should -Be 5
+            ($snap.Results | Where-Object Name -eq 'b').Data.seven_day.utilization | Should -Be 1
             # Repaints: 1 (initial 'warming-up' frame) + 2 per slot
             # ('priming' + terminal) = 1 + 4 = 5.
             $script:repaints | Should -Be 5
@@ -2390,6 +2503,20 @@ Describe 'switch_claude_account' {
             $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
 
             (Get-RowStatus $snap 'limited') | Should -Be 'rate-limited'
+            # A failed prime skips the verify-after-prime usage read: the
+            # prime's own outcome is the signal, and a usage call would not
+            # add information.
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+        }
+
+        It 'verify-after-prime: an ok prime triggers exactly one usage read per slot' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            (Get-RowStatus $snap 'a') | Should -Be 'ok'
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
         }
 
         It 'no-OAuth slot: row ends Status="no-oauth" without any messages call' {

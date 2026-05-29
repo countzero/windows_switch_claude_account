@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-05-29
+
+### Changed
+- A transient `429` no longer makes a slot look dead in `sca usage`. When the usage endpoint (or the token-refresh endpoint) returns `429` and the per-slot cache holds an entry, the last-known Session/Week percentages stay on screen (served via `Get-CachedUsageOrNull -AllowStale`, marked, with the status kept at `rate-limited`) instead of collapsing to em-dash cells. `Format-UsageTable` now renders bucket percentages for any row carrying `Data`, not only `ok` rows.
+- `sca usage -Watch -Warmup` shows live bucket data on its first frame. After a successful prime, `Invoke-WarmAllSlots` now performs a verify-after-prime `Get-SlotUsage` read so the warmup snapshot carries real percentages, instead of rendering `ok (no plan data)` (empty cells) until the first poll ~60 s later. A failed prime skips the read and surfaces the prime's own outcome.
+
+### Added
+- Transient-throttle advisory for the no-cache case: when a slot is `rate-limited` with no cached data to display, `Format-UsageFrame` prints a note clarifying the condition is transient and the slot is active, so an empty row is not mistaken for an unused/dead slot. Driven by a new `HasRateLimited` flag on the usage snapshot.
+- `-AllowStale` switch on `Get-CachedUsageOrNull`.
+
 ## [3.0.0] - 2026-05-28
 
 ### Changed

@@ -46,13 +46,19 @@ The `try/finally` scope is per-`Invoke-Main`, NOT global. Tests dot-source the s
   | 5h bucket ≥ `UtilLimitPct` | `limited 5h` | Red |
   | 7d bucket ≥ `UtilLimitPct` | `limited 7d` | Red |
   | Both buckets ≥ `UtilLimitPct` | `limited` | Red |
-  | HTTP 429, no fresh cache | `rate-limited` | Yellow |
+  | HTTP 429, cache available (fresh or stale) | `rate-limited` with last-known % | Yellow |
+  | HTTP 429, no cache at all | `rate-limited` (em-dash cells) | Yellow |
   | `-Watch -Auto` startup warmup in flight | `warming up` | Yellow |
   | HTTP failure | `expired` / `unauthorized` / `error: …` / `no-oauth (api key or non-claude.ai slot)` | Yellow / Red / Red / DarkGray |
 
-  Thresholds: `$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`. `Get-StatusColor` is the single source of truth so summary table and verbose view stay in lockstep.
+  Thresholds: `$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`. `Get-StatusColor` is the single source of truth so summary table and verbose view stay in lockstep. `Format-UsageTable` fills bucket cells whenever the row carries `Data` (not only `ok` rows), so a `rate-limited` row served from the cache keeps its percentages instead of collapsing to em-dashes.
 
-**429 / `rate-limited` handling**: a 429 from `/api/oauth/usage` OR `/v1/oauth/token` (the latter from `Get-SlotUsage`'s pre-call refresh) is detected by `Test-Is429` and routed through the same fallback: serve fresh cached data when `$Script:SlotUsageCache` has a `<UsageCacheTTL = 10`-minute entry, else `Status='rate-limited'`. Advisory: `Anthropic API rate limited; displaying cached data.` Long error messages on `'expired'` / `'error'` arms are normalized through `Format-StatusErrorTail` (whitespace collapse + 60-char cap) so verbose exceptions can't wrap the row.
+**429 / `rate-limited` handling**: a 429 from `/api/oauth/usage` OR `/v1/oauth/token` (the latter from `Get-SlotUsage`'s pre-call refresh) is detected by `Test-Is429` and routed through `Get-CachedUsageOrNull`:
+- **Fresh** entry (`< UsageCacheTTL = 10` min) → served as `Status='ok'` + `IsCachedFallback` (full functionality during a brief throttle).
+- **Stale** entry → served via `-AllowStale` as `Status='rate-limited'` + `IsCachedFallback`: the last-known percentages stay visible (so the row is not misread as dead) but the status stays `rate-limited` so stale data is never mistaken for live. The usage-endpoint path serves stale only as a last resort, after the fresh lookup and the one retry-after-5s have failed.
+- **No cache at all** → `Status='rate-limited'` with no `Data` (em-dash cells).
+
+Advisories (`Format-UsageFrame`, in precedence order): if any row served from cache (`HasCacheFallback`), `Anthropic API rate limited; displaying cached data.`; else if any row is `rate-limited` with no data (`HasRateLimited`), a transient-throttle note (`…this is transient and clears on its own. The slot is active.`) so an empty row reads as "throttled, not dead". Long error messages on `'expired'` / `'error'` arms are normalized through `Format-StatusErrorTail` (whitespace collapse + 60-char cap) so verbose exceptions can't wrap the row.
 
 ## Aggregate progress bars
 
