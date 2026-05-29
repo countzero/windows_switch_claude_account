@@ -2729,6 +2729,74 @@ Describe 'switch_claude_account' {
             # c (round-robin), a (restore).
             $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
         }
+
+        It 'restore-failure advisory names the actual active slot, not rows[-1], on a double swap failure' {
+            # Double failure: the LAST round-robin swap (c) throws, so the
+            # loop ends active on b (the last successful swap), and the
+            # restore swap to the original active slot (a) also throws,
+            # firing the advisory. The advisory must name b, not c
+            # (rows[-1]).
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+                # Last round-robin slot fails.
+                if ($Slot.Name -eq 'c') {
+                    throw [System.Exception]::new('synthetic swap failure on c')
+                }
+                # Second call for 'a' is the restore; let the first
+                # (round-robin) succeed so the loop progresses past a.
+                if ($Slot.Name -eq 'a' -and (@($script:swapNames | Where-Object { $_ -eq 'a' }).Count -ge 2)) {
+                    throw [System.Exception]::new('synthetic restore failure on a')
+                }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+            Mock Write-Color -MockWith { }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            # Call order: a (round-robin), b (round-robin), c (throws),
+            # a (restore, throws).
+            $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
+            Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'b'" }
+            Should -Invoke Write-Color -Times 0 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+        }
+
+        It 'restore-failure advisory names the last primed slot when every round-robin swap succeeded' {
+            # Common case: all loop swaps succeed; only the restore fails.
+            # The user is left on the last primed slot (c), and the
+            # advisory names it.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+                # Only the restore (second 'a' call) fails.
+                if ($Slot.Name -eq 'a' -and (@($script:swapNames | Where-Object { $_ -eq 'a' }).Count -ge 2)) {
+                    throw [System.Exception]::new('synthetic restore failure on a')
+                }
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { New-PrimeOk }
+            Mock Write-Color -MockWith { }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
+            Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+        }
     }
 
     Context 'Invoke-SlotPrime' {

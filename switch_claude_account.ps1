@@ -4133,6 +4133,15 @@ function Invoke-WarmAllSlots {
         $origActive = Find-SlotByName -Name $state.active_slot
     }
 
+    # Track the slot the process is actually active on. Seeded to
+    # $origActive (the active slot before any swap) and advanced only
+    # after a successful Invoke-SlotSwap below, so it always names the
+    # live active slot even when a mid-loop swap throws (the throw skips
+    # the advance and routes to the catch). The restore-failure advisory
+    # in the finally reads it, so a double swap failure names the slot
+    # the user is genuinely left on rather than blindly assuming rows[-1].
+    $lastSwapped = $origActive
+
     $last = $rows.Count - 1
     try {
         for ($i = 0; $i -le $last; $i++) {
@@ -4158,6 +4167,9 @@ function Invoke-WarmAllSlots {
             # actual exceptions.
             try {
                 Invoke-SlotSwap -Slot $row 6>$null
+                # Swap succeeded (it throws on failure): this slot is now
+                # the live active slot. Record it for the restore advisory.
+                $lastSwapped = $row
                 $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
                 if ($r.Status -eq 'ok') {
                     # Prime opened the session but returns no bucket data.
@@ -4200,7 +4212,7 @@ function Invoke-WarmAllSlots {
     finally {
         if ($origActive) {
             try { Invoke-SlotSwap -Slot $origActive 6>$null }
-            catch { Write-Color "[Warmup] Restore of original active slot '$($origActive.Name)' failed: $($_.Exception.Message). You are now active on '$($rows[-1].Name)'." 'Yellow' 6>$null }
+            catch { Write-Color "[Warmup] Restore of original active slot '$($origActive.Name)' failed: $($_.Exception.Message). You are now active on '$($lastSwapped.Name)'." 'Yellow' 6>$null }
         }
     }
     return $snapshot
