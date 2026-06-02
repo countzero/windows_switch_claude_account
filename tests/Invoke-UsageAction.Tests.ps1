@@ -340,8 +340,8 @@ Describe 'switch_claude_account' {
             # Cached values render via the regular 'ok' Status path.
             $out | Should -Match '\b42%'
             $out | Should -Match '\b73%'
-            # New endpoint-agnostic advisory text fires for the cache fallback.
-            $out | Should -Match 'Anthropic API rate limited.+displaying cached data'
+            # Endpoint-agnostic cache-fallback advisory fires (shortened wording).
+            $out | Should -Match 'Rate limited.+showing cached data'
             # Old advisory wording must not leak through.
             $out | Should -Not -Match '/api/oauth/usage rate limited'
         }
@@ -1003,10 +1003,10 @@ Describe 'switch_claude_account' {
 
             # The em-dash data cells stay (no data to show), but the advisory
             # makes clear it is transient and the slot is active.
-            $out | Should -Match 'transient and clears on its own'
-            $out | Should -Match 'The slot is active'
+            $out | Should -Match 'transient'
+            $out | Should -Match 'slot active'
             # The cached-data advisory must NOT fire (no cache here).
-            $out | Should -Not -Match 'displaying cached data'
+            $out | Should -Not -Match 'cached data'
         }
 
         It 'Format-UsageFrame prefers the cached-data advisory over the transient note when data was served' {
@@ -1021,8 +1021,25 @@ Describe 'switch_claude_account' {
 
             $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
 
-            $out | Should -Match 'displaying cached data'
-            $out | Should -Not -Match 'transient and clears on its own'
+            $out | Should -Match 'showing cached data'
+            $out | Should -Not -Match 'transient'
+        }
+
+        It 'Format-UsageFrame renders the advisory in the footer block, leading the [Auto]/[Watch] lines' {
+            $snap = [pscustomobject]@{
+                Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
+                    Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
+                NoSlots          = $false
+                HasCacheFallback = $false
+                HasRateLimited   = $true
+            }
+
+            $out = Format-UsageFrame -Snapshot $snap -Footer "[Watch] Last poll at 07:56:48" 6>&1 | Out-String
+
+            # Advisory moved out from under the table and into the footer
+            # block, leading the [Watch] line (and, when present, [Auto]).
+            ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('Rate limited'))
+            ($out.IndexOf('Rate limited')) | Should -BeLessThan ($out.IndexOf('[Watch]'))
         }
 
         It 'Invoke-UsageAction -Watch -Json throws (mutually exclusive)' {

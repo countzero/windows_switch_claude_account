@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- The `sca usage` rate-limit advisory moved out from under the table into the watch footer block, leading the `[Auto]` / `[Watch]` lines, and was shortened to a single line that fits the table width.
+
 ## [2.3.0] - 2026-05-29
 
 ### Added

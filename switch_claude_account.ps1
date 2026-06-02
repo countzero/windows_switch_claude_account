@@ -3436,31 +3436,48 @@ function Format-UsageFrame {
         Format-UsageTable -Results @($results) -IncludeAggregateBars -AutoThreshold $AutoThreshold
     }
 
-    # Cache-fallback advisory: inform the user that data is stale because
-    # an Anthropic API returned 429 and we fell back to cached responses.
-    # The 429 may have come from /api/oauth/usage (existing path) OR from
-    # /v1/oauth/token during a token refresh that triggered the cache
+    # Cache-fallback / rate-limit advisory. Rendered in the footer block
+    # (alongside the [Auto] / [Watch] lines), NOT directly under the table:
+    # the advisory leads the footer group so the rate-limit signal sits with
+    # the other per-frame status lines instead of crowding the table's last
+    # row. The 429 may have come from /api/oauth/usage (existing path) OR
+    # from /v1/oauth/token during a token refresh that triggered the cache
     # fallback in Get-SlotUsage's refresh-failure handler; hence the
     # endpoint-agnostic wording.
+    $advisory = $null
     if ($Snapshot.HasCacheFallback) {
-        Write-Color "  [Usage] Warning: Anthropic API rate limited; displaying cached data." 'Yellow'
+        $advisory = '[Usage] Rate limited; showing cached data.'
     }
     elseif ($Snapshot.HasRateLimited) {
-        # No cached data to fall back on (first poll under a throttle).
-        # Make it explicit that 'rate-limited' is a transient API condition,
-        # not an unused/dead slot: the slot is active and its numbers return
-        # on the next successful poll.
-        Write-Color "  [Usage] Note: Anthropic API rate limited; this is transient and clears on its own. The slot is active." 'Yellow'
+        # No cached data to fall back on (first poll under a throttle). Make
+        # it explicit that 'rate-limited' is a transient API condition, not
+        # an unused/dead slot: the slot is active and its numbers return on
+        # the next successful poll.
+        $advisory = '[Usage] Rate limited; transient, slot active.'
     }
 
-    if ($Footer) { Format-UsageFooter $Footer } else { Write-Host '' }
+    if ($Footer -or $advisory) {
+        Format-UsageFooter -Footer $Footer -Advisory $advisory
+    } else {
+        Write-Host ''
+    }
 }
 
 # Render the multi-line footer block under a usage frame. Internal helper
 # for Format-UsageFrame; extracted so the watch loop and any future
 # footer-consumers share one wrapping policy.
+#
+# -Footer   : the [Watch] / [Auto] lines (DarkGray). Kept as the first
+#             positional parameter so the existing positional call sites
+#             (`Format-UsageFooter $Footer`) bind unchanged.
+# -Advisory : optional rate-limit advisory (Yellow). Leads the footer
+#             block, above the DarkGray footer lines, so the warning stays
+#             visually distinct while grouping with the per-frame status.
 function Format-UsageFooter {
-    Param ([String] $Footer)
+    Param (
+        [AllowEmptyString()] [AllowNull()] [String] $Footer,
+        [AllowEmptyString()] [AllowNull()] [String] $Advisory
+    )
 
     # Two blank lines between the table and the footer: the first
     # closes the table block (paired with `Format-UsageTable`'s output),
@@ -3470,8 +3487,13 @@ function Format-UsageFooter {
     # user's main horizontal landmark.
     Write-Host ""
     Write-Host ""
-    foreach ($line in ($Footer -split "`r?`n")) {
-        Write-Color $line 'DarkGray'
+    if ($Advisory) {
+        Write-Color $Advisory 'Yellow'
+    }
+    if ($Footer) {
+        foreach ($line in ($Footer -split "`r?`n")) {
+            Write-Color $line 'DarkGray'
+        }
     }
 }
 
