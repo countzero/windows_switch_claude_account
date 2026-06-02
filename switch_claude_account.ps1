@@ -2391,7 +2391,14 @@ function Get-SlotUsage {
                 return [pscustomobject]@{ Status = 'rate-limited' }
             }
         }
-        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
+        # Generic fall-through. Surface the numeric HTTP status (when the
+        # exception carried a Response) so Format-UsageTable can render a
+        # short 'error <code>' label instead of the verbose .NET message
+        # ('Response status code does not indicate success: 529 ...'),
+        # which otherwise blows out the Status column and wraps the row.
+        # $status is $null for codeless network/timeout errors; the
+        # renderer falls back to the truncated message tail in that case.
+        return [pscustomobject]@{ Status = 'error'; HttpStatus = $status; Error = $_.Exception.Message }
     }
 }
 
@@ -3027,17 +3034,30 @@ function Format-UsageTable {
         $accountCell = Format-AccountCell -SlotName $r.Name -Email $email
 
         # Status: plan-usability when HTTP was ok, HTTP-state otherwise.
-        # The 'expired' and 'error' arms both route through
-        # Format-StatusErrorTail so a long underlying exception cannot
-        # wrap the row; the previous 'expired' arm interpolated the raw
-        # message with no length cap, which produced multi-line table
-        # rows when the token endpoint returned 429 with a long body.
+        # Long underlying exceptions must never wrap the row. The 'error'
+        # arm prefers a short 'error <code>' label when the row carries a
+        # numeric HttpStatus (e.g. 529 Overloaded), else falls back to a
+        # Format-StatusErrorTail truncated tail; the 'expired' arm routes
+        # through Format-StatusErrorTail too. The previous 'expired' arm
+        # interpolated the raw message with no length cap, which produced
+        # multi-line table rows when the token endpoint returned 429 with
+        # a long body.
         $statusText = switch ($r.Status) {
             'ok'           { Get-PlanStatus $r.Data }
             'no-oauth'     { 'no-oauth (api key or non-claude.ai slot)' }
             'expired'      { if ($r.Error) { "expired: $(Format-StatusErrorTail $r.Error)" } else { 'expired (run sca switch to refresh)' } }
             'unauthorized' { 'unauthorized (token revoked; run sca switch then /login)' }
-            'error'        { "error: $(Format-StatusErrorTail $r.Error)" }
+            'error'        {
+                # Prefer a short 'error <code>' label when the row carries a
+                # numeric HTTP status (e.g. 529 Overloaded, 5xx). Falls back
+                # to the truncated message tail for codeless network/timeout
+                # errors. Both forms match Get-StatusColor's '^error' -> Red.
+                if ($r.PSObject.Properties['HttpStatus'] -and $r.HttpStatus) {
+                    "error $($r.HttpStatus)"
+                } else {
+                    "error: $(Format-StatusErrorTail $r.Error)"
+                }
+            }
             'rate-limited' { 'rate-limited' }
             # 'warming-up' is the transient initial label rendered when
             # Invoke-WarmAllSlots starts iterating slots on `-Watch

@@ -1925,6 +1925,91 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Get-SlotUsage (generic HTTP error surfaces the status code)' {
+        # A non-401/403/429 HTTP failure (e.g. 529 Overloaded, 5xx) must
+        # surface Status='error' WITH the numeric HttpStatus so the table
+        # can render a short 'error <code>' label instead of the verbose
+        # .NET 'Response status code does not indicate success' message.
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+        }
+
+        It 'returns Status=error and HttpStatus=529 on an HTTP 529 from the usage endpoint' {
+            $slot = Join-Path $script:CredDirPath '.credentials.overloaded.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 529 }
+                $inner = [System.Exception]::new('Response status code does not indicate success: 529 (<none>).')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.HttpStatus | Should -Be 529
+            $r.Error      | Should -Not -BeNullOrEmpty
+        }
+
+        It 'leaves HttpStatus null for a codeless network/timeout error' {
+            $slot = Join-Path $script:CredDirPath '.credentials.timeout.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            # No Response member -> $status stays $null in the catch.
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Net.WebException]::new('The operation has timed out.')
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.HttpStatus | Should -BeNullOrEmpty
+            $r.Error      | Should -Match 'timed out'
+        }
+    }
+
+    Context 'Format-UsageTable (error-status label)' {
+        # The 'error' arm prefers a short 'error <code>' label when the row
+        # carries a numeric HttpStatus so a verbose .NET exception cannot
+        # widen the Status column and wrap the row; it falls back to the
+        # truncated message tail for codeless network errors.
+        It 'renders "error <code>" when the row carries an HttpStatus' {
+            $row = [pscustomobject]@{
+                Name       = 'slot-1'
+                IsActive   = $false
+                Status     = 'error'
+                HttpStatus = 529
+                Error      = 'Response status code does not indicate success: 529 (<none>).'
+                Data       = $null
+                Email      = $null
+            }
+            $out = Format-UsageTable -Results @($row) 6>&1 | Out-String
+            $out | Should -Match 'error 529'
+            # The verbose .NET sentence must not leak into the cell.
+            $out | Should -Not -Match 'does not indicate success'
+        }
+
+        It 'falls back to "error: <tail>" when the row has no HttpStatus' {
+            $row = [pscustomobject]@{
+                Name     = 'slot-1'
+                IsActive = $false
+                Status   = 'error'
+                Error    = 'The operation has timed out.'
+                Data     = $null
+                Email    = $null
+            }
+            $out = Format-UsageTable -Results @($row) 6>&1 | Out-String
+            $out | Should -Match 'error: The operation has timed out\.'
+        }
+    }
+
     Context 'Get-CachedUsageOrNull' {
         # Direct unit tests for the per-process usage cache helper.
         # $Script:SlotUsageCache is re-initialized to @{} in each

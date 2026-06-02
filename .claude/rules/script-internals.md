@@ -49,7 +49,7 @@ The `try/finally` scope is per-`Invoke-Main`, NOT global. Tests dot-source the s
   | HTTP 429, cache available (fresh or stale) | `rate-limited` with last-known % | Yellow |
   | HTTP 429, no cache at all | `rate-limited` (em-dash cells) | Yellow |
   | `-Watch -Auto` startup warmup in flight | `warming up` | Yellow |
-  | HTTP failure | `expired` / `unauthorized` / `error: …` / `no-oauth (api key or non-claude.ai slot)` | Yellow / Red / Red / DarkGray |
+  | HTTP failure | `expired` / `unauthorized` / `error <code>` (numeric HTTP status, e.g. `error 529`) or `error: …` (codeless network/timeout fallback) / `no-oauth (api key or non-claude.ai slot)` | Yellow / Red / Red / DarkGray |
 
   Thresholds: `$Script:UtilWarnPct = 90`, `$Script:UtilLimitPct = 100`. `Get-StatusColor` is the single source of truth so summary table and verbose view stay in lockstep. `Format-UsageTable` fills bucket cells whenever the row carries `Data` (not only `ok` rows), so a `rate-limited` row served from the cache keeps its percentages instead of collapsing to em-dashes.
 
@@ -58,7 +58,7 @@ The `try/finally` scope is per-`Invoke-Main`, NOT global. Tests dot-source the s
 - **Stale** entry → served via `-AllowStale` as `Status='rate-limited'` + `IsCachedFallback`: the last-known percentages stay visible (so the row is not misread as dead) but the status stays `rate-limited` so stale data is never mistaken for live. The usage-endpoint path serves stale only as a last resort, after the fresh lookup and the one retry-after-5s have failed.
 - **No cache at all** → `Status='rate-limited'` with no `Data` (em-dash cells).
 
-Advisories (`Format-UsageFrame`, in precedence order): if any row served from cache (`HasCacheFallback`), `[Usage] Rate limited; showing cached data.`; else if any row is `rate-limited` with no data (`HasRateLimited`), a transient-throttle note (`[Usage] Rate limited; transient, slot active.`) so an empty row reads as "throttled, not dead". The advisory is rendered by `Format-UsageFooter -Advisory` in the footer block (Yellow, leading the DarkGray `[Auto]` / `[Watch]` lines), NOT directly under the table, so the rate-limit signal groups with the other per-frame status lines. Long error messages on `'expired'` / `'error'` arms are normalized through `Format-StatusErrorTail` (whitespace collapse + 60-char cap) so verbose exceptions can't wrap the row.
+Advisories (`Format-UsageFrame`, in precedence order): if any row served from cache (`HasCacheFallback`), `[Usage] Rate limited; showing cached data.`; else if any row is `rate-limited` with no data (`HasRateLimited`), a transient-throttle note (`[Usage] Rate limited; transient, slot active.`) so an empty row reads as "throttled, not dead". The advisory is rendered by `Format-UsageFooter -Advisory` in the footer block (Yellow, leading the DarkGray `[Auto]` / `[Watch]` lines), NOT directly under the table, so the rate-limit signal groups with the other per-frame status lines. Long error messages can't wrap the row: the `'error'` arm prefers a short `error <code>` label when the row carries a numeric `HttpStatus` (set by `Get-SlotUsage` on any non-401/403/429 HTTP failure, e.g. `error 529`), falling back to a `Format-StatusErrorTail`-normalized tail (whitespace collapse + 60-char cap) for codeless network/timeout errors; the `'expired'` arm routes through `Format-StatusErrorTail` too.
 
 ## Aggregate progress bars
 
