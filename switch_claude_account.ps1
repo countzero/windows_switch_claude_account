@@ -4383,6 +4383,16 @@ function Invoke-UsageWatch {
                     Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot -Aggregate:$Auto))
                 } catch { Write-Verbose "Warmup title set deferred: $_" }
             }
+            # If warmup ended with rate-limited rows, the user sees dashes
+            # for the full poll interval. Trigger an early repoll (~10s) so
+            # the rate-limit window (a "short cooldown" per the code
+            # comments) likely clears and the user sees real data sooner.
+            # If the early repoll also gets 429, $lastPoll resets to now
+            # and we fall back to the normal interval — no worse than
+            # current behaviour.
+            if ($snapshot -and $snapshot.HasRateLimited) {
+                $lastPoll = [DateTime]::Now.AddSeconds(-10)
+            }
         }
 
         while ($true) {
