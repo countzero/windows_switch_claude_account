@@ -1210,6 +1210,7 @@ Describe 'switch_claude_account' {
             @{ Case = 'limited 7d';        Label = 'limited 7d';        Expected = 'no prompts until 7d window resets' }
             @{ Case = 'limited (both)';    Label = 'limited';           Expected = 'no prompts until both 5h and 7d windows reset' }
             @{ Case = 'ok (no plan data)'; Label = 'ok (no plan data)'; Expected = 'HTTP ok but response carried no bucket data' }
+            @{ Case = 'rate-limited';      Label = 'rate-limited';      Expected = 'temporary API throttle (429), not a plan limit' }
         ) {
             (Get-StatusRationale -Label $Label) | Should -Be $Expected
         }
@@ -1224,6 +1225,128 @@ Describe 'switch_claude_account' {
             (Get-StatusRationale -Label 'ok')    | Should -BeNullOrEmpty
             (Get-StatusRationale -Label 'error') | Should -BeNullOrEmpty
             (Get-StatusRationale -Label '')      | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Format-SlotNameList' {
+        It 'returns $null for an empty or all-blank list' {
+            (Format-SlotNameList -Names @())            | Should -BeNullOrEmpty
+            (Format-SlotNameList -Names @($null, ''))   | Should -BeNullOrEmpty
+        }
+
+        It 'single-quotes and comma-joins up to 3 names' {
+            (Format-SlotNameList -Names @('a'))           | Should -Be "'a'"
+            (Format-SlotNameList -Names @('a','b'))       | Should -Be "'a', 'b'"
+            (Format-SlotNameList -Names @('a','b','c'))   | Should -Be "'a', 'b', 'c'"
+        }
+
+        It 'collapses past 3 names to the "and N more" form' {
+            (Format-SlotNameList -Names @('a','b','c','d'))         | Should -Be "'a', 'b', 'c' and 1 more"
+            (Format-SlotNameList -Names @('a','b','c','d','e'))     | Should -Be "'a', 'b', 'c' and 2 more"
+        }
+    }
+
+    Context 'Format-RateLimitAdvisory' {
+        BeforeAll {
+            function New-RlSnapshot {
+                Param ($Results, [bool] $Cache, [bool] $Rl)
+                [pscustomobject]@{
+                    Results = @($Results); NoSlots = $false
+                    HasCacheFallback = $Cache; HasRateLimited = $Rl
+                }
+            }
+            function New-RlRow {
+                Param ([string] $Name, [string] $Status = 'rate-limited', [bool] $Cached = $false)
+                [pscustomobject]@{ Name = $Name; Status = $Status; IsCachedFallback = $Cached;
+                    Data = $null; Error = $null; Email = $null; IsActive = $false }
+            }
+        }
+
+        It 'returns $null when nothing is rate-limited' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'a' -Status 'ok')) -Cache $false -Rl $false
+            Format-RateLimitAdvisory -Snapshot $snap | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null for a null snapshot' {
+            Format-RateLimitAdvisory -Snapshot $null | Should -BeNullOrEmpty
+        }
+
+        It 'no-cache, one slot: names it with "is" and no last-known clause' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1')) -Cache $false -Rl $true
+            Format-RateLimitAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'slot-1' is currently rate-limited by Anthropic."
+        }
+
+        It 'no-cache, multiple slots: names them with "are"' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3')) -Cache $false -Rl $true
+            Format-RateLimitAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited by Anthropic."
+        }
+
+        It 'no-cache, >3 slots: collapses to "and N more" with plural verb' {
+            $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ }
+            $snap = New-RlSnapshot -Results $rows -Cache $false -Rl $true
+            Format-RateLimitAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited by Anthropic."
+        }
+
+        It 'cache branch: names the cached slot and adds the last-known clause' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'cached' -Cached $true)) -Cache $true -Rl $true
+            Format-RateLimitAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'cached' is currently rate-limited by Anthropic; showing last known usage."
+        }
+
+        It 'cache branch takes precedence and names only the cached rows' {
+            $rows = @((New-RlRow -Name 'cached' -Cached $true), (New-RlRow -Name 'nocache' -Cached $false))
+            $snap = New-RlSnapshot -Results $rows -Cache $true -Rl $true
+            $out  = Format-RateLimitAdvisory -Snapshot $snap
+            $out | Should -Match "'cached'"
+            $out | Should -Not -Match 'nocache'
+            $out | Should -Match 'showing last known usage'
+        }
+    }
+
+    Context 'Get-RetryAfterSeconds' {
+        BeforeAll {
+            function New-HttpEx {
+                Param ($Response)
+                $ex = [System.Exception]::new('429')
+                $ex | Add-Member -NotePropertyName Response -NotePropertyValue $Response -Force
+                return $ex
+            }
+        }
+
+        It 'returns $null when the exception has no Response' {
+            Get-RetryAfterSeconds (New-HttpEx -Response $null) | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null for a Response with no Headers (test stub shape)' {
+            # Mirrors the existing fake-429 fixtures: pscustomobject w/ StatusCode only.
+            Get-RetryAfterSeconds (New-HttpEx -Response ([pscustomobject]@{ StatusCode = 429 })) |
+                Should -BeNullOrEmpty
+        }
+
+        It 'reads the typed RetryAfter.Delta (delta-seconds form)' {
+            $headers = [System.Net.Http.HttpResponseMessage]::new(429).Headers
+            $headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([TimeSpan]::FromSeconds(8))
+            $resp = [pscustomobject]@{ Headers = $headers }
+            Get-RetryAfterSeconds (New-HttpEx -Response $resp) | Should -Be 8
+        }
+
+        It 'reads the typed RetryAfter.Date (HTTP-date form), clamping the future delta' {
+            $headers = [System.Net.Http.HttpResponseMessage]::new(429).Headers
+            $headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([DateTimeOffset]::UtcNow.AddSeconds(30))
+            $resp = [pscustomobject]@{ Headers = $headers }
+            $secs = Get-RetryAfterSeconds (New-HttpEx -Response $resp)
+            $secs | Should -BeGreaterThan 20
+            $secs | Should -BeLessOrEqual 31
+        }
+
+        It 'returns 0 for a past HTTP-date (retry immediately)' {
+            $headers = [System.Net.Http.HttpResponseMessage]::new(429).Headers
+            $headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([DateTimeOffset]::UtcNow.AddSeconds(-30))
+            $resp = [pscustomobject]@{ Headers = $headers }
+            Get-RetryAfterSeconds (New-HttpEx -Response $resp) | Should -Be 0
         }
     }
 

@@ -48,7 +48,7 @@ Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`. Te
 | `switch`   | Optional      | Refuses if Claude Code is running. Reconciles first (so a pending refresh on the outgoing slot is captured), then atomic-writes the target slot's bytes into `.credentials.json`, then atomic-writes the destination slot's captured `oauthAccount` (whitelisted fields) into `~/.claude.json`. If `<name>` omitted, rotates to the next saved slot in alphabetical order (wraps). Refuses to activate a slot with no sidecar. |
 | `list`     | No            | Reconciles first (so cross-account swaps detected since the last `sca` call surface in the marker column), then renders saved slots as `Slot \| Account` with leading active-marker column. `*` marker comes from `state.active_slot`. Sidecar-less slots silently filtered out. |
 | `remove`   | Yes           | Deletes a named slot AND its sidecar. Walks the raw filesystem (not `Get-Slots`) so sidecar-less legacy slots can be cleaned by name. Refuses to remove the slot tracked as active in state. |
-| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot for 5h / 7d plan-usage percentages. Auto-refreshes expired tokens via `Update-SlotTokens`. Accepts `-Json` for scripted output, or `-Watch` (optional `-Interval <seconds>`, floor 60) for live view. `-Watch -Auto [-Threshold <1..100>]` auto-rotates to the next eligible slot when the active slot's `max(5h, 7d)` utilization hits the threshold (default 95); refuses if Claude Code is running. `-Watch -Warmup` (independent of `-Auto`) pre-refreshes every slot's OAuth tokens before the first poll. With `<name>`, renders verbose single-slot block. |
+| `usage`    | Optional      | Reconciles first, then calls Claude Code's **undocumented** `GET /api/oauth/usage` per slot for 5h / 7d plan-usage percentages. Auto-refreshes expired tokens via `Update-SlotTokens`. Accepts `-Json` for scripted output, or `-Watch` (optional `-Interval <seconds>`, floor 60) for live view. `-Watch -Auto [-Threshold <1..100>]` auto-rotates to the next eligible slot when the active slot's `max(5h, 7d)` utilization hits the threshold (default 95); refuses if Claude Code is running. `-Watch -Warmup` (independent of `-Auto`) primes every slot (a billable `/v1/messages` request that opens its 5h window) before the first poll. With `<name>`, renders verbose single-slot block. |
 | `install`  | No            | Adds wrapper function + aliases to PowerShell profile. |
 | `uninstall`| No            | Removes wrapper function + aliases from profile. |
 | `help`     | No            | Shows detailed help. |
@@ -124,7 +124,7 @@ OpenCode-scoped (issue #8): requires `opencode-claude-auth >= 1.5.4`, which re-r
 
 ## Startup warmup (`-Warmup`)
 
-`sca usage -Watch -Warmup` (independent of `-Auto`; combines as `-Watch -Auto -Warmup`) primes every saved slot before entering the steady-state polling loop. Per slot in alphabetical order: `Invoke-SlotSwap` makes it active, then `Invoke-SlotPrime` POSTs a minimal billable `/v1/messages` request (~2 tokens on Haiku) so Anthropic opens the slot's server-side 5h session window. **Verify-after-prime**: because `Invoke-SlotPrime` returns no bucket data, an `ok` prime is immediately followed by a `Get-SlotUsage` read so the warmup frame shows live percentages right away instead of `ok (no plan data)` (empty cells) until the first poll ~60 s later; a failed prime skips the read and surfaces the prime's own outcome. A `finally` block restores the original active slot at the end. Per-slot progress in the Status column: `warming up` (queued) → `priming` (prime POST in flight) → real outcome (the verify-after-prime usage result, or the prime's failure: `rate-limited` / `no-oauth` / `expired` / `unauthorized` / `error`). The end-state snapshot IS the first frame of the polling loop. `$Script:WarmupSpacingMs` (300 ms) between slots dodges per-IP burst limits; `Test-ClaudeRunning` refuses pre-loop (the per-slot swap writes `~/.claude.json`'s `oauthAccount`).
+`sca usage -Watch -Warmup` (independent of `-Auto`; combines as `-Watch -Auto -Warmup`) primes every saved slot before entering the steady-state polling loop. Per slot in alphabetical order: `Invoke-SlotSwap` makes it active, then `Invoke-SlotPrime` POSTs a minimal billable `/v1/messages` request (~2 tokens on Haiku) so Anthropic opens the slot's server-side 5h session window. **Verify-after-prime**: because `Invoke-SlotPrime` returns no bucket data, an `ok` prime is immediately followed by a `Get-SlotUsage` read so the warmup frame shows live percentages right away instead of `ok (no plan data)` (empty cells) until the first poll ~60 s later; a 429 prime is retried once first (honoring `Retry-After` up to `$Script:WarmupPrimeRetryCapSec` = 10 s, else `$Script:WarmupPrimeRetryDefaultMs`) so a transient throttle still opens the window, and a prime that still fails skips the read and surfaces its own outcome. A `finally` block restores the original active slot at the end. Per-slot progress in the Status column: `warming up` (queued) → `priming` (prime POST in flight) → real outcome (the verify-after-prime usage result, or the prime's failure: `rate-limited` / `no-oauth` / `expired` / `unauthorized` / `error`). The end-state snapshot IS the first frame of the polling loop. `$Script:WarmupSpacingMs` (300 ms) between slots dodges per-IP burst limits; `Test-ClaudeRunning` refuses pre-loop (the per-slot swap writes `~/.claude.json`'s `oauthAccount`).
 
 Swap failures share the `error` label with prime failures; the exception message in the row's Error tail names the failing operation. `-Name` narrows warmup to a single slot. Refused when no slots match.
 
@@ -152,15 +152,7 @@ Three SVG terminal-output examples in `docs/images/` (`usage-watch`, `usage-tabl
 
 ## Default Change Workflow
 
-When asked to make a change, always follow these steps in order:
-
-1. Make the code change
-2. Run the test suite (Pester + PSScriptAnalyzer advisory) from the repo root:
-   - `pwsh -NoProfile -File tests/Invoke-Tests.ps1`
-
-PowerShell has no separate typecheck step; parse-time validation runs implicitly when the script is dot-sourced or invoked. PSScriptAnalyzer lint runs inside `Invoke-Tests.ps1` in advisory (non-fatal) mode, so a single command covers both tests and lint.
-
-Commit and push are **not** performed automatically. Only commit when the user explicitly requests it, and only push when the user explicitly requests it. These are separate steps; "commit" does not imply "push."
+After any code change, run `pwsh -NoProfile -File tests/Invoke-Tests.ps1` (Pester + PSScriptAnalyzer advisory; the implicit parse-time check when the script is dot-sourced is the only "typecheck"). Commit and push are **not** automatic: commit only when explicitly asked, push only when explicitly asked, and "commit" does not imply "push."
 
 ## Scratch files
 
@@ -188,8 +180,7 @@ When your changes overlap foreign WIP in the same file, stop and ask. Do not res
 
 ## Skills
 
-- `plan-review` (`.claude/skills/plan-review/`): second-pass design review before non-trivial plans.
-- `pr-code-review` (`.claude/skills/pr-code-review/`): multi-pass PR review.
+- `plan-review` / `pr-code-review` (under `.claude/skills/`): second-pass design review before non-trivial plans; multi-pass PR review.
 
 ## Punctuation: prefer specific marks over the em dash
 

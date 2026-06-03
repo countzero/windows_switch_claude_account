@@ -340,10 +340,12 @@ Describe 'switch_claude_account' {
             # Cached values render via the regular 'ok' Status path.
             $out | Should -Match '\b42%'
             $out | Should -Match '\b73%'
-            # Endpoint-agnostic cache-fallback advisory fires (shortened wording).
-            $out | Should -Match 'Rate limited.+showing cached data'
+            # Cache-fallback advisory fires, naming the slot and noting the
+            # last-known data is being shown.
+            $out | Should -Match 'currently rate-limited by Anthropic; showing last known usage'
             # Old advisory wording must not leak through.
             $out | Should -Not -Match '/api/oauth/usage rate limited'
+            $out | Should -Not -Match 'showing cached data'
         }
 
         It 'refresh failure with non-429 long message: expired tail is truncated' {
@@ -990,7 +992,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)^\s*\*?\s*cached\b.*\brate-limited\s*$'
         }
 
-        It 'Format-UsageFrame shows the transient note for a no-cache rate-limited row' {
+        It 'Format-UsageFrame names the slot for a no-cache rate-limited row' {
             $snap = [pscustomobject]@{
                 Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
                     Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
@@ -1002,14 +1004,14 @@ Describe 'switch_claude_account' {
             $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
 
             # The em-dash data cells stay (no data to show), but the advisory
-            # makes clear it is transient and the slot is active.
-            $out | Should -Match 'transient'
-            $out | Should -Match 'slot active'
-            # The cached-data advisory must NOT fire (no cache here).
-            $out | Should -Not -Match 'cached data'
+            # names the throttled slot and states the condition without
+            # promising recovery (the renderer is shared with one-shot).
+            $out | Should -Match "'throttled' is currently rate-limited by Anthropic\."
+            # The cached-data wording must NOT fire (no cache here).
+            $out | Should -Not -Match 'last known usage'
         }
 
-        It 'Format-UsageFrame prefers the cached-data advisory over the transient note when data was served' {
+        It 'Format-UsageFrame prefers the cached-data advisory over the no-cache one when data was served' {
             $snap = [pscustomobject]@{
                 Results = @([pscustomobject]@{ Name = 'cached'; IsActive = $true; Status = 'rate-limited';
                     Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null } }
@@ -1021,8 +1023,7 @@ Describe 'switch_claude_account' {
 
             $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
 
-            $out | Should -Match 'showing cached data'
-            $out | Should -Not -Match 'transient'
+            $out | Should -Match "'cached' is currently rate-limited by Anthropic; showing last known usage\."
         }
 
         It 'Format-UsageFrame renders the advisory in the footer block, leading the [Auto]/[Watch] lines' {
@@ -1038,8 +1039,10 @@ Describe 'switch_claude_account' {
 
             # Advisory moved out from under the table and into the footer
             # block, leading the [Watch] line (and, when present, [Auto]).
-            ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('Rate limited'))
-            ($out.IndexOf('Rate limited')) | Should -BeLessThan ($out.IndexOf('[Watch]'))
+            # 'throttled' appears first in the table row, then again in the
+            # advisory; the advisory-only phrase anchors the ordering check.
+            ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('currently rate-limited'))
+            ($out.IndexOf('currently rate-limited')) | Should -BeLessThan ($out.IndexOf('[Watch]'))
         }
 
         It 'Invoke-UsageAction -Watch -Json throws (mutually exclusive)' {
@@ -2605,10 +2608,71 @@ Describe 'switch_claude_account' {
             $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
 
             (Get-RowStatus $snap 'limited') | Should -Be 'rate-limited'
+            # The fake 429 carries no Retry-After header, so the prime is
+            # retried once on the blind default backoff (zeroed in tests);
+            # both attempts 429, so the row stays rate-limited.
+            Should -Invoke Invoke-RestMethod -Times 2 -Exactly -ParameterFilter { $Uri -eq $Script:MessagesEndpoint }
             # A failed prime skips the verify-after-prime usage read: the
             # prime's own outcome is the signal, and a usage call would not
             # add information.
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+        }
+
+        It 'rate-limited prime with Retry-After within cap: retries once, succeeds, then reads usage' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            Mock Start-Sleep -MockWith { }
+            $script:primeCalls = 0
+            Mock Invoke-SlotPrime -MockWith {
+                $script:primeCalls++
+                if ($script:primeCalls -eq 1) {
+                    return [pscustomobject]@{ Status = 'rate-limited'; RetryAfterSec = 3 }
+                }
+                return [pscustomobject]@{ Status = 'ok' }
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            (Get-RowStatus $snap 'a') | Should -Be 'ok'
+            $script:primeCalls | Should -Be 2
+            # Honored Retry-After (3s) as the backoff before the retry.
+            Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Milliseconds -eq 3000 }
+            # Verify-after-prime fires on the successful retry.
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+        }
+
+        It 'rate-limited prime with Retry-After above cap: skips the retry, stays rate-limited' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            Mock Start-Sleep -MockWith { }
+            $script:primeCalls = 0
+            Mock Invoke-SlotPrime -MockWith {
+                $script:primeCalls++
+                return [pscustomobject]@{ Status = 'rate-limited'; RetryAfterSec = ($Script:WarmupPrimeRetryCapSec + 5) }
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            (Get-RowStatus $snap 'a') | Should -Be 'rate-limited'
+            $script:primeCalls | Should -Be 1
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+        }
+
+        It 'rate-limited prime with no Retry-After: one blind retry at the default backoff' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            Mock Start-Sleep -MockWith { }
+            $script:primeCalls = 0
+            Mock Invoke-SlotPrime -MockWith {
+                $script:primeCalls++
+                if ($script:primeCalls -eq 1) {
+                    return [pscustomobject]@{ Status = 'rate-limited'; RetryAfterSec = $null }
+                }
+                return [pscustomobject]@{ Status = 'ok' }
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            (Get-RowStatus $snap 'a') | Should -Be 'ok'
+            $script:primeCalls | Should -Be 2
         }
 
         It 'verify-after-prime: an ok prime triggers exactly one usage read per slot' {
@@ -3046,6 +3110,20 @@ Describe 'switch_claude_account' {
             }
 
             (Invoke-SlotPrime -SlotPath $path).Status | Should -Be 'rate-limited'
+        }
+
+        It 'messages endpoint 429 surfaces RetryAfterSec parsed from the Retry-After header' {
+            $path = New-PrimeSlot -Name 'busy2'
+            $headers = [System.Net.Http.HttpResponseMessage]::new(429).Headers
+            $headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([TimeSpan]::FromSeconds(7))
+            $resp = [pscustomobject]@{ StatusCode = 429; Headers = $headers }
+            $ex   = [System.Exception]::new('429 Too Many Requests')
+            $ex | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq $Script:MessagesEndpoint } -MockWith { throw $ex }
+
+            $r = Invoke-SlotPrime -SlotPath $path
+            $r.Status        | Should -Be 'rate-limited'
+            $r.RetryAfterSec | Should -Be 7
         }
 
         It 'messages endpoint generic exception returns Status=error with the message' {

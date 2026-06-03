@@ -2479,6 +2479,58 @@ function Get-SlotProfile {
     return [pscustomobject]@{ Status = 'ok'; Email = $email }
 }
 
+# Parse a 429 response's Retry-After into seconds (double) or $null.
+# Invoke-SlotPrime attaches the result to its 'rate-limited' return so the
+# warmup retry in Invoke-WarmAllSlots can honor the server-directed wait
+# instead of guessing a backoff. Reads the strongly-typed
+# HttpResponseMessage.Headers.RetryAfter first (.Delta for the delta-seconds
+# form, .Date for the HTTP-date form), then falls back to a raw 'Retry-After'
+# header parse. Fully defensive: a missing header, a malformed value, or a
+# non-HttpResponseMessage Response (e.g. a pscustomobject test stub that only
+# carries StatusCode) all return $null so the caller takes its no-header
+# path. Never throws. A past Date clamps to 0 (retry immediately).
+function Get-RetryAfterSeconds {
+    Param ($Exception)
+
+    try {
+        $resp = $Exception.Response
+        if (-not $resp) { return $null }
+
+        $headers = $resp.Headers
+        if (-not $headers) { return $null }
+
+        $retryAfter = $headers.RetryAfter
+        if ($retryAfter) {
+            if ($null -ne $retryAfter.Delta) {
+                $secs = [double]$retryAfter.Delta.TotalSeconds
+                if ($secs -lt 0) { return 0.0 }
+                return $secs
+            }
+            if ($null -ne $retryAfter.Date) {
+                $secs = ([DateTimeOffset]$retryAfter.Date - [DateTimeOffset]::UtcNow).TotalSeconds
+                if ($secs -lt 0) { return 0.0 }
+                return [double]$secs
+            }
+        }
+
+        # Raw header fallback (delta-seconds form). HTTP-date is already
+        # covered by the typed .Date path above when .NET parsed it.
+        $out = $null
+        if ($headers.TryGetValues('Retry-After', [ref]$out)) {
+            $raw  = @($out)[0]
+            $secs = 0.0
+            if ([double]::TryParse([string]$raw, [ref]$secs)) {
+                if ($secs -lt 0) { return 0.0 }
+                return $secs
+            }
+        }
+        return $null
+    }
+    catch {
+        return $null
+    }
+}
+
 # Send a minimal billable request to /v1/messages so Anthropic opens a
 # server-side 5h session window for this slot. Subsequent /api/oauth/usage
 # calls against the slot then return real bucket data instead of an empty
@@ -2492,7 +2544,7 @@ function Get-SlotProfile {
 #   @{ Status = 'ok' }                                # 2xx; window opened
 #   @{ Status = 'no-oauth' }                          # slot has no claudeAiOauth
 #   @{ Status = 'expired'; Error = <msg> }            # token expired AND refresh failed (non-429)
-#   @{ Status = 'rate-limited' }                      # 429 from refresh OR messages endpoint
+#   @{ Status = 'rate-limited'; RetryAfterSec = <n|null> } # 429 from refresh OR messages endpoint
 #   @{ Status = 'unauthorized' }                      # 401/403 from messages endpoint
 #   @{ Status = 'error'; Error = <msg> }              # network / shape / other
 #
@@ -2549,7 +2601,9 @@ function Invoke-SlotPrime {
             return [pscustomobject]@{ Status = 'unauthorized' }
         }
         if ($status -eq 429) {
-            return [pscustomobject]@{ Status = 'rate-limited' }
+            # Surface the server-directed wait (Retry-After) so the warmup
+            # retry in Invoke-WarmAllSlots can honor it instead of guessing.
+            return [pscustomobject]@{ Status = 'rate-limited'; RetryAfterSec = (Get-RetryAfterSeconds $_.Exception) }
         }
         return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
     }
@@ -2815,6 +2869,7 @@ function Get-StatusRationale {
         'limited'           { return 'no prompts until both 5h and 7d windows reset' }
         'near limit'        { return "at or above $($Script:UtilWarnPct)% on at least one bucket" }
         'ok (no plan data)' { return 'HTTP ok but response carried no bucket data' }
+        'rate-limited'      { return 'temporary API throttle (429), not a plan limit' }
         default             { return $null }
     }
 }
@@ -3405,6 +3460,61 @@ function Get-UsageSnapshot {
     }
 }
 
+# Format a list of slot names as quoted, comma-joined text, collapsing to
+# "'a', 'b', 'c' and N more" past 3 names so a wide pool can't overflow the
+# advisory line. Returns $null for an empty list. Pure.
+function Format-SlotNameList {
+    Param ([string[]] $Names)
+
+    $names = @($Names | Where-Object { $_ })
+    if ($names.Count -eq 0) { return $null }
+
+    $cap = 3
+    if ($names.Count -le $cap) {
+        return (($names | ForEach-Object { "'$_'" }) -join ', ')
+    }
+    $shown = @($names[0..($cap - 1)] | ForEach-Object { "'$_'" })
+    $more  = $names.Count - $cap
+    return (($shown -join ', ') + " and $more more")
+}
+
+# Build the yellow rate-limit advisory line for a usage frame, or $null when
+# no row is rate-limited. Pure (no Write-Host) so it unit-tests without host
+# capture. Names the affected slot(s) so the user sees WHICH slot is
+# throttled: it is usually a non-active peer, not the '*' active slot, which
+# is exactly the confusion the old "transient, slot active." wording caused.
+# Two branches, cache-fallback taking precedence (matches the prior
+# single-line behavior; when both cached and no-cache rate-limited rows exist
+# only the cached ones are named):
+#   * HasCacheFallback : rows served stale from the 429 cache, so the table
+#     keeps last-known percentages and the advisory says so.
+#   * HasRateLimited    : no cache to show (em-dash cells). States the
+#     condition without promising recovery, because the renderer is shared by
+#     one-shot `sca usage` (no "next poll") and `sca usage -Watch`.
+function Format-RateLimitAdvisory {
+    Param ([pscustomobject] $Snapshot)
+
+    if (-not $Snapshot) { return $null }
+
+    if ($Snapshot.HasCacheFallback) {
+        $names = @($Snapshot.Results | Where-Object { $_.IsCachedFallback } | ForEach-Object { $_.Name })
+        $list  = Format-SlotNameList -Names $names
+        if (-not $list) { return $null }
+        $verb  = if ($names.Count -eq 1) { 'is' } else { 'are' }
+        return "[Usage] $list $verb currently rate-limited by Anthropic; showing last known usage."
+    }
+
+    if ($Snapshot.HasRateLimited) {
+        $names = @($Snapshot.Results | Where-Object { $_.Status -eq 'rate-limited' } | ForEach-Object { $_.Name })
+        $list  = Format-SlotNameList -Names $names
+        if (-not $list) { return $null }
+        $verb  = if ($names.Count -eq 1) { 'is' } else { 'are' }
+        return "[Usage] $list $verb currently rate-limited by Anthropic."
+    }
+
+    return $null
+}
+
 # Render one usage frame (table OR verbose view, plus optional advisory
 # and optional footer). Pure presentation; does not call the network.
 # Used by both the one-shot action and the live watch loop; the same
@@ -3456,25 +3566,12 @@ function Format-UsageFrame {
         Format-UsageTable -Results @($results) -IncludeAggregateBars -AutoThreshold $AutoThreshold
     }
 
-    # Cache-fallback / rate-limit advisory. Rendered in the footer block
-    # (alongside the [Auto] / [Watch] lines), NOT directly under the table:
-    # the advisory leads the footer group so the rate-limit signal sits with
-    # the other per-frame status lines instead of crowding the table's last
-    # row. The 429 may have come from /api/oauth/usage (existing path) OR
-    # from /v1/oauth/token during a token refresh that triggered the cache
-    # fallback in Get-SlotUsage's refresh-failure handler; hence the
-    # endpoint-agnostic wording.
-    $advisory = $null
-    if ($Snapshot.HasCacheFallback) {
-        $advisory = '[Usage] Rate limited; showing cached data.'
-    }
-    elseif ($Snapshot.HasRateLimited) {
-        # No cached data to fall back on (first poll under a throttle). Make
-        # it explicit that 'rate-limited' is a transient API condition, not
-        # an unused/dead slot: the slot is active and its numbers return on
-        # the next successful poll.
-        $advisory = '[Usage] Rate limited; transient, slot active.'
-    }
+    # Cache-fallback / rate-limit advisory (wording + slot naming in
+    # Format-RateLimitAdvisory). Rendered in the footer block (alongside the
+    # [Auto] / [Watch] lines), NOT directly under the table: the advisory
+    # leads the footer group so the rate-limit signal sits with the other
+    # per-frame status lines instead of crowding the table's last row.
+    $advisory = Format-RateLimitAdvisory -Snapshot $Snapshot
 
     if ($Footer -or $advisory) {
         Format-UsageFooter -Footer $Footer -Advisory $advisory
@@ -4093,6 +4190,20 @@ $Script:UsageWatchMinInterval = 60
 $Script:WarmupSpacingMs    = 300
 $Script:WarmupPrimingMinMs = 150
 
+# Warmup prime-retry policy. A warmup prime that returns HTTP 429 gets ONE
+# retry inside Invoke-WarmAllSlots so a transient throttle still opens the
+# slot's 5h window instead of leaving the row 'rate-limited' for the whole
+# watch session (priming is the only thing that opens the window; the
+# steady-state poll only reads usage). The wait honors the 429's Retry-After
+# header when present (Get-RetryAfterSeconds), capped at WarmupPrimeRetryCapSec
+# so an interactive warmup never blocks too long on one slot: a Retry-After
+# above the cap is read as "not worth waiting" and the retry is skipped. When
+# no Retry-After is present (e.g. a token-endpoint 429, which carries none),
+# fall back to WarmupPrimeRetryDefaultMs (aligned with Get-SlotUsage's blind
+# 5s 429 backoff). Tunable for tests (Common.ps1 zeroes the default backoff).
+$Script:WarmupPrimeRetryCapSec    = 10
+$Script:WarmupPrimeRetryDefaultMs = 5000
+
 # Warmup-as-swap-then-prime orchestrator for `sca usage -Watch -Warmup`.
 # Round-robins through every saved slot in alphabetical order: per slot,
 # Invoke-SlotSwap makes it active (writes .credentials.json AND
@@ -4213,6 +4324,27 @@ function Invoke-WarmAllSlots {
                 # the live active slot. Record it for the restore advisory.
                 $lastSwapped = $row
                 $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
+                # Single retry on a transient 429 so the slot's 5h window
+                # still opens. Honor Retry-After when the prime surfaced it
+                # (capped: a wait longer than WarmupPrimeRetryCapSec is read
+                # as "not worth blocking an interactive warmup", so skip the
+                # retry); otherwise fall back to a default blind backoff.
+                if ($r.Status -eq 'rate-limited') {
+                    $retryAfter = $r.RetryAfterSec
+                    $sleepMs    = -1
+                    if ($null -ne $retryAfter) {
+                        if ($retryAfter -le $Script:WarmupPrimeRetryCapSec) {
+                            $sleepMs = [int]([math]::Ceiling($retryAfter * 1000))
+                        }
+                    }
+                    else {
+                        $sleepMs = $Script:WarmupPrimeRetryDefaultMs
+                    }
+                    if ($sleepMs -ge 0) {
+                        if ($sleepMs -gt 0) { Start-Sleep -Milliseconds $sleepMs }
+                        $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
+                    }
+                }
                 if ($r.Status -eq 'ok') {
                     # Prime opened the session but returns no bucket data.
                     # Read /api/oauth/usage now (verify-after-prime) so the
