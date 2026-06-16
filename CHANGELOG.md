@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The `sca usage` rate-limit advisory moved out from under the table into the watch footer block, leading the `[Auto]` / `[Watch]` lines, and was shortened to a single line that fits the table width.
+- Agent instructions now live in `AGENTS.md` (read natively by OpenCode); `CLAUDE.md` is a thin `@AGENTS.md` import shim so Claude Code loads the same content. Added a Code Comments conventions section.
 - Warmup (`sca warmup` and `sca usage -Watch -Warmup`) now opens a slot's 5h window by running the real Claude Code CLI (`claude -p` in safe-mode on Haiku, ~$0.004/slot) instead of a raw `/v1/messages` request. This always opens the window like a real message, delegates the OAuth refresh to Claude Code's own flow, and no longer amplifies a transient token-refresh rate limit. A throttled slot is reported and skipped rather than retried.
 
 ## [2.3.0] - 2026-05-29

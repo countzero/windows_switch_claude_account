@@ -579,7 +579,7 @@ Describe 'switch_claude_account' {
         # this happened automatically through the hardlink; now
         # Update-SlotTokens explicitly atomic-writes both endpoints when
         # the slot is the tracked active. Regression guard for the
-        # correctness fix described in CLAUDE.md.
+        # correctness fix described in AGENTS.md.
         It 'refresh on active slot propagates new tokens to .credentials.json' {
             $slotPath = New-Slot -Name 'activeStale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
 

@@ -79,7 +79,7 @@ Param (
     # -Watch (-Watch is the set's mandatory anchor; see above).
     # [ValidateRange] rejects zero / negatives at bind time. The
     # 60-second floor is enforced as a runtime clamp-with-advisory inside
-    # Invoke-UsageWatch (deliberate; see CLAUDE.md "Watch mode").
+    # Invoke-UsageWatch (deliberate; see AGENTS.md "Watch mode").
     [Parameter(ParameterSetName = 'Watch')]
     [ValidateRange(1, [int]::MaxValue)]
     [int] $Interval = 60,
@@ -518,7 +518,7 @@ function Update-ScaState {
 # `~/.claude.json` config file. The /status screen's "Email:" line reads
 # `oauthAccount.emailAddress` from this cache; the cache is populated once at
 # login (from /api/oauth/profile) and is NOT refreshed on subsequent token
-# refreshes (see binary RE in CLAUDE.md). This file is therefore the single
+# refreshes (see binary RE in AGENTS.md). This file is therefore the single
 # authoritative source of "what email is Claude Code displaying right now."
 #
 # sca uses ~/.claude.json two ways:
@@ -533,7 +533,7 @@ function Update-ScaState {
 # in an in-memory cache (Un.config) that is not auto-invalidated on external
 # changes, and a flush from a running Claude Code instance would silently
 # overwrite our oauthAccount mutation. Refuse-while-running is the chosen
-# mitigation; see decision (2) in CLAUDE.md's planning history.
+# mitigation; see decision (2) in AGENTS.md's planning history.
 
 # Returns $true if any process named 'claude' is running on the host.
 # Get-Process enumerates processes from ALL users on the system (limited
@@ -642,7 +642,7 @@ function Get-SHA256Hex {
 # would wipe Claude Code's cached identity when the sidecar carries the
 # /api/oauth/profile-fallback's null defaults) is blocked.
 #
-# Pre-flight test (CLAUDE.md history) verified this approach: editing
+# Pre-flight test (AGENTS.md history) verified this approach: editing
 # emailAddress and restarting Claude Code makes /status report the new
 # value, and the rest of the file round-trips byte-equal.
 #
@@ -1528,7 +1528,7 @@ function Invoke-SaveAction {
     # while Claude Code runs would silently capture stale identity into
     # the sidecar AND risk overwriting our writes if a flush races our
     # write. Refuse-while-running is the chosen mitigation; see
-    # CLAUDE.md's planning history for the binary-RE rationale.
+    # AGENTS.md's planning history for the binary-RE rationale.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca save' so identity capture is consistent."
     }
@@ -1762,7 +1762,7 @@ function Invoke-SwitchAction {
     # oauthAccount block from the destination slot's sidecar, and a
     # running Claude Code instance keeps that file in an in-memory
     # cache that may flush and clobber our update. Refusing is the
-    # simplest reliability guarantee; see CLAUDE.md's planning history.
+    # simplest reliability guarantee; see AGENTS.md's planning history.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca switch' so the email-display change applies cleanly."
     }
@@ -2138,7 +2138,7 @@ function Update-SlotTokens {
             # path, not the "active slot was filtered out" path.
             #
             # Deliberate: do NOT auto-propagate. Sidecar absence is the
-            # visibility-gate signal documented in CLAUDE.md ("Slots
+            # visibility-gate signal documented in AGENTS.md ("Slots
             # without a valid sidecar are HIDDEN from list / usage /
             # rotation"); silently writing to .credentials.json for a
             # hidden slot would violate the contract enforced by

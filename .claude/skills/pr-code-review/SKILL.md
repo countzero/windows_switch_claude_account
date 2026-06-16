@@ -63,7 +63,7 @@ overall design of the change:
    - `README.md`: usage documentation.
    Flag changes that mix concerns inappropriately (e.g., credential logic
    embedded in profile management, or profile logic in credential actions),
-   or that violate the reconcile rule documented in `CLAUDE.md` (which
+   or that violate the reconcile rule documented in `AGENTS.md` (which
    actions must call `Invoke-Reconcile` first).
 3. **Complexity:** Is any part of the change more complex than necessary?
    Flag over-engineering, unnecessary abstractions, or functionality that
