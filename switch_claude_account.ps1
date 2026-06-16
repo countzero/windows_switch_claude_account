@@ -44,7 +44,7 @@ characters are automatically sanitized to underscores.
 [CmdletBinding(DefaultParameterSetName = 'Default')]
 Param (
     [Parameter(Position = 0)]
-    [ValidateSet('save', 'switch', 'list', 'remove', 'usage', 'install', 'uninstall', 'help')]
+    [ValidateSet('save', 'switch', 'list', 'remove', 'usage', 'warmup', 'install', 'uninstall', 'help')]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -107,20 +107,24 @@ Param (
     [ValidateRange(1, 100)]
     [int] $Threshold = 95,
 
-    # -Warmup: in `sca usage -Watch`, prime every saved slot before the
+    # -Warmup: in `sca usage -Watch`, activate every saved slot before the
     # first poll. For each slot in alphabetical order, Invoke-WarmAllSlots
-    # makes the slot active (Invoke-SlotSwap) then sends a minimal
-    # billable /v1/messages request (Invoke-SlotPrime) so Anthropic opens
-    # a server-side 5h session window for the slot. Subsequent
+    # makes the slot active (Invoke-SlotSwap) then runs the real Claude Code
+    # CLI (`claude -p`, via Invoke-SlotActivator) so Anthropic opens a
+    # server-side 5h session window for the slot. Subsequent
     # /api/oauth/usage polls then return real bucket data instead of
-    # empty/rate-limited responses. Cost: ~2 tokens per slot per warmup
-    # on the pinned Haiku model (fractions of a cent). Bound to the
-    # 'Watch' parameter set so the binder rejects -Warmup without
-    # -Watch. Independent of -Auto: works with bare -Watch and with
-    # -Watch -Auto. The pre-loop Test-ClaudeRunning guard refuses to
-    # operate when Claude Code is running because the per-slot swap
-    # writes ~/.claude.json's oauthAccount, which Claude Code keeps in
-    # an in-memory cache.
+    # empty/rate-limited responses. Cost: ~$0.004 per slot per warmup on
+    # the pinned Haiku model (a real one-turn "Hi" message; Claude Code
+    # always sends its base system prompt, so it is ~3k input tokens, not
+    # a bare request). Bound to the 'Watch' parameter set so the binder
+    # rejects -Warmup without -Watch. Independent of -Auto: works with
+    # bare -Watch and with -Watch -Auto. The pre-loop Test-ClaudeRunning
+    # guard refuses to operate when Claude Code is ALREADY running because
+    # the per-slot swap writes ~/.claude.json's oauthAccount, which a live
+    # Claude Code keeps in an in-memory cache (the short-lived `claude -p`
+    # the warmup itself spawns is awaited to exit before the next swap,
+    # so it never races a file write). See also the standalone `warmup`
+    # action for a one-shot warm pass without the live watch view.
     [Parameter(ParameterSetName = 'Watch')]
     [switch] $Warmup,
 
@@ -214,7 +218,6 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 # flow and does not accept our refresh tokens.
 $Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
 $Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
-$Script:MessagesEndpoint    = "https://api.anthropic.com/v1/messages"
 $Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
 $Script:OAuthClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 $Script:AnthropicBeta       = "oauth-2025-04-20"
@@ -228,20 +231,6 @@ $Script:AnthropicApiVersion = "2023-06-01"
 $Script:UsageUserAgent      = "claude-code/2.1.119"
 $Script:UsageTimeoutSec     = 5
 $Script:ProfileTimeoutSec   = 10
-# Priming model + timeout for Invoke-SlotPrime. /v1/messages accepts the
-# claudeAiOauth bearer when paired with the same anthropic-beta header
-# the OAuth-namespaced endpoints use; the OAuth client flow is allowed
-# to call the standard messages API. Pin Haiku as the cheapest current
-# model so each prime costs ~2 tokens (1 in, 1 out). Drifts when
-# Anthropic deprecates the pinned model id; same maintenance recipe as
-# the constants above. /v1/messages can be slower than /api/oauth/usage
-# (model load on cold path), so the timeout is more generous than
-# $UsageTimeoutSec. Model identifier MUST be JSON-safe (no quotes /
-# backslashes): Invoke-SlotPrime inlines it into a format-string body
-# without escaping. All Anthropic model identifiers to date are
-# `[a-z0-9-]+` so this is a non-issue in practice.
-$Script:PrimeModel          = "claude-haiku-4-5"
-$Script:PrimeTimeoutSec     = 15
 
 # Retry policy for /v1/oauth/token on a 429 response. Empirically the
 # refresh endpoint's per-token rate limiter has a short cooldown
@@ -885,6 +874,7 @@ function Show-Help {
         "  list             List saved slots (active slot marked with *)",
         "  remove <name>    Delete a named slot",
         "  usage [name]     Show Session / Week plan usage per slot (network; unofficial Anthropic API)",
+        "  warmup [name]    Open each slot's 5h session window by running 'claude -p' as that slot (billable)",
         "  install          Add 'sca' + 'switch-claude-account' aliases to your PS profile",
         "  uninstall        Remove the aliases from your PS profile",
         "  help, -h         Show this help",
@@ -902,7 +892,9 @@ function Show-Help {
         "  $cmd usage                             # show Session + Week usage for every slot",
         "  $cmd usage -Watch                      # live refresh; 60s polls; Ctrl-C to quit",
         "  $cmd usage -Watch -Interval 300        # slower refresh (floor is 60s)",
-        "  $cmd usage -Watch -Warmup              # prime all slots (billable; ~2 tokens/slot on Haiku)",
+        "  $cmd warmup                            # open every slot's 5h window via 'claude -p' (billable; ~`$0.004/slot)",
+        "  $cmd warmup slot-2                     # warm just one slot",
+        "  $cmd usage -Watch -Warmup              # warm all slots, then keep watching (billable)",
         "  $cmd usage -Watch -Auto                # auto-rotate when active slot hits 95% (OpenCode only)",
         "  $cmd usage -Watch -Auto -Threshold 90  # rotate earlier (default is 95%)",
         "  $cmd usage -Watch -Auto -Warmup        # auto-rotate and prime all available slots",
@@ -2205,11 +2197,12 @@ function Get-CachedUsageOrNull {
 
 # Read a slot's OAuth tokens and return a non-expired access token,
 # refreshing via /v1/oauth/token first if the cached token is past or
-# within 60s of its expiry. Shared prelude for Get-SlotUsage,
-# Get-SlotProfile, and Invoke-SlotPrime; collapses three near-identical
-# 30-line blocks that previously each did Get-SlotOAuth + HasOAuth gate
-# + 60s expiry threshold + Update-SlotTokens with 429-as-rate-limited /
-# non-429-as-expired catches.
+# within 60s of its expiry. Shared prelude for Get-SlotUsage and
+# Get-SlotProfile; collapses two near-identical 30-line blocks that
+# previously each did Get-SlotOAuth + HasOAuth gate + 60s expiry
+# threshold + Update-SlotTokens with 429-as-rate-limited /
+# non-429-as-expired catches. (Warmup activation no longer uses this:
+# `claude -p` does its own token refresh.)
 #
 # Returns one of:
 #   @{ Status = 'ok'; AccessToken = <string> }     # caller proceeds with HTTP
@@ -2288,7 +2281,7 @@ function Get-SlotUsage {
     # (Write-Progress / stream 4) so it does not paint over the watch
     # loop's alt-screen buffer between frames. See Update-SlotTokens
     # for the full rationale; same suppression is applied identically
-    # in Get-SlotProfile / Invoke-SlotPrime.
+    # in Get-SlotProfile.
     $ProgressPreference = 'SilentlyContinue'
 
     # Resolve a non-expired access token (refresh if needed). Rate-
@@ -2480,9 +2473,8 @@ function Get-SlotProfile {
 }
 
 # Parse a 429 response's Retry-After into seconds (double) or $null.
-# Invoke-SlotPrime attaches the result to its 'rate-limited' return so the
-# warmup retry in Invoke-WarmAllSlots can honor the server-directed wait
-# instead of guessing a backoff. Reads the strongly-typed
+# Generic, defensive helper retained for honoring a server-directed wait
+# on a 429 (e.g. a future Get-SlotUsage backoff). Reads the strongly-typed
 # HttpResponseMessage.Headers.RetryAfter first (.Delta for the delta-seconds
 # form, .Date for the HTTP-date form), then falls back to a raw 'Retry-After'
 # header parse. Fully defensive: a missing header, a malformed value, or a
@@ -2531,81 +2523,129 @@ function Get-RetryAfterSeconds {
     }
 }
 
-# Send a minimal billable request to /v1/messages so Anthropic opens a
-# server-side 5h session window for this slot. Subsequent /api/oauth/usage
-# calls against the slot then return real bucket data instead of an empty
-# response (or 429, depending on the account's state). Cost: ~2 tokens
-# per call on the pinned Haiku model (1 input "." + max_tokens=1 output).
-# Used exclusively by Invoke-WarmAllSlots when `sca usage -Watch -Warmup`
-# is set.
+# Run the Claude Code CLI (`claude`) as a child process and return its raw
+# result so Invoke-SlotActivator can classify it. Extracted as the single
+# mockable seam for the activator: tests stub THIS to feed synthetic exit
+# codes / stdout / stderr without spawning a real `claude`, while the
+# parsing/classification logic in Invoke-SlotActivator is exercised
+# directly. Never throws; a missing binary, a timeout, or a non-zero exit
+# are all reported through the returned object.
+#
+# Returns: @{ TimedOut = <bool>; ExitCode = <int|null>; Stdout = <string>;
+#             Stderr = <string> }. A null ExitCode means the binary was not
+# found (Stderr = 'claude-not-found') or the call timed out (TimedOut).
+function Invoke-ClaudeActivatorProcess {
+    Param (
+        [string[]] $ClaudeArgs,
+        [int]      $TimeoutSec = 90
+    )
+
+    $claude = Get-Command claude -CommandType Application -ErrorAction SilentlyContinue
+    if (-not $claude) {
+        return [pscustomobject]@{ TimedOut = $false; ExitCode = $null; Stdout = ''; Stderr = 'claude-not-found' }
+    }
+
+    # Redirect stdout/stderr to temp files so claude's output never paints
+    # over the watch alt-buffer, and so the JSON envelope (stdout) stays
+    # uncorrupted by any stderr noise. -NoNewWindow keeps it inline with
+    # the current console; WaitForExit(ms) bounds a hung model load.
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $claude.Source -ArgumentList $ClaudeArgs -NoNewWindow -PassThru `
+                           -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill($true) } catch { Write-Verbose "Activator kill after timeout failed: $_" }
+            return [pscustomobject]@{ TimedOut = $true; ExitCode = $null; Stdout = ''; Stderr = '' }
+        }
+        $stdout = [System.IO.File]::ReadAllText($outFile)
+        $stderr = [System.IO.File]::ReadAllText($errFile)
+        return [pscustomobject]@{ TimedOut = $false; ExitCode = $p.ExitCode; Stdout = $stdout; Stderr = $stderr }
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Activate a slot by running the real Claude Code CLI as that slot, exactly
+# as a user typing one message would: `claude -p "Hi"` opens Anthropic's
+# server-side 5h session window so subsequent /api/oauth/usage calls return
+# real bucket data. The slot must already be active (Invoke-SlotSwap wrote
+# its tokens into .credentials.json); claude reads those, refreshes them
+# through its own canonical OAuth flow if needed, and makes the billable
+# request. Used by Invoke-WarmAllSlots.
 #
 # Returns the same status vocabulary as Get-SlotUsage so the warmup
 # orchestrator can copy the result onto the row without translation:
-#   @{ Status = 'ok' }                                # 2xx; window opened
-#   @{ Status = 'no-oauth' }                          # slot has no claudeAiOauth
-#   @{ Status = 'expired'; Error = <msg> }            # token expired AND refresh failed (non-429)
-#   @{ Status = 'rate-limited'; RetryAfterSec = <n|null> } # 429 from refresh OR messages endpoint
-#   @{ Status = 'unauthorized' }                      # 401/403 from messages endpoint
-#   @{ Status = 'error'; Error = <msg> }              # network / shape / other
+#   @{ Status = 'ok' }                     # claude returned a successful result
+#   @{ Status = 'no-oauth' }               # slot has no claudeAiOauth (skip claude)
+#   @{ Status = 'rate-limited' }           # claude reported a rate limit (429)
+#   @{ Status = 'unauthorized' }           # claude reported an auth/permission failure
+#   @{ Status = 'expired'; Error = <msg> } # claude reported the login expired / needs re-auth
+#   @{ Status = 'error'; Error = <msg> }   # binary missing, timeout, or other failure
 #
-# Unlike Get-SlotUsage there is no Data payload (the prime is for the
-# side effect, not the response body) and no per-slot cache (the response
-# carries nothing worth replaying). 429 handling mirrors Get-SlotUsage's
-# token-endpoint catch but without the cache fallback path: a clean
-# 'rate-limited' status is the only signal available.
-function Invoke-SlotPrime {
+# Failure classification is best-effort: claude's success envelope is well
+# defined ({type:'result', is_error:false}), but its failure surface (exit
+# code + stderr vs a JSON error) is not contractually stable, so the
+# non-ok arms scan the message text. Never throws.
+function Invoke-SlotActivator {
     Param (
         [String] $SlotPath
     )
 
-    # See Get-SlotUsage for the $ProgressPreference rationale; same
-    # suppression here for the /v1/messages POST below.
-    $ProgressPreference = 'SilentlyContinue'
-
-    # Resolve a non-expired access token; non-ok statuses (including
-    # 429-as-rate-limited from the token endpoint) return verbatim. No
-    # cache to fall back on (priming is fire-and-forget).
-    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
-    if ($tok.Status -ne 'ok') { return $tok }
-    $accessToken = $tok.AccessToken
-
-    $headers = @{
-        'Authorization'     = "Bearer $accessToken"
-        'anthropic-beta'    = $Script:AnthropicBeta
-        'anthropic-version' = $Script:AnthropicApiVersion
-        'Content-Type'      = 'application/json'
-        'User-Agent'        = $Script:UsageUserAgent
+    # Cheap pre-check: a slot with no OAuth material (e.g. an API-key-only
+    # file) can never open a subscription session window, so skip the
+    # billable claude call entirely and surface 'no-oauth' like the old
+    # prime did. claude reads .credentials.json (the swapped-in active
+    # slot), which equals this slot's bytes by construction.
+    $oauth = Get-SlotOAuth -SlotPath $SlotPath
+    if (-not $oauth.HasOAuth) {
+        return [pscustomobject]@{ Status = 'no-oauth' }
     }
 
-    # Minimal billable payload. `max_tokens=1` caps output; content is a
-    # single "." so the input is one token. Aggregate cost: ~2 tokens
-    # per slot per warmup on the pinned Haiku model (fractions of a cent).
-    $body = '{{"model":"{0}","max_tokens":1,"messages":[{{"role":"user","content":"."}}]}}' -f $Script:PrimeModel
+    $claudeArgs = @(
+        '-p', $Script:ActivatorPrompt,
+        '--safe-mode',
+        '--model', $Script:ActivatorModel,
+        '--output-format', 'json',
+        '--no-session-persistence'
+    )
 
-    try {
-        Invoke-RestMethod -Method Post `
-                          -Uri $Script:MessagesEndpoint `
-                          -Headers $headers `
-                          -Body $body `
-                          -TimeoutSec $Script:PrimeTimeoutSec `
-                          -ErrorAction Stop | Out-Null
+    $proc = Invoke-ClaudeActivatorProcess -ClaudeArgs $claudeArgs -TimeoutSec $Script:ActivatorTimeoutSec
+
+    if ($proc.Stderr -eq 'claude-not-found') {
+        return [pscustomobject]@{ Status = 'error'; Error = "claude CLI not found on PATH; warmup activation requires Claude Code installed." }
+    }
+    if ($proc.TimedOut) {
+        return [pscustomobject]@{ Status = 'error'; Error = "claude -p timed out after $($Script:ActivatorTimeoutSec)s." }
+    }
+
+    $parsed = $null
+    if ($proc.Stdout) {
+        try { $parsed = $proc.Stdout | ConvertFrom-Json -ErrorAction Stop } catch { $parsed = $null }
+    }
+
+    if ($proc.ExitCode -eq 0 -and $parsed -and $parsed.type -eq 'result' -and -not $parsed.is_error) {
         return [pscustomobject]@{ Status = 'ok' }
     }
-    catch {
-        $status = $null
-        $resp   = $_.Exception.Response
-        if ($resp -and $resp.StatusCode) {
-            $status = [int]$resp.StatusCode
-        }
-        if ($status -eq 401 -or $status -eq 403) {
-            return [pscustomobject]@{ Status = 'unauthorized' }
-        }
-        if ($status -eq 429) {
-            # Surface the server-directed wait (Retry-After) so the warmup
-            # retry in Invoke-WarmAllSlots can honor it instead of guessing.
-            return [pscustomobject]@{ Status = 'rate-limited'; RetryAfterSec = (Get-RetryAfterSeconds $_.Exception) }
-        }
-        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
+
+    # Non-ok: build a probe string from the richest message available, then
+    # classify. Prefer claude's JSON error text, fall back to stderr.
+    $msg = $null
+    if ($parsed) {
+        if    ($parsed.result)  { $msg = [string]$parsed.result }
+        elseif ($parsed.error)  { $msg = [string]$parsed.error }
+        elseif ($parsed.subtype){ $msg = [string]$parsed.subtype }
+    }
+    if (-not $msg) { $msg = [string]$proc.Stderr }
+    if (-not $msg) { $msg = "claude -p exited with code $($proc.ExitCode)" }
+
+    $probe = "$msg $($proc.Stderr)"
+    switch -Regex ($probe) {
+        '(?i)rate.?limit|\b429\b'                              { return [pscustomobject]@{ Status = 'rate-limited' } }
+        '(?i)\b401\b|\b403\b|unauthor|forbidden|permission'    { return [pscustomobject]@{ Status = 'unauthorized' } }
+        '(?i)expired|invalid.?grant|re-?auth|\blog ?in\b|\blogin\b' { return [pscustomobject]@{ Status = 'expired'; Error = (Format-StatusErrorTail $msg) } }
+        default                                                { return [pscustomobject]@{ Status = 'error'; Error = (Format-StatusErrorTail $msg) } }
     }
 }
 
@@ -2847,11 +2887,11 @@ function Get-StatusColor {
         # steady state.
         '^warming up'    { return 'Yellow' }
         # 'priming' is the per-slot in-flight state during the warmup
-        # pass: Invoke-SlotPrime's /v1/messages POST is running for
+        # pass: Invoke-SlotActivator's `claude -p` call is running for
         # this row right now. Once the call completes, the row
-        # transitions directly to a real HTTP status ('ok' /
-        # 'rate-limited' / 'no-oauth' / 'expired' / 'unauthorized' /
-        # 'error'), which are already mapped above.
+        # transitions directly to a real status ('ok' / 'rate-limited' /
+        # 'no-oauth' / 'expired' / 'unauthorized' / 'error'), which are
+        # already mapped above.
         '^priming$'      { return 'Yellow' }
         default          { return 'Gray' }
     }
@@ -3115,15 +3155,15 @@ function Format-UsageTable {
             }
             'rate-limited' { 'rate-limited' }
             # 'warming-up' is the transient initial label rendered when
-            # Invoke-WarmAllSlots starts iterating slots on `-Watch
-            # -Warmup` startup. Synthetic snapshot rows carry it; the
-            # warmup pass mutates each row's Status to 'priming'
-            # while its /v1/messages call is in flight, then to the
-            # real HTTP outcome ('ok' / 'rate-limited' / 'no-oauth' /
-            # 'expired' / 'unauthorized' / 'error') once the call
-            # returns. The hyphenated internal value renders space-
-            # separated to match the existing label convention
-            # ('rate limited' / 'limited 5h' / 'near limit').
+            # Invoke-WarmAllSlots starts iterating slots on `sca warmup`
+            # or `-Watch -Warmup` startup. Synthetic snapshot rows carry
+            # it; the warmup pass mutates each row's Status to 'priming'
+            # while its `claude -p` activation is in flight, then to the
+            # real outcome ('ok' / 'rate-limited' / 'no-oauth' /
+            # 'expired' / 'unauthorized' / 'error') once it returns. The
+            # hyphenated internal value renders space-separated to match
+            # the existing label convention ('rate limited' / 'limited
+            # 5h' / 'near limit').
             'warming-up'    { 'warming up' }
             'priming'       { 'priming' }
             default         { [string]$r.Status }
@@ -3775,9 +3815,9 @@ function Invoke-UsageAction {
         # reporting lags real consumption; range enforced by
         # [ValidateRange(1,100)] on the top-level Param block.
         [int]    $Threshold = 95,
-        # -Warmup: prime every saved slot via a billable /v1/messages
-        # request before the first poll. Requires -Watch. Independent
-        # of -Auto.
+        # -Warmup: activate every saved slot via the real Claude Code CLI
+        # (`claude -p`, through Invoke-WarmAllSlots) before the first poll.
+        # Requires -Watch. Independent of -Auto.
         [switch] $Warmup
     )
 
@@ -3859,6 +3899,48 @@ function Invoke-UsageAction {
         return
     }
 
+    Format-UsageFrame -Name $Name -Snapshot $snapshot
+}
+
+# `sca warmup [name]`: one-shot, non-watch warm pass. Activates every saved
+# slot (or just <name>) via the real Claude Code CLI (`claude -p`), so each
+# slot's server-side 5h session window opens, then prints the usual usage
+# table with live percentages and exits. This is the automation of the
+# manual "switch to a slot, send one message" routine across all slots.
+#
+# Refuses up front if Claude Code is already running (the per-slot swap
+# writes ~/.claude.json's oauthAccount, which a live Claude Code caches)
+# and if the `claude` binary is not on PATH (the activation IS `claude`).
+# The original active slot is restored by Invoke-WarmAllSlots' finally
+# block. Billable: ~$0.004 per slot on the pinned Haiku model.
+function Invoke-WarmupAction {
+    Param ([String] $Name)
+
+    if (Test-ClaudeRunning) {
+        throw "Claude Code is running. Close it before 'sca warmup' so each per-slot credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
+    }
+    if (-not (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue)) {
+        throw "The 'claude' CLI was not found on PATH. 'sca warmup' activates each slot by running 'claude -p', so Claude Code must be installed."
+    }
+
+    # Reconcile first so a cross-account swap landed since the last sca call
+    # is captured before any slot bytes are read (matches list / usage).
+    Invoke-Reconcile | Out-Null
+
+    Write-Color "[Warmup] Activating saved slots via 'claude -p' (billable; ~`$0.004/slot on Haiku, a few seconds each)..." 'DarkYellow'
+
+    # No-op repaint: the one-shot path has no live frame to redraw, so the
+    # per-slot state transitions are not rendered; only the final snapshot
+    # is printed below as the usual usage table.
+    $snapshot = Invoke-WarmAllSlots -Name $Name -Repaint { Param ($snap) }
+
+    if ($null -eq $snapshot) {
+        $scope = if ($Name) { "matching '$(Get-SafeName $Name)'" } else { 'saved' }
+        Write-Color "[Warmup] No slots $scope to activate. Use: sca save <name>" 'Yellow'
+        return
+    }
+
+    Write-Host ''
     Format-UsageFrame -Name $Name -Snapshot $snapshot
 }
 
@@ -4170,70 +4252,71 @@ function Invoke-AutoRotationStep {
 $Script:UsageWatchMinInterval = 60
 
 # Inter-slot spacing during the warmup loop. After each slot is
-# primed, sleep this many milliseconds before moving to the next.
-# Cheap insurance against per-IP burst rate-limits on /v1/messages:
-# 300 ms between calls keeps two-slot pools well under typical burst
-# thresholds while adding only ~300 ms * (N-1) of startup latency.
-# Tunable for tests (Pester overrides to zero).
-#
-# Minimum on-screen visibility for the per-slot transient 'priming'
-# row state during warmup. The 'priming' label is painted into the
-# frame, then Invoke-SlotPrime runs (HTTP POST to /v1/messages), then
-# the terminal-status label replaces it. Without this floor, a fast-
-# LAN prime can return in <100 ms, flashing the 'priming' cell
-# unreadably. 150 ms is the perceptual lower bound for a label the
-# user is meant to read; below that the eye sees a flicker rather
-# than a state. Sleep is placed BEFORE Invoke-SlotPrime (not after)
-# so the floor adds at most one 150 ms * N latency penalty regardless
-# of HTTP timing, and stacks linearly with $WarmupSpacingMs rather
-# than racing it. Tunable for tests (Pester overrides to zero).
+# activated, sleep this many milliseconds before moving to the next.
+# Cheap insurance against per-IP burst rate-limits: a small gap between
+# `claude -p` spawns keeps a pool well under typical burst thresholds
+# while adding only ~300 ms * (N-1) of startup latency. Tunable for
+# tests (Common.ps1 overrides to zero).
 $Script:WarmupSpacingMs    = 300
-$Script:WarmupPrimingMinMs = 150
 
-# Warmup prime-retry policy. A warmup prime that returns HTTP 429 gets ONE
-# retry inside Invoke-WarmAllSlots so a transient throttle still opens the
-# slot's 5h window instead of leaving the row 'rate-limited' for the whole
-# watch session (priming is the only thing that opens the window; the
-# steady-state poll only reads usage). The wait honors the 429's Retry-After
-# header when present (Get-RetryAfterSeconds), capped at WarmupPrimeRetryCapSec
-# so an interactive warmup never blocks too long on one slot: a Retry-After
-# above the cap is read as "not worth waiting" and the retry is skipped. When
-# no Retry-After is present (e.g. a token-endpoint 429, which carries none),
-# fall back to WarmupPrimeRetryDefaultMs (aligned with Get-SlotUsage's blind
-# 5s 429 backoff). Tunable for tests (Common.ps1 zeroes the default backoff).
-$Script:WarmupPrimeRetryCapSec    = 10
-$Script:WarmupPrimeRetryDefaultMs = 5000
+# Slot activator (`claude -p`) settings. Warmup opens a slot's 5h session
+# window by running the real Claude Code CLI as that slot, exactly as a
+# user typing one message would (Invoke-SlotActivator). This delegates the
+# OAuth token refresh to Claude Code's own canonical flow instead of
+# re-implementing it, and removes any doubt about whether a minimal request
+# "counts" as opening the window (a real one-turn message always does).
+#   --safe-mode      keeps OAuth auth but disables CLAUDE.md / MCP / hooks /
+#                    plugins / skills, so the activation cannot trigger this
+#                    repo's own Claude config and stays cheap (no project
+#                    context loaded). (NOT --bare: that never reads OAuth.)
+#   --model haiku    cheapest current model; ~$0.004 per activation.
+#   --output-format json  structured {type,subtype,is_error,result,...} so
+#                    Invoke-SlotActivator can classify success vs failure.
+#   --no-session-persistence  no session files written to disk.
+# Model alias drifts when Anthropic deprecates Haiku; bump it then.
+$Script:ActivatorModel      = "haiku"
+$Script:ActivatorPrompt     = "Hi"
+$Script:ActivatorTimeoutSec = 90
 
-# Warmup-as-swap-then-prime orchestrator for `sca usage -Watch -Warmup`.
-# Round-robins through every saved slot in alphabetical order: per slot,
-# Invoke-SlotSwap makes it active (writes .credentials.json AND
-# ~/.claude.json's oauthAccount AND state.active_slot) and Invoke-SlotPrime
-# sends a minimal billable /v1/messages request so Anthropic opens a
-# server-side 5h session window for the slot. Either throwing collapses
-# into Status='error' on the row; the loop continues with remaining slots.
+# Warmup-as-swap-then-activate orchestrator for `sca warmup` and
+# `sca usage -Watch -Warmup`. Round-robins through every saved slot in
+# alphabetical order: per slot, Invoke-SlotSwap makes it active (writes
+# .credentials.json AND ~/.claude.json's oauthAccount AND state.active_slot)
+# and Invoke-SlotActivator runs the real Claude Code CLI (`claude -p`) as
+# that slot so Anthropic opens a server-side 5h session window. Either
+# throwing collapses into Status='error' on the row; the loop continues
+# with the remaining slots.
 #
-# Why billable priming instead of an /api/oauth/usage probe: a non-active
-# slot's /api/oauth/usage returns empty bucket data (or 429) until a
-# server-side 5h session window has been opened, which only a billable
-# request can do. v2.5.0's swap-then-probe rationale was wrong; this
-# entry retracts that claim. Cost: ~2 tokens per slot per warmup on the
-# pinned Haiku model (fractions of a cent).
+# Why a real `claude -p` instead of an /api/oauth/usage probe: a slot's
+# /api/oauth/usage returns empty bucket data (or 429) until a server-side
+# 5h session window has been opened, which only a billable message can do.
+# Running claude (rather than re-implementing the request) delegates the
+# OAuth refresh to Claude Code's own flow and is exactly what a user does
+# by hand. Cost: ~$0.004 per slot per warmup on the pinned Haiku model.
 #
-# Verify-after-prime: a successful prime opens the session but returns no
-# bucket data, so the row would otherwise read 'ok (no plan data)' (empty
-# em-dash cells) until the first poll ~60 s later. After an ok prime we
-# immediately call Get-SlotUsage for the slot so the warmup frame shows
-# live percentages right away, matching what plain `sca usage` displays.
-# A failed prime (rate-limited / unauthorized / expired / no-oauth /
-# error) skips the usage read and surfaces the prime's own outcome. Cost:
-# one extra /api/oauth/usage GET per successfully primed slot.
+# Mirror-then-verify (only after an 'ok' activation):
+#   1. Invoke-Reconcile copies the (possibly refreshed) tokens claude just
+#      wrote into .credentials.json back into the slot file. This MUST run
+#      before the usage read: otherwise Get-SlotUsage reads the slot's
+#      stale pre-activation token and triggers sca's own refresh against
+#      the (sometimes throttled) token endpoint -- the exact amplification
+#      this design removes. The reconcile takes the same-identity mirror
+#      branch (the swap wrote this slot's email to ~/.claude.json), so it
+#      never auto-saves.
+#   2. Get-SlotUsage reads /api/oauth/usage with the fresh token so the
+#      warmup frame shows live percentages immediately instead of
+#      'ok (no plan data)' until the first poll ~60 s later.
+# A failed activation (rate-limited / unauthorized / expired / no-oauth /
+# error) skips both the mirror and the usage read -- no token to refresh,
+# nothing to verify -- and surfaces the activator's own outcome, so a
+# throttled slot incurs zero sca refresh calls.
 #
 # Builds the rendered snapshot in place: one row per slot (filtered by
 # -Name when set), each starting at Status='warming-up' with Data=$null,
-# transitioning through 'priming' to its real outcome (the prime's usage
-# read, or the prime's failure status). The end state is the first frame
-# of the polling loop; the caller wires it to $snapshot and sets
-# $lastPoll = now. Returns $null when no slots match.
+# transitioning through 'priming' (the claude -p call in flight) to its
+# real outcome. The end state is the first frame of the polling loop; the
+# caller wires it to $snapshot and sets $lastPoll = now. Returns $null
+# when no slots match.
 #
 # The original active slot is captured before the loop via Read-ScaState
 # + Find-SlotByName. A finally block restores it via one more Invoke-Slot-
@@ -4241,12 +4324,11 @@ $Script:WarmupPrimeRetryDefaultMs = 5000
 # user where they started. Restore failure logs a yellow advisory naming
 # the slot the user is now active on. No active slot captured (fresh
 # install, sidecar-hidden active) is fine: the finally guard skips the
-# restore and the user ends on the last primed slot.
+# restore and the user ends on the last activated slot.
 #
-# $Repaint is invoked as: & $Repaint $snapshot.
-# Per-slot latency is bounded at $WarmupPrimingMinMs (floors the
-# 'priming' label's on-screen visibility against fast-LAN returns)
-# + swap + HTTP + $WarmupSpacingMs (per-IP burst guard between slots).
+# $Repaint is invoked as: & $Repaint $snapshot. The `claude -p` spawn
+# (seconds) naturally floors the 'priming' label's on-screen visibility,
+# so no artificial min-visibility sleep is needed.
 function Invoke-WarmAllSlots {
     Param (
         [string]                             $Name,
@@ -4302,56 +4384,34 @@ function Invoke-WarmAllSlots {
             $row.Status = 'priming'
             & $Repaint $snapshot
 
-            # Conditional sleep so a test-side zero override is a no-op
-            # rather than a degenerate Start-Sleep 0.
-            if ($Script:WarmupPrimingMinMs -gt 0) {
-                Start-Sleep -Milliseconds $Script:WarmupPrimingMinMs
-            }
-
             # 6>$null suppresses [Switch] / [Sync] advisories so they
             # don't paint outside the DEC 2026 sync envelope. The try/
             # catch catches Invoke-SlotSwap throws AND defends against
-            # any Invoke-SlotPrime contract violation (the prime's
-            # documented surface is non-throwing, but defense-in-depth
-            # against unexpected exceptions keeps the loop alive for
-            # the remaining slots). Normal prime failure modes route
-            # through $r.Status (rate-limited / expired / unauthorized
-            # / error) without throwing; this catch only fires on
-            # actual exceptions.
+            # any Invoke-SlotActivator contract violation (its documented
+            # surface is non-throwing, but defense-in-depth against
+            # unexpected exceptions keeps the loop alive for the remaining
+            # slots). Normal activation failure modes route through
+            # $r.Status (rate-limited / expired / unauthorized / no-oauth /
+            # error) without throwing; this catch only fires on actual
+            # exceptions.
             try {
                 Invoke-SlotSwap -Slot $row 6>$null
                 # Swap succeeded (it throws on failure): this slot is now
                 # the live active slot. Record it for the restore advisory.
                 $lastSwapped = $row
-                $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
-                # Single retry on a transient 429 so the slot's 5h window
-                # still opens. Honor Retry-After when the prime surfaced it
-                # (capped: a wait longer than WarmupPrimeRetryCapSec is read
-                # as "not worth blocking an interactive warmup", so skip the
-                # retry); otherwise fall back to a default blind backoff.
-                if ($r.Status -eq 'rate-limited') {
-                    $retryAfter = $r.RetryAfterSec
-                    $sleepMs    = -1
-                    if ($null -ne $retryAfter) {
-                        if ($retryAfter -le $Script:WarmupPrimeRetryCapSec) {
-                            $sleepMs = [int]([math]::Ceiling($retryAfter * 1000))
-                        }
-                    }
-                    else {
-                        $sleepMs = $Script:WarmupPrimeRetryDefaultMs
-                    }
-                    if ($sleepMs -ge 0) {
-                        if ($sleepMs -gt 0) { Start-Sleep -Milliseconds $sleepMs }
-                        $r = Invoke-SlotPrime -SlotPath $row.Path 6>$null
-                    }
-                }
+                $r = Invoke-SlotActivator -SlotPath $row.Path 6>$null
                 if ($r.Status -eq 'ok') {
-                    # Prime opened the session but returns no bucket data.
-                    # Read /api/oauth/usage now (verify-after-prime) so the
-                    # warmup frame shows live percentages immediately,
-                    # instead of 'ok (no plan data)' until the first poll
-                    # ~60 s later. Get-SlotUsage never throws; it returns
-                    # the real outcome (ok / rate-limited / cached / etc.).
+                    # Mirror claude's (possibly refreshed) tokens from
+                    # .credentials.json back into the slot file BEFORE the
+                    # verify read, so Get-SlotUsage reads the fresh token
+                    # rather than the slot's stale pre-activation one (which
+                    # would trigger sca's own refresh against a possibly
+                    # throttled token endpoint). Same-identity mirror only;
+                    # never auto-saves (the swap wrote this slot's email to
+                    # ~/.claude.json). Then read usage so the warmup frame
+                    # shows live percentages immediately instead of
+                    # 'ok (no plan data)'. Neither call throws.
+                    Invoke-Reconcile 6>$null | Out-Null
                     $u = Get-SlotUsage -SlotPath $row.Path 6>$null
                     $row.Status           = $u.Status
                     $row.Data             = $u.Data
@@ -4359,9 +4419,10 @@ function Invoke-WarmAllSlots {
                     $row.IsCachedFallback = [bool]$u.IsCachedFallback
                 }
                 else {
-                    # Prime failed (rate-limited / unauthorized / expired /
-                    # no-oauth / error): surface its real outcome; a usage
-                    # read would not add signal here.
+                    # Activation failed (rate-limited / unauthorized /
+                    # expired / no-oauth / error): surface its real outcome;
+                    # a usage read would not add signal and a throttled slot
+                    # must not incur extra refresh calls.
                     $row.Status = $r.Status
                     $row.Error  = $r.Error
                 }
@@ -4444,8 +4505,8 @@ function Invoke-UsageWatch {
         # -Threshold: utilization percentage (1..100) at or above which
         # -Auto fires a rotation. Ignored when -Auto is absent.
         [int]    $Threshold = 95,
-        # -Warmup: prime every saved slot via a billable /v1/messages
-        # request through Invoke-WarmAllSlots before the first poll.
+        # -Warmup: activate every saved slot via the real Claude Code CLI
+        # (`claude -p`, through Invoke-WarmAllSlots) before the first poll.
         # Independent of -Auto: works with bare -Watch and with -Watch
         # -Auto. See the warmup block below the alt-screen entry for
         # the synthetic snapshot + Status-column mechanics.
@@ -4455,8 +4516,10 @@ function Invoke-UsageWatch {
     # Pre-loop Claude Code guard for -Auto and -Warmup. Both write
     # ~/.claude.json's oauthAccount block via Invoke-SlotSwap (-Auto
     # during the in-loop rotation step; -Warmup during the per-slot
-    # swap-then-prime round-robin). Claude Code keeps that block in an
-    # in-memory cache; racing its flush would clobber our update.
+    # swap-then-activate round-robin). Claude Code keeps that block in an
+    # in-memory cache; racing its flush would clobber our update. The
+    # short-lived `claude -p` the warmup spawns is awaited to exit before
+    # the next swap, so it never overlaps a file write.
     # Same guard / wording as Invoke-SwitchAction so the user sees a
     # consistent message regardless of entry point. -Auto additionally
     # re-checks Test-ClaudeRunning before every rotation attempt to
@@ -4510,7 +4573,7 @@ function Invoke-UsageWatch {
         $lastAutoFooter = if ($Auto) { '[Auto] Automatic slot switching is enabled.' } else { $null }
 
         # -Warmup startup pass. Invoke-WarmAllSlots does the per-slot
-        # swap-then-probe round-robin and returns a populated snapshot
+        # swap-then-activate round-robin and returns a populated snapshot
         # we hand off to the polling loop as its first frame ($lastPoll
         # = now so the loop's first iteration falls into the redraw
         # branch, not the poll branch). Reconcile first so a cross-
@@ -4749,6 +4812,7 @@ function Invoke-Main {
             "list"      { Invoke-ListAction }
             "remove"    { Invoke-RemoveAction -Name $Name }
             "usage"     { Invoke-UsageAction  -Name $Name -Json:$Json -Watch:$Watch -Interval $Interval -Auto:$Auto -Threshold $Threshold -Warmup:$Warmup }
+            "warmup"    { Invoke-WarmupAction -Name $Name }
         }
     }
     finally {
