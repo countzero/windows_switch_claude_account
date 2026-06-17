@@ -1306,50 +1306,6 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'Get-RetryAfterSeconds' {
-        BeforeAll {
-            function New-HttpEx {
-                Param ($Response)
-                $ex = [System.Exception]::new('429')
-                $ex | Add-Member -NotePropertyName Response -NotePropertyValue $Response -Force
-                return $ex
-            }
-        }
-
-        It 'returns $null when the exception has no Response' {
-            Get-RetryAfterSeconds (New-HttpEx -Response $null) | Should -BeNullOrEmpty
-        }
-
-        It 'returns $null for a Response with no Headers (test stub shape)' {
-            # Mirrors the existing fake-429 fixtures: pscustomobject w/ StatusCode only.
-            Get-RetryAfterSeconds (New-HttpEx -Response ([pscustomobject]@{ StatusCode = 429 })) |
-                Should -BeNullOrEmpty
-        }
-
-        It 'reads the typed RetryAfter.Delta (delta-seconds form)' {
-            $headers = [System.Net.Http.HttpResponseMessage]::new(429).Headers
-            $headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([TimeSpan]::FromSeconds(8))
-            $resp = [pscustomobject]@{ Headers = $headers }
-            Get-RetryAfterSeconds (New-HttpEx -Response $resp) | Should -Be 8
-        }
-
-        It 'reads the typed RetryAfter.Date (HTTP-date form), clamping the future delta' {
-            $headers = [System.Net.Http.HttpResponseMessage]::new(429).Headers
-            $headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([DateTimeOffset]::UtcNow.AddSeconds(30))
-            $resp = [pscustomobject]@{ Headers = $headers }
-            $secs = Get-RetryAfterSeconds (New-HttpEx -Response $resp)
-            $secs | Should -BeGreaterThan 20
-            $secs | Should -BeLessOrEqual 31
-        }
-
-        It 'returns 0 for a past HTTP-date (retry immediately)' {
-            $headers = [System.Net.Http.HttpResponseMessage]::new(429).Headers
-            $headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([DateTimeOffset]::UtcNow.AddSeconds(-30))
-            $resp = [pscustomobject]@{ Headers = $headers }
-            Get-RetryAfterSeconds (New-HttpEx -Response $resp) | Should -Be 0
-        }
-    }
-
     Context 'Get-EarlyRepollLastPoll' {
         It 'rewinds by (Interval - DelaySec) so the next poll fires ~DelaySec out' {
             # The watch loop polls when (now - lastPoll) >= Interval. With

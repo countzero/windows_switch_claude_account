@@ -2472,64 +2472,13 @@ function Get-SlotProfile {
     return [pscustomobject]@{ Status = 'ok'; Email = $email }
 }
 
-# Parse a 429 response's Retry-After into seconds (double) or $null.
-# Generic, defensive helper retained for honoring a server-directed wait
-# on a 429 (e.g. a future Get-SlotUsage backoff). Reads the strongly-typed
-# HttpResponseMessage.Headers.RetryAfter first (.Delta for the delta-seconds
-# form, .Date for the HTTP-date form), then falls back to a raw 'Retry-After'
-# header parse. Fully defensive: a missing header, a malformed value, or a
-# non-HttpResponseMessage Response (e.g. a pscustomobject test stub that only
-# carries StatusCode) all return $null so the caller takes its no-header
-# path. Never throws. A past Date clamps to 0 (retry immediately).
-function Get-RetryAfterSeconds {
-    Param ($Exception)
-
-    try {
-        $resp = $Exception.Response
-        if (-not $resp) { return $null }
-
-        $headers = $resp.Headers
-        if (-not $headers) { return $null }
-
-        $retryAfter = $headers.RetryAfter
-        if ($retryAfter) {
-            if ($null -ne $retryAfter.Delta) {
-                $secs = [double]$retryAfter.Delta.TotalSeconds
-                if ($secs -lt 0) { return 0.0 }
-                return $secs
-            }
-            if ($null -ne $retryAfter.Date) {
-                $secs = ([DateTimeOffset]$retryAfter.Date - [DateTimeOffset]::UtcNow).TotalSeconds
-                if ($secs -lt 0) { return 0.0 }
-                return [double]$secs
-            }
-        }
-
-        # Raw header fallback (delta-seconds form). HTTP-date is already
-        # covered by the typed .Date path above when .NET parsed it.
-        $out = $null
-        if ($headers.TryGetValues('Retry-After', [ref]$out)) {
-            $raw  = @($out)[0]
-            $secs = 0.0
-            if ([double]::TryParse([string]$raw, [ref]$secs)) {
-                if ($secs -lt 0) { return 0.0 }
-                return $secs
-            }
-        }
-        return $null
-    }
-    catch {
-        return $null
-    }
-}
-
 # Run the Claude Code CLI (`claude`) as a child process and return its raw
 # result so Invoke-SlotActivator can classify it. Extracted as the single
 # mockable seam for the activator: tests stub THIS to feed synthetic exit
 # codes / stdout / stderr without spawning a real `claude`, while the
 # parsing/classification logic in Invoke-SlotActivator is exercised
-# directly. Never throws; a missing binary, a timeout, or a non-zero exit
-# are all reported through the returned object.
+# directly. A missing binary, a timeout, and a non-zero exit are all
+# reported through the returned object.
 #
 # Returns: @{ TimedOut = <bool>; ExitCode = <int|null>; Stdout = <string>;
 #             Stderr = <string> }. A null ExitCode means the binary was not
@@ -2587,7 +2536,8 @@ function Invoke-ClaudeActivatorProcess {
 # Failure classification is best-effort: claude's success envelope is well
 # defined ({type:'result', is_error:false}), but its failure surface (exit
 # code + stderr vs a JSON error) is not contractually stable, so the
-# non-ok arms scan the message text. Never throws.
+# non-ok arms scan the message text. Returns an object for every
+# documented outcome.
 function Invoke-SlotActivator {
     Param (
         [String] $SlotPath
