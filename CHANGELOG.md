@@ -4,15 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.4.0] - 2026-06-17
 
 ### Added
-- `sca warmup [name]` action: a one-shot pass that opens each saved slot's 5h session window (all slots, or just `<name>`), restores the original active slot, and prints the usage table. The automation of the manual "switch to a slot, send one message" routine. Refuses while Claude Code is running or when the `claude` CLI is absent.
+- `sca warmup [name]` action: opens each saved slot's 5h session window (or just `<name>`) and prints the usage table. Refuses while Claude Code is running or the `claude` CLI is absent.
 
 ### Changed
-- The `sca usage` rate-limit advisory moved out from under the table into the watch footer block, leading the `[Auto]` / `[Watch]` lines, and was shortened to a single line that fits the table width.
-- Agent instructions now live in `AGENTS.md` (read natively by OpenCode); `CLAUDE.md` is a thin `@AGENTS.md` import shim so Claude Code loads the same content. Added a Code Comments conventions section.
-- Warmup (`sca warmup` and `sca usage -Watch -Warmup`) now opens a slot's 5h window by running the real Claude Code CLI (`claude -p` in safe-mode on Haiku, ~$0.004/slot) instead of a raw `/v1/messages` request. This always opens the window like a real message, delegates the OAuth refresh to Claude Code's own flow, and no longer amplifies a transient token-refresh rate limit. A throttled slot is reported and skipped rather than retried.
+- Warmup now opens a slot's 5h window by running the real Claude Code CLI (`claude -p` on Haiku in safe-mode, ~$0.004/slot) instead of a raw `/v1/messages` request, delegating the OAuth refresh to Claude Code's own flow. A throttled slot is reported and skipped, not retried.
+- The `sca usage` rate-limit advisory moved into the watch footer as a single line that fits the table width.
+- Agent instructions now live in `AGENTS.md`; `CLAUDE.md` is a thin `@AGENTS.md` import shim so Claude Code loads the same content.
+
+### Fixed
+- `sca usage` shows a short `error <code>` label (e.g. `error 529`) for HTTP errors instead of a verbose .NET message that wrapped the table row.
 
 ## [2.3.0] - 2026-05-29
 
