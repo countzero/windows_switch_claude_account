@@ -4251,6 +4251,13 @@ function Invoke-AutoRotationStep {
 # round number.
 $Script:UsageWatchMinInterval = 60
 
+# How soon to re-poll after a warmup pass that ended with rate-limited
+# rows. The 429 cooldown is short, so a quick second poll usually returns
+# real data instead of leaving the user staring at em-dash cells for a
+# full -Interval. See Get-EarlyRepollLastPoll for how this maps onto the
+# loop's elapsed-since-last-poll trigger.
+$Script:WarmupRepollDelaySec  = 10
+
 # Inter-slot spacing during the warmup loop. After each slot is
 # activated, sleep this many milliseconds before moving to the next.
 # Cheap insurance against per-IP burst rate-limits: a small gap between
@@ -4453,6 +4460,22 @@ function Invoke-WarmAllSlots {
     return $snapshot
 }
 
+# Compute the $lastPoll value that schedules the next watch poll roughly
+# $DelaySec from now. The watch loop polls when (now - $lastPoll) >=
+# $Interval, so to fire $DelaySec out we must rewind by ($Interval -
+# $DelaySec), NOT by $DelaySec. Clamped at 0 so a $DelaySec >= $Interval
+# never pushes $lastPoll into the future (which would DELAY the poll);
+# at the clamp the loop polls immediately. Pure; unit-tested in
+# Helpers.Tests.ps1.
+function Get-EarlyRepollLastPoll {
+    Param (
+        [DateTime] $Now,
+        [int]      $Interval,
+        [int]      $DelaySec
+    )
+    return $Now.AddSeconds(-[Math]::Max(0, $Interval - $DelaySec))
+}
+
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. The redraw cadence is decoupled from
 # the poll cadence so the frame self-heals on terminal resize within
@@ -4599,14 +4622,14 @@ function Invoke-UsageWatch {
                 } catch { Write-Verbose "Warmup title set deferred: $_" }
             }
             # If warmup ended with rate-limited rows, the user sees dashes
-            # for the full poll interval. Trigger an early repoll (~10s) so
-            # the rate-limit window (a "short cooldown" per the code
-            # comments) likely clears and the user sees real data sooner.
-            # If the early repoll also gets 429, $lastPoll resets to now
-            # and we fall back to the normal interval — no worse than
-            # current behaviour.
+            # for the full poll interval. Schedule an early repoll
+            # ~$Script:WarmupRepollDelaySec from now (regardless of
+            # -Interval) so the short 429 cooldown likely clears and real
+            # data appears sooner. If the early repoll also gets 429,
+            # $lastPoll resets to now and we fall back to the normal
+            # interval — no worse than current behaviour.
             if ($snapshot -and $snapshot.HasRateLimited) {
-                $lastPoll = [DateTime]::Now.AddSeconds(-10)
+                $lastPoll = Get-EarlyRepollLastPoll -Now ([DateTime]::Now) -Interval $Interval -DelaySec $Script:WarmupRepollDelaySec
             }
         }
 

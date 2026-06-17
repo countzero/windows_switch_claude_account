@@ -1350,6 +1350,23 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Get-EarlyRepollLastPoll' {
+        It 'rewinds by (Interval - DelaySec) so the next poll fires ~DelaySec out' {
+            # The watch loop polls when (now - lastPoll) >= Interval. With
+            # Interval 60 / DelaySec 10 the result must sit 50s before $Now
+            # so the next poll lands ~10s from $Now, not ~50s.
+            $now = [DateTime]::new(2025, 1, 1, 12, 0, 0)
+            $res = Get-EarlyRepollLastPoll -Now $now -Interval 60 -DelaySec 10
+            ($now - $res).TotalSeconds | Should -Be 50
+        }
+
+        It 'clamps at 0 when DelaySec >= Interval so lastPoll is never pushed into the future' {
+            $now = [DateTime]::new(2025, 1, 1, 12, 0, 0)
+            $res = Get-EarlyRepollLastPoll -Now $now -Interval 5 -DelaySec 10
+            $res | Should -Be $now
+        }
+    }
+
     Context 'Read-Sidecar' {
         # Pure-helper file-IO tests; sandbox uses $TestDrive directly to
         # avoid pulling in the full credential-dir scaffolding.
