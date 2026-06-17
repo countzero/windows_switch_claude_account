@@ -166,16 +166,18 @@ The terminal-tab title is updated on every poll so a backgrounded watch is glanc
 > [!NOTE]
 > The title's numbers come from the **active** slot (or the slot named in `sca usage <name> -Watch`); a non-`ok` row falls back to the bare brand suffix. A `[~]` prefix appears when a bucket is ≥90%, `[!]` when ≥100%. Pre-watch title is restored on Ctrl-C.
 
-### Prime cold slots at startup
+### Warm up cold slots
 
-Anthropic only reports `/api/oauth/usage` data for slots that have an open server-side 5h session window, which only a real billable request can open. Pass `-Warmup` to send a minimal `/v1/messages` request (~2 tokens on Haiku, fractions of a cent) for each saved slot before the watch loop starts, so every slot reports real bucket numbers on the first frame instead of `rate-limited`:
+Anthropic only reports `/api/oauth/usage` data for slots that have an open server-side 5h session window, which only a real message can open. Warmup automates the manual "switch to a slot, send one message" routine across every saved slot: for each slot it switches in and runs the real Claude Code CLI (`claude -p "Hi"` in safe-mode on Haiku, ~$0.004/slot), then restores the slot you started on. Because it runs the actual client, it opens the window exactly like you typing a message would.
 
 ```powershell
-sca usage -Watch -Warmup              # prime all slots, then watch
-sca usage -Watch -Auto -Warmup        # prime + auto-rotate (recommended pairing)
+sca warmup                            # warm every slot once, print the table, exit
+sca warmup slot-2                     # warm just one slot
+sca usage -Watch -Warmup              # warm all slots, then keep watching
+sca usage -Watch -Auto -Warmup        # warm + auto-rotate (recommended pairing)
 ```
 
-`-Warmup` refuses to operate while Claude Code is running (per-slot swap writes `~/.claude.json`). Pair with `-Auto` for the typical use case: `-Auto` needs every peer slot reporting real data to make rotation decisions.
+Warmup refuses to operate while Claude Code is running (the per-slot swap writes `~/.claude.json`) and requires the `claude` CLI to be installed and logged in. A slot whose token refresh is temporarily rate-limited is reported and skipped, not retried. Pair `-Warmup` with `-Auto` for the typical use case: `-Auto` needs every peer slot reporting real data to make rotation decisions.
 
 ### Auto-rotate on usage limit (OpenCode only)
 

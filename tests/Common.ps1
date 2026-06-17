@@ -68,12 +68,9 @@ Mock Test-ClaudeRunning -MockWith { $false }
 # because $Script:TokenRefreshRetryMax stays at its production value;
 # only the wall-clock wait between attempts goes to zero. Same trick
 # for $Script:WarmupSpacingMs so the warmup loop's per-slot 300 ms
-# pacing does not multiply across many-slot tests, and for
-# $Script:WarmupPrimingMinMs so the 'priming' visibility floor does
-# not add 150 ms per slot to every Invoke-WarmAllSlots test.
-$Script:TokenRefreshRetryDelayMs = 0
-$Script:WarmupSpacingMs          = 0
-$Script:WarmupPrimingMinMs       = 0
+# pacing does not multiply across many-slot tests.
+$Script:TokenRefreshRetryDelayMs   = 0
+$Script:WarmupSpacingMs            = 0
 
 # --- Test fixtures --------------------------------------------------------
 #
