@@ -107,13 +107,16 @@ Param (
     [ValidateRange(1, 100)]
     [int] $Threshold = 95,
 
-    # -Warmup: in `sca usage -Watch`, activate every saved slot before the
-    # first poll. For each slot in alphabetical order, Invoke-WarmAllSlots
-    # makes the slot active (Invoke-SlotSwap) then runs the real Claude Code
-    # CLI (`claude -p`, via Invoke-SlotActivator) so Anthropic opens a
-    # server-side 5h session window for the slot. Subsequent
-    # /api/oauth/usage polls then return real bucket data instead of
-    # empty/rate-limited responses. Cost: ~$0.004 per slot per warmup on
+    # -Warmup: in `sca usage -Watch`, KEEP every saved slot warm for the
+    # life of the watch. Before the first poll, activate every slot in
+    # alphabetical order: Invoke-WarmAllSlots makes the slot active
+    # (Invoke-SlotSwap) then runs the real Claude Code CLI (`claude -p`, via
+    # Invoke-SlotActivator) so Anthropic opens a server-side 5h session
+    # window for the slot. Then, at each poll, Invoke-KeepWarmStep re-opens
+    # any slot whose 5h window has since closed, so the slots do not all
+    # expire ~5h after startup and stay dark. Subsequent /api/oauth/usage
+    # polls return real bucket data instead of empty/rate-limited responses.
+    # Cost: ~$0.004 per slot per warmup on
     # the pinned Haiku model (a real one-turn "Hi" message; Claude Code
     # always sends its base system prompt, so it is ~3k input tokens, not
     # a bare request). Bound to the 'Watch' parameter set so the binder
@@ -894,10 +897,10 @@ function Show-Help {
         "  $cmd usage -Watch -Interval 300        # slower refresh (floor is 60s)",
         "  $cmd warmup                            # open every slot's 5h window via 'claude -p' (billable; ~`$0.004/slot)",
         "  $cmd warmup slot-2                     # warm just one slot",
-        "  $cmd usage -Watch -Warmup              # warm all slots, then keep watching (billable)",
+        "  $cmd usage -Watch -Warmup              # keep all slots warm (re-warms closed 5h windows) (billable)",
         "  $cmd usage -Watch -Auto                # auto-rotate when active slot hits 95% (OpenCode only)",
         "  $cmd usage -Watch -Auto -Threshold 90  # rotate earlier (default is 95%)",
-        "  $cmd usage -Watch -Auto -Warmup        # auto-rotate and prime all available slots",
+        "  $cmd usage -Watch -Auto -Warmup        # auto-rotate and keep all slots warm (recommended)",
         "  $cmd usage -Json                       # emit usage as JSON for scripting",
         "  $cmd usage -NoColor                    # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
         "",
@@ -3765,8 +3768,9 @@ function Invoke-UsageAction {
         # reporting lags real consumption; range enforced by
         # [ValidateRange(1,100)] on the top-level Param block.
         [int]    $Threshold = 95,
-        # -Warmup: activate every saved slot via the real Claude Code CLI
-        # (`claude -p`, through Invoke-WarmAllSlots) before the first poll.
+        # -Warmup: keep every saved slot warm via the real Claude Code CLI
+        # (`claude -p`): a startup pass before the first poll, then a per-poll
+        # re-warm of any slot whose 5h window has closed (Invoke-KeepWarmStep).
         # Requires -Watch. Independent of -Auto.
         [switch] $Warmup
     )
@@ -4216,6 +4220,17 @@ $Script:WarmupRepollDelaySec  = 10
 # tests (Common.ps1 overrides to zero).
 $Script:WarmupSpacingMs    = 300
 
+# Minimum minutes between re-warms of the SAME slot during a `-Watch
+# -Warmup` session (see Invoke-KeepWarmStep). A successful re-warm pushes
+# the slot's five_hour.resets_at ~5h out, so the closed-window check alone
+# already prevents re-warming a healthy slot for hours. This cooldown only
+# bounds the pathological case: a slot whose warm attempt FAILS (claude
+# error / throttle) keeps reporting a closed window, which would otherwise
+# trigger a fresh billable `claude -p` on every ~60s poll. Tracked in
+# memory (a per-session hashtable in Invoke-UsageWatch), never persisted to
+# .sca-state.json. Tunable for tests (Common.ps1 overrides to zero).
+$Script:WarmupCooldownMin  = 5
+
 # Slot activator (`claude -p`) settings. Warmup opens a slot's 5h session
 # window by running the real Claude Code CLI as that slot, exactly as a
 # user typing one message would (Invoke-SlotActivator). This delegates the
@@ -4269,7 +4284,7 @@ $Script:ActivatorTimeoutSec = 90
 # throttled slot incurs zero sca refresh calls.
 #
 # Builds the rendered snapshot in place: one row per slot (filtered by
-# -Name when set), each starting at Status='warming-up' with Data=$null,
+# -Names, else -Name, when set), each starting at Status='warming-up' with Data=$null,
 # transitioning through 'priming' (the claude -p call in flight) to its
 # real outcome. The end state is the first frame of the polling loop; the
 # caller wires it to $snapshot and sets $lastPoll = now. Returns $null
@@ -4289,11 +4304,21 @@ $Script:ActivatorTimeoutSec = 90
 function Invoke-WarmAllSlots {
     Param (
         [string]                             $Name,
+        # -Names: restrict the pass to this set of (already-sanitized) slot
+        # names. Used by Invoke-KeepWarmStep to re-warm only the slots whose
+        # 5h window has closed mid-watch, reusing this function's swap ->
+        # activate -> mirror -> read -> restore machinery for the subset.
+        # Takes precedence over -Name when both are supplied. Names come
+        # from Get-Slots output (snapshot rows), so no Get-SafeName needed.
+        [string[]]                           $Names,
         [Parameter(Mandatory)] [scriptblock] $Repaint
     )
 
     $slots = @(Get-Slots)
-    if ($Name) {
+    if ($Names) {
+        $slots = @($slots | Where-Object { $Names -contains $_.Name })
+    }
+    elseif ($Name) {
         $safe  = Get-SafeName $Name
         $slots = @($slots | Where-Object { $_.Name -eq $safe })
     }
@@ -4410,6 +4435,99 @@ function Invoke-WarmAllSlots {
     return $snapshot
 }
 
+# Per-poll keep-warm step for `sca usage -Watch -Warmup`. Mirrors
+# Invoke-AutoRotationStep's shape: orchestration that returns the footer-
+# latch string the watch loop appends to every frame until the next state
+# change. Re-opens the 5h session window of any saved slot whose window has
+# closed since the startup warm pass, so a long-running watch keeps every
+# slot warm instead of letting them all expire ~5h after startup and never
+# restart (the one-shot startup pass was the whole of warmup before this).
+#
+# A slot needs re-warming when its row is HTTP-ok AND its five_hour bucket
+# reports no OPEN window (bucket missing, or resets_at null / already past;
+# a mid-window slot always carries a future resets_at). Non-ok rows
+# (expired / unauthorized / rate-limited / no-oauth / error) are skipped:
+# warming them just fails again and burns a billable `claude -p`. A 5h
+# window can only be RE-opened after it closes (sending a message earlier
+# just adds to the open window without renewing it), so this is reactive by
+# necessity, not by choice.
+#
+# $WarmupTimes (slot name -> last attempt [DateTime], mutated in place)
+# gates repeated attempts via $Script:WarmupCooldownMin. A successful warm
+# pushes resets_at ~5h out, so the closed-window check alone keeps a healthy
+# slot from re-warming for hours; the cooldown only bounds the pathological
+# case where a warm FAILS and the slot keeps reporting a closed window,
+# which would otherwise re-fire a billable call every ~60s poll. The stamp
+# is written for every attempted slot, success or failure.
+#
+# Test-ClaudeRunning is re-checked here (not only at loop startup): the
+# per-slot swap inside Invoke-WarmAllSlots writes ~/.claude.json's
+# oauthAccount, which a Claude Code launched mid-watch would cache. Same
+# per-tick rationale as Invoke-AutoRotationStep's re-check.
+#
+# Re-warmed rows are deliberately NOT merged back into $Snapshot: the next
+# poll (<= -Interval away) re-reads /api/oauth/usage and renders them warm.
+# The footer latch explains the brief lag where the table still shows a
+# just-warmed row as cold. Never throws: a warm-path exception is caught and
+# surfaced as a '[Warmup] Re-warm failed! ...' line so the loop never aborts.
+function Invoke-KeepWarmStep {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Snapshot,
+        [Parameter(Mandatory)] [hashtable]      $WarmupTimes,
+        [int]                                   $CooldownMin = $Script:WarmupCooldownMin,
+        [AllowNull()] [AllowEmptyString()] [string] $CurrentLatch
+    )
+
+    if (-not $Snapshot -or $Snapshot.NoSlots) { return $CurrentLatch }
+    $results = @($Snapshot.Results)
+    if ($results.Count -eq 0) { return $CurrentLatch }
+
+    $now    = [DateTime]::Now
+    $nowUtc = [DateTimeOffset]::UtcNow
+    $cold   = @(
+        foreach ($r in $results) {
+            if ($r.Status -ne 'ok') { continue }
+
+            $reset = $null
+            if ($r.Data -and $r.Data.five_hour) {
+                $reset = ConvertTo-DateTimeOffsetOrNull $r.Data.five_hour.resets_at
+            }
+            # A future reset means the window is still open: leave it alone.
+            if ($null -ne $reset -and $reset -gt $nowUtc) { continue }
+
+            $last = $WarmupTimes[$r.Name]
+            if ($last -and ($now - $last).TotalMinutes -lt $CooldownMin) { continue }
+
+            $r.Name
+        }
+    )
+
+    if ($cold.Count -eq 0) { return $CurrentLatch }
+
+    if (Test-ClaudeRunning) {
+        return '[Warmup] Re-warm refused! Claude Code is running.'
+    }
+
+    $list = ($cold | Sort-Object | ForEach-Object { "'$_'" }) -join ', '
+    try {
+        # 6>$null: Invoke-WarmAllSlots's nested Invoke-SlotSwap / Reconcile /
+        # Get-SlotUsage emit yellow advisories that must not paint outside
+        # the watch loop's DEC 2026 sync envelope. Matches the suppression
+        # on Invoke-AutoRotationStep's Invoke-SlotSwap. No-op repaint: the
+        # subset's per-row transitions are not rendered (the loop's own
+        # redraw covers the table); only the footer latch reports the event.
+        Invoke-WarmAllSlots -Names $cold -Repaint { Param ($snap) } 6>$null | Out-Null
+        foreach ($n in $cold) { $WarmupTimes[$n] = $now }
+        return "[Warmup] Re-warmed $list at $($now.ToString('HH:mm:ss'))"
+    }
+    catch {
+        # Stamp the attempt anyway so a hard failure does not re-fire every
+        # poll; the cooldown then holds the slot off until it likely recovers.
+        foreach ($n in $cold) { $WarmupTimes[$n] = $now }
+        return "[Warmup] Re-warm failed! $($_.Exception.Message)"
+    }
+}
+
 # Compute the $lastPoll value that schedules the next watch poll roughly
 # $DelaySec from now. The watch loop polls when (now - $lastPoll) >=
 # $Interval, so to fire $DelaySec out we must rewind by ($Interval -
@@ -4478,11 +4596,12 @@ function Invoke-UsageWatch {
         # -Threshold: utilization percentage (1..100) at or above which
         # -Auto fires a rotation. Ignored when -Auto is absent.
         [int]    $Threshold = 95,
-        # -Warmup: activate every saved slot via the real Claude Code CLI
-        # (`claude -p`, through Invoke-WarmAllSlots) before the first poll.
-        # Independent of -Auto: works with bare -Watch and with -Watch
-        # -Auto. See the warmup block below the alt-screen entry for
-        # the synthetic snapshot + Status-column mechanics.
+        # -Warmup: keep every saved slot warm for the life of the watch.
+        # The startup pass (Invoke-WarmAllSlots, below the alt-screen entry)
+        # activates every slot via the real Claude Code CLI (`claude -p`)
+        # before the first poll; thereafter Invoke-KeepWarmStep re-opens any
+        # slot whose 5h window has closed at each poll boundary. Independent
+        # of -Auto: works with bare -Watch and with -Watch -Auto.
         [switch] $Warmup
     )
 
@@ -4545,6 +4664,14 @@ function Invoke-UsageWatch {
         # mode is engaged before the first rotation event.
         $lastAutoFooter = if ($Auto) { '[Auto] Automatic slot switching is enabled.' } else { $null }
 
+        # -Warmup footer-line latch + per-slot last-re-warm map. The latch
+        # parallels $lastAutoFooter (steady-state line until a keep-warm
+        # event replaces it). $warmupTimes (slot name -> last attempt
+        # [DateTime]) lives only for this watch session and feeds the
+        # cooldown gate in Invoke-KeepWarmStep; it is never persisted.
+        $lastWarmupFooter = if ($Warmup) { '[Warmup] Keeping all slots warm.' } else { $null }
+        $warmupTimes      = @{}
+
         # -Warmup startup pass. Invoke-WarmAllSlots does the per-slot
         # swap-then-activate round-robin and returns a populated snapshot
         # we hand off to the polling loop as its first frame ($lastPoll
@@ -4561,8 +4688,11 @@ function Invoke-UsageWatch {
             $autoHeader = if ($Auto) { $Threshold } else { 0 }
             $snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
                 Param ($snap)
+                $startupFooter = ''
+                if ($lastAutoFooter)   { $startupFooter = $lastAutoFooter + "`n" }
+                if ($lastWarmupFooter) { $startupFooter += $lastWarmupFooter }
                 Write-VTSequence "`e[?2026h`e[2J`e[H"
-                Format-UsageFrame -Name $Name -Snapshot $snap -Footer $lastAutoFooter -AutoThreshold $autoHeader
+                Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
                 Write-VTSequence "`e[?2026l"
             }
             if ($null -ne $snapshot) {
@@ -4580,6 +4710,16 @@ function Invoke-UsageWatch {
             # interval — no worse than current behaviour.
             if ($snapshot -and $snapshot.HasRateLimited) {
                 $lastPoll = Get-EarlyRepollLastPoll -Now ([DateTime]::Now) -Interval $Interval -DelaySec $Script:WarmupRepollDelaySec
+            }
+
+            # Seed the cooldown map with the startup pass: every slot just
+            # warmed counts as a re-warm at "now", so a slot whose startup
+            # verify-read failed/lagged (still reporting a closed window) is
+            # not immediately re-warmed on the first poll. The closed-window
+            # check covers the healthy slots; this covers the laggy ones.
+            if ($null -ne $snapshot) {
+                $seed = [DateTime]::Now
+                foreach ($r in @($snapshot.Results)) { $warmupTimes[$r.Name] = $seed }
             }
         }
 
@@ -4641,6 +4781,16 @@ function Invoke-UsageWatch {
                     if ($Auto) {
                         $lastAutoFooter = Invoke-AutoRotationStep -Snapshot $snapshot -Threshold $Threshold -CurrentLatch $lastAutoFooter
                     }
+
+                    # Keep-warm decision after auto-rotation so the slot
+                    # Invoke-WarmAllSlots restores to is the post-rotation
+                    # active one. Cold (~0% util, closed window) and at-limit
+                    # (>= threshold) are disjoint, so keep-warm and rotation
+                    # never fight over the same slot. Re-opens any slot whose
+                    # 5h window has closed; the latched footer reports it.
+                    if ($Warmup) {
+                        $lastWarmupFooter = Invoke-KeepWarmStep -Snapshot $snapshot -WarmupTimes $warmupTimes -CurrentLatch $lastWarmupFooter
+                    }
                 }
                 catch {
                     # Keep the previous snapshot visible. If the very first
@@ -4656,14 +4806,17 @@ function Invoke-UsageWatch {
             # poll boundaries (timestamp updates only on poll), but the
             # rebuild is a cheap concat and keeps the redraw path single-
             # branch. Multi-line only when the previous poll failed.
-            # Order: [Auto] state (if -Auto) -> [Watch] Last poll ->
-            # [Watch] Last poll failed (if any). The [Auto] line leads
-            # the block so the user's eye finds the auto-mode state
-            # signal first; transport-level details (poll timestamp,
-            # failure tail) follow underneath.
+            # Order: [Auto] state (if -Auto) -> [Warmup] state (if -Warmup)
+            # -> [Watch] Last poll -> [Watch] Last poll failed (if any).
+            # The mode-state lines ([Auto], [Warmup]) lead the block so the
+            # user's eye finds them first; transport-level details (poll
+            # timestamp, failure tail) follow underneath.
             $footer = ''
             if ($lastAutoFooter) {
                 $footer = $lastAutoFooter + "`n"
+            }
+            if ($lastWarmupFooter) {
+                $footer += $lastWarmupFooter + "`n"
             }
             $footer += "[Watch] Last poll at $($lastPoll.ToString('HH:mm:ss'))"
             if ($lastPollError) {

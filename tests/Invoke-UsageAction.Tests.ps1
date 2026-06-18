@@ -2547,6 +2547,33 @@ Describe 'switch_claude_account' {
             $snap.Results[0].Name | Should -Be 'work_slot'
         }
 
+        It '-Names restricts the pass to the given subset of slots' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+
+            $snap = Invoke-WarmAllSlots -Names @('a', 'c') -Repaint { }
+
+            @($snap.Results).Count          | Should -Be 2
+            @($snap.Results.Name | Sort-Object) | Should -Be @('a', 'c')
+            Should -Invoke Invoke-SlotActivator -Times 2 -Exactly
+        }
+
+        It '-Names takes precedence over -Name when both are supplied' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            $snap = Invoke-WarmAllSlots -Name 'b' -Names @('a') -Repaint { }
+
+            @($snap.Results).Count   | Should -Be 1
+            $snap.Results[0].Name    | Should -Be 'a'
+        }
+
+        It '-Names returns $null when no saved slot matches the subset' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            Invoke-WarmAllSlots -Names @('nonexistent') -Repaint { } | Should -BeNullOrEmpty
+        }
+
         It 'ok activation then verify-after populates live bucket data' {
             New-WarmupSlot -Name 'a' -ExpiresAt $script:FutureMs | Out-Null
             New-WarmupSlot -Name 'b' -ExpiresAt $script:FutureMs | Out-Null
@@ -2812,6 +2839,173 @@ Describe 'switch_claude_account' {
 
             $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
             Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+        }
+    }
+
+    Context 'Invoke-KeepWarmStep' {
+        # The per-poll keep-warm step for `-Watch -Warmup`. Mirrors
+        # Invoke-AutoRotationStep: decides which slots have a CLOSED 5h
+        # window, re-warms them via Invoke-WarmAllSlots (mocked here), and
+        # returns a latched footer string. Cold = Status='ok' AND
+        # five_hour bucket missing / resets_at null or past. Non-ok rows
+        # are skipped; a per-slot cooldown ($WarmupTimes map) bounds retries.
+
+        BeforeAll {
+            # Build a snapshot row exposing only the fields the step reads:
+            # Name, Status, Data.five_hour.resets_at.
+            function New-KwRow {
+                Param (
+                    [string] $Name,
+                    [string] $Status = 'ok',
+                    $FiveResetsAt    = $null,
+                    [switch] $NoFiveBucket,
+                    [switch] $NoData
+                )
+                $data = $null
+                if ($Status -eq 'ok' -and -not $NoData) {
+                    $five = if ($NoFiveBucket) { $null } else {
+                        [pscustomobject]@{ utilization = 0.0; resets_at = $FiveResetsAt }
+                    }
+                    $data = [pscustomobject]@{ five_hour = $five; seven_day = $null }
+                }
+                return [pscustomobject]@{
+                    Name = $Name; Status = $Status; Data = $data
+                    IsActive = $false; Error = $null; Email = "$Name@test.local"
+                }
+            }
+
+            function New-KwSnapshot {
+                Param ([object[]] $Rows)
+                return [pscustomobject]@{
+                    Results          = @($Rows)
+                    NoSlots          = (@($Rows).Count -eq 0)
+                    HasCacheFallback = $false
+                }
+            }
+
+            $script:Future = [DateTimeOffset]::UtcNow.AddHours(3).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+            $script:Past   = [DateTimeOffset]::UtcNow.AddMinutes(-5).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        }
+
+        BeforeEach {
+            # Default: no real claude process; no real warm pass.
+            Mock Test-ClaudeRunning { $false }
+            Mock Invoke-WarmAllSlots { }
+        }
+
+        It 'returns the current latch and does NOT warm when every window is open' {
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $script:Future) )
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+
+            $out | Should -Be '[Warmup] Keeping all slots warm.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 'returns the current latch when the snapshot has no slots' {
+            $out = Invoke-KeepWarmStep -Snapshot (New-KwSnapshot @()) -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out | Should -Be '[Warmup] Keeping all slots warm.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 'returns the current latch when Results is empty but NoSlots is false' {
+            $snap = [pscustomobject]@{ Results = @(); NoSlots = $false; HasCacheFallback = $false }
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out | Should -Be '[Warmup] Keeping all slots warm.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 're-warms a slot whose five_hour.resets_at is null' {
+            $times = @{}
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CurrentLatch '[Warmup] Keeping all slots warm.'
+
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' -and @($Names).Count -eq 1 }
+            $out | Should -Match "^\[Warmup\] Re-warmed 'a' at \d{2}:\d{2}:\d{2}$"
+            $times.ContainsKey('a') | Should -BeTrue
+        }
+
+        It 're-warms a slot whose five_hour.resets_at is in the past' {
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $script:Past) )
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+            $out | Should -Match "^\[Warmup\] Re-warmed 'a' at"
+        }
+
+        It 're-warms an ok row whose Data is null (no plan data)' {
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -NoData) )
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x' | Out-Null
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' }
+        }
+
+        It 're-warms an ok row whose five_hour bucket is missing' {
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -NoFiveBucket) )
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x' | Out-Null
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' }
+        }
+
+        It 'skips non-ok rows even when their window is closed' {
+            $snap = New-KwSnapshot @(
+                (New-KwRow -Name 'a' -Status 'expired'),
+                (New-KwRow -Name 'b' -Status 'rate-limited')
+            )
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out | Should -Be '[Warmup] Keeping all slots warm.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 'skips a cold slot still inside its cooldown window' {
+            $times = @{ 'a' = [DateTime]::Now }   # just re-warmed
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
+
+            $out | Should -Be '[Warmup] Keeping all slots warm.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 're-warms a cold slot once its cooldown has elapsed' {
+            $times = @{ 'a' = [DateTime]::Now.AddMinutes(-10) }
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch 'x' | Out-Null
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+        }
+
+        It 'refuses (without warming) when Claude Code is running' {
+            Mock Test-ClaudeRunning { $true }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+
+            $out | Should -Be '[Warmup] Re-warm refused! Claude Code is running.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 'surfaces a warm-path exception as "Re-warm failed!" and still stamps the attempt' {
+            Mock Invoke-WarmAllSlots { throw [System.IO.IOException]::new('locked slot file') }
+            $times = @{}
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CurrentLatch 'x'
+
+            $out | Should -Match '^\[Warmup\] Re-warm failed! .*locked slot file'
+            $times.ContainsKey('a') | Should -BeTrue
+        }
+
+        It 'lists multiple cold slots sorted and quoted, warming only the cold subset' {
+            $snap = New-KwSnapshot @(
+                (New-KwRow -Name 'b' -FiveResetsAt $null),
+                (New-KwRow -Name 'a' -FiveResetsAt $script:Future),  # warm; excluded
+                (New-KwRow -Name 'c' -FiveResetsAt $script:Past)
+            )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter {
+                @($Names).Count -eq 2 -and (@($Names) -contains 'b') -and (@($Names) -contains 'c')
+            }
+            $out | Should -Match "^\[Warmup\] Re-warmed 'b', 'c' at"
         }
     }
 

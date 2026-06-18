@@ -173,9 +173,11 @@ Anthropic only reports `/api/oauth/usage` data for slots that have an open serve
 ```powershell
 sca warmup                            # warm every slot once, print the table, exit
 sca warmup slot-2                     # warm just one slot
-sca usage -Watch -Warmup              # warm all slots, then keep watching
-sca usage -Watch -Auto -Warmup        # warm + auto-rotate (recommended pairing)
+sca usage -Watch -Warmup              # keep every slot warm for the whole watch
+sca usage -Watch -Auto -Warmup        # keep warm + auto-rotate (recommended pairing)
 ```
+
+In `-Watch` mode `-Warmup` does more than the one-shot startup pass: at each poll it re-opens any slot whose 5h window has since closed, so a long watch keeps every slot warm instead of letting them all expire ~5h after startup. (A 5h window can only be reopened *after* it closes, so a just-expired slot is re-warmed within one poll, not before.) A per-slot cooldown keeps a slot whose warm keeps failing from being retried every poll.
 
 Warmup refuses to operate while Claude Code is running (the per-slot swap writes `~/.claude.json`) and requires the `claude` CLI to be installed and logged in. A slot whose token refresh is temporarily rate-limited is reported and skipped, not retried. Pair `-Warmup` with `-Auto` for the typical use case: `-Auto` needs every peer slot reporting real data to make rotation decisions.
 

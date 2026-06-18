@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `sca usage -Watch -Warmup` now keeps every slot warm for the life of the watch: in addition to the startup pass it re-opens any slot whose 5h session window has closed, checked at each poll, so the slots no longer all expire ~5h after startup and stay dark. A per-slot cooldown (`$Script:WarmupCooldownMin`, default 5 min) bounds repeated re-warms of a slot whose warm attempt keeps failing. Still combines with `-Auto`.
+
 ## [2.4.0] - 2026-06-17
 
 ### Added

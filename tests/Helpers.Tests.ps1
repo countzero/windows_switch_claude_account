@@ -994,6 +994,45 @@ Describe 'switch_claude_account' {
                     'before the next watch frame ESC[2J wipes it.')
             }
         }
+
+        It 'Invoke-KeepWarmStep suppresses Invoke-WarmAllSlots information stream' {
+            # Sibling assertion to the Invoke-AutoRotationStep check above:
+            # the re-warm arm of Invoke-KeepWarmStep calls Invoke-WarmAllSlots,
+            # whose nested Invoke-SlotSwap / Invoke-Reconcile / Get-SlotUsage
+            # emit yellow advisories (e.g. [Warmup] restore-failure, [Sync]
+            # token-propagation). Keep-warm owns its own footer line; the
+            # inner advisory would flash sub-frame before the next ESC[2J.
+            #
+            # Walk CommandAst nodes (real invocations) rather than regexing
+            # the body text, so a comment mentioning Invoke-WarmAllSlots is
+            # not mistaken for a call site missing its 6>$null.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-KeepWarmStep'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-KeepWarmStep must exist'
+
+            $warmInvocations = @($func.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.CommandAst]
+            }, $true) | Where-Object { $_.GetCommandName() -eq 'Invoke-WarmAllSlots' })
+            $warmInvocations.Count | Should -BeGreaterOrEqual 1 -Because 're-warm arm must call Invoke-WarmAllSlots'
+
+            foreach ($cmd in $warmInvocations) {
+                $hasInfoSuppression = @($cmd.Redirections | Where-Object {
+                    $_ -is [System.Management.Automation.Language.FileRedirectionAst] -and
+                    $_.FromStream -eq [System.Management.Automation.Language.RedirectionStream]::Information
+                }).Count -gt 0
+                $hasInfoSuppression | Should -BeTrue -Because (
+                    'Invoke-WarmAllSlots inside Invoke-KeepWarmStep must ' +
+                    'suppress information stream (6>$null); its nested ' +
+                    'advisories would flash sub-frame before the next watch ' +
+                    'frame ESC[2J wipes them.')
+            }
+        }
     }
 
     Context 'No-color mode' {
