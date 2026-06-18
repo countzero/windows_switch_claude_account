@@ -1928,6 +1928,84 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Get-SlotUsage (rate-limit backoff)' {
+        # After a 429, RateLimitedUntil is stamped on the cache entry so the
+        # NEXT poll short-circuits to cache without any token/usage HTTP --
+        # the loop stops re-tripping a hot limiter every poll. A successful
+        # read clears the stamp; Clear-SlotRateLimitBackoff drops it for the
+        # warmup verify read.
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+            $script:boSlot = Join-Path $script:CredDirPath '.credentials.bo.json'
+            $payload = @{ claudeAiOauth = @{ accessToken='AT'; refreshToken='RT'; expiresAt=$script:FutureMs } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $payload -NoNewline
+            Mock Start-Sleep -MockWith { }
+        }
+
+        It 'stamps RateLimitedUntil on the existing cache entry after a usage 429' {
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 1.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))   # stale
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp = [pscustomobject]@{ StatusCode = 429 }; $e = [System.Exception]::new('429'); $e | Add-Member -NotePropertyName Response -NotePropertyValue $resp; throw $e
+            }
+
+            Get-SlotUsage -SlotPath $script:boSlot | Out-Null
+
+            $Script:SlotUsageCache[$script:boSlot].RateLimitedUntil | Should -BeGreaterThan ([DateTime]::UtcNow)
+        }
+
+        It 'short-circuits to cache with ZERO HTTP while inside the backoff window' {
+            $script:rmCount = 0
+            Mock Invoke-RestMethod -MockWith { $script:rmCount++; throw 'HTTP must not be called during backoff' }
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data             = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 7.0 } }
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status                     | Should -Be 'rate-limited'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 7
+            $script:rmCount               | Should -Be 0
+        }
+
+        It 'a successful read clears any backoff stamp' {
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data             = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 1.0 } }
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(-1)   # expired: no short-circuit
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                return [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 9.0; resets_at = $null } }
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status | Should -Be 'ok'
+            $Script:SlotUsageCache[$script:boSlot].ContainsKey('RateLimitedUntil') | Should -BeFalse
+        }
+
+        It 'Clear-SlotRateLimitBackoff drops the stamp but keeps cached Data' {
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data = 'D'; Timestamp = [DateTime]::UtcNow; RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            Clear-SlotRateLimitBackoff -SlotPath $script:boSlot
+            $Script:SlotUsageCache[$script:boSlot].ContainsKey('RateLimitedUntil') | Should -BeFalse
+            $Script:SlotUsageCache[$script:boSlot].Data                            | Should -Be 'D'
+        }
+
+        It 'Set-SlotRateLimitBackoff is a no-op when the slot has no cache entry' {
+            Set-SlotRateLimitBackoff -SlotPath $script:boSlot
+            $Script:SlotUsageCache.ContainsKey($script:boSlot) | Should -BeFalse
+        }
+    }
+
     Context 'Get-SlotUsage (generic HTTP error surfaces the status code)' {
         # A non-401/403/429 HTTP failure (e.g. 529 Overloaded, 5xx) must
         # surface Status='error' WITH the numeric HttpStatus so the table
@@ -2842,6 +2920,46 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Test-WarmEligible' {
+        # Pure predicate behind Invoke-KeepWarmStep's cold-slot selection.
+        BeforeEach { $script:Now = [DateTimeOffset]::UtcNow }
+
+        It 'rate-limited is eligible regardless of data (recovery path)' {
+            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = $null }
+            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+        }
+
+        It 'ok with a FUTURE five_hour reset is not eligible (window open)' {
+            $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ resets_at = $script:Now.AddHours(2).ToString('o', [Globalization.CultureInfo]::InvariantCulture) } } }
+            Test-WarmEligible -Row $row -Now $script:Now | Should -BeFalse
+        }
+
+        It 'ok with a PAST five_hour reset is eligible (window closed)' {
+            $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ resets_at = $script:Now.AddMinutes(-5).ToString('o', [Globalization.CultureInfo]::InvariantCulture) } } }
+            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+        }
+
+        It 'ok with a null five_hour reset is eligible' {
+            $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ resets_at = $null } } }
+            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+        }
+
+        It 'ok with no Data is eligible' {
+            $row = [pscustomobject]@{ Status = 'ok'; Data = $null }
+            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+        }
+
+        It 'hard-fail statuses are not eligible' -TestCases @(
+            @{ S = 'expired' }, @{ S = 'unauthorized' }, @{ S = 'no-oauth' }, @{ S = 'error' }
+        ) {
+            Param ($S)
+            $row = [pscustomobject]@{ Status = $S; Data = $null }
+            Test-WarmEligible -Row $row -Now $script:Now | Should -BeFalse
+        }
+    }
+
     Context 'Invoke-KeepWarmStep' {
         # The per-poll keep-warm step for `-Watch -Warmup`. Mirrors
         # Invoke-AutoRotationStep: decides which slots have a CLOSED 5h
@@ -2944,13 +3062,34 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' }
         }
 
-        It 'skips non-ok rows even when their window is closed' {
+        It 'skips hard-fail rows (expired / unauthorized / no-oauth / error)' {
+            # A `claude -p` cannot fix these and would burn a billable call.
             $snap = New-KwSnapshot @(
                 (New-KwRow -Name 'a' -Status 'expired'),
-                (New-KwRow -Name 'b' -Status 'rate-limited')
+                (New-KwRow -Name 'b' -Status 'unauthorized'),
+                (New-KwRow -Name 'c' -Status 'no-oauth'),
+                (New-KwRow -Name 'd' -Status 'error')
             )
             $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Keeping all slots warm.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 're-warms a rate-limited slot (recoverable via claude -p)' {
+            # The recovery path out of the "frozen on rate-limited until
+            # restart" state: a real `claude -p` refreshes tokens through
+            # Claude Code's own OAuth flow and reopens the 5h window.
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
+            $out  = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'b' -and @($Names).Count -eq 1 }
+            $out | Should -Match "^\[Warmup\] Re-warmed 'b' at"
+        }
+
+        It 'reports a throttled-but-cooling latch when rate-limited slots are all within cooldown' {
+            $times = @{ 'b' = [DateTime]::Now }   # just attempted
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
+            $out   = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out | Should -Be '[Warmup] Rate-limited; will re-warm when cooldown clears.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 

@@ -185,7 +185,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '2.4.0'
+$Script:ScriptVersion = '2.5.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -249,12 +249,33 @@ $Script:ProfileTimeoutSec   = 10
 $Script:TokenRefreshRetryMax     = 3
 $Script:TokenRefreshRetryDelayMs = 2000
 
-# Cache of the last successful /api/oauth/usage response per slot path.
-# Used as a fallback when the endpoint returns 429 (rate limited) so the
-# watch display stays functional during rate-limited periods. Entries
-# expire after $Script:UsageCacheTTL minutes.
+# Per-slot record of the last /api/oauth/usage attempt, keyed by slot path.
+# Single source of truth for everything Get-SlotUsage remembers between
+# polls; one structure rather than two parallel maps so the data and the
+# throttle state cannot drift apart. Entry shape:
+#
+#   @{ Data; Timestamp; RateLimitedUntil }
+#
+#   Data             last successful response body (the fallback served on a
+#                    429 so the watch display keeps last-known percentages).
+#   Timestamp        when Data was captured; fresh < $Script:UsageCacheTTL min.
+#   RateLimitedUntil [DateTime] (UtcNow + $Script:RateLimitBackoffSec) set on
+#                    every 'rate-limited' return; absent/past otherwise. While
+#                    in the future Get-SlotUsage short-circuits to the cache
+#                    WITHOUT any token/usage HTTP, so a sustained 429 stops the
+#                    loop re-hitting (and re-tripping) a hot limiter every poll
+#                    -- the quiet window a process restart used to provide by
+#                    accident. A successful read replaces the whole entry,
+#                    clearing the backoff; warmup clears it explicitly before
+#                    its verify read (Invoke-WarmAllSlots).
 $Script:SlotUsageCache = @{}
 $Script:UsageCacheTTL  = 10
+
+# Seconds to suppress live token/usage HTTP for a slot after it returns
+# 'rate-limited' (see RateLimitedUntil above). Short enough to re-probe
+# within a poll or two once the throttle likely clears, long enough to break
+# the per-poll refresh storm on an expired idle-slot token. Tunable for tests.
+$Script:RateLimitBackoffSec = 120
 
 # Plan-usability thresholds used by Get-PlanStatus / Format-UsageTable /
 # Format-UsageVerbose. The Status column on the usage table mixes HTTP
@@ -2198,6 +2219,33 @@ function Get-CachedUsageOrNull {
     return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
 }
 
+# Mark a slot as throttled: stamp RateLimitedUntil on its cache entry so the
+# next Get-SlotUsage short-circuits to the cache without any token/usage HTTP
+# (see $Script:SlotUsageCache). Updates the EXISTING entry only -- a slot with
+# no prior successful read has no data to protect, so it keeps the legacy
+# retry-once behaviour and never gets a data-less marker entry (which would
+# complicate Get-CachedUsageOrNull's staleness math). The common runaway this
+# guards -- an idle non-active slot whose token expired and whose refresh now
+# 429s every poll -- always has a prior cache entry from earlier in the session.
+function Set-SlotRateLimitBackoff {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+    if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
+        $Script:SlotUsageCache[$SlotPath].RateLimitedUntil = [DateTime]::UtcNow.AddSeconds($Script:RateLimitBackoffSec)
+    }
+}
+
+# Drop a slot's backoff stamp so the next Get-SlotUsage probes live again,
+# keeping any cached Data intact. Called by Invoke-WarmAllSlots right before
+# its post-activation verify read: a fresh `claude -p` is evidence the throttle
+# may be over, and without this the verify read would be suppressed by the very
+# backoff it is trying to recover from.
+function Clear-SlotRateLimitBackoff {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+    if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
+        $Script:SlotUsageCache[$SlotPath].Remove('RateLimitedUntil')
+    }
+}
+
 # Read a slot's OAuth tokens and return a non-expired access token,
 # refreshing via /v1/oauth/token first if the cached token is past or
 # within 60s of its expiry. Shared prelude for Get-SlotUsage and
@@ -2287,12 +2335,26 @@ function Get-SlotUsage {
     # in Get-SlotProfile.
     $ProgressPreference = 'SilentlyContinue'
 
+    # Backoff short-circuit: if a recent 429 stamped RateLimitedUntil into the
+    # future, serve the last-known data WITHOUT any token/usage HTTP. This is
+    # what stops a sustained throttle from re-hitting (and re-tripping) a hot
+    # limiter every poll -- the self-inflicted load a process restart used to
+    # shed by accident. Status stays 'rate-limited' (honest: we are throttled,
+    # just not re-confirming) so the keep-warm step can recover the slot.
+    $entry = $Script:SlotUsageCache[$SlotPath]
+    if ($entry -and $entry.RateLimitedUntil -and [DateTime]::UtcNow -lt $entry.RateLimitedUntil) {
+        return [pscustomobject]@{ Status = 'rate-limited'; Data = $entry.Data; IsCachedFallback = $true }
+    }
+
     # Resolve a non-expired access token (refresh if needed). Rate-
     # limited from the token endpoint gets the cache-fallback path here;
     # other non-ok statuses return verbatim.
     $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
     if ($tok.Status -ne 'ok') {
         if ($tok.Status -eq 'rate-limited') {
+            # Stamp the backoff so subsequent polls stop hammering the token
+            # endpoint (the expired-idle-slot refresh storm).
+            Set-SlotRateLimitBackoff -SlotPath $SlotPath
             $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
             if ($cached) { return $cached }
             # Last resort: keep the last-known percentages visible (marked
@@ -2350,6 +2412,11 @@ function Get-SlotUsage {
         #   3. No cache yet -> one retry after a short delay; the original
         #                      back-to-back-poll-collision case.
         if ($status -eq 429) {
+            # Stamp the backoff (no-op when no prior entry exists; see
+            # Set-SlotRateLimitBackoff). Done before the cache lookups below;
+            # it only adds RateLimitedUntil to an existing entry, so it does
+            # not disturb the ContainsKey retry decision that follows.
+            Set-SlotRateLimitBackoff -SlotPath $SlotPath
             $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
             if ($cached) { return $cached }
             # Cache miss vs stale-entry both reach this point. If the
@@ -4394,6 +4461,11 @@ function Invoke-WarmAllSlots {
                     # shows live percentages immediately instead of
                     # 'ok (no plan data)'. Neither call throws.
                     Invoke-Reconcile 6>$null | Out-Null
+                    # Drop any backoff stamp first: a successful activation is
+                    # evidence the throttle may be over, and the verify read
+                    # must probe live rather than be short-circuited by the
+                    # backoff it is recovering from.
+                    Clear-SlotRateLimitBackoff -SlotPath $row.Path
                     $u = Get-SlotUsage -SlotPath $row.Path 6>$null
                     $row.Status           = $u.Status
                     $row.Data             = $u.Data
@@ -4443,14 +4515,13 @@ function Invoke-WarmAllSlots {
 # slot warm instead of letting them all expire ~5h after startup and never
 # restart (the one-shot startup pass was the whole of warmup before this).
 #
-# A slot needs re-warming when its row is HTTP-ok AND its five_hour bucket
-# reports no OPEN window (bucket missing, or resets_at null / already past;
-# a mid-window slot always carries a future resets_at). Non-ok rows
-# (expired / unauthorized / rate-limited / no-oauth / error) are skipped:
-# warming them just fails again and burns a billable `claude -p`. A 5h
-# window can only be RE-opened after it closes (sending a message earlier
-# just adds to the open window without renewing it), so this is reactive by
-# necessity, not by choice.
+# Warm-eligibility is decided by Test-WarmEligible: an HTTP-ok slot whose
+# five_hour window is closed/unknown, OR a 'rate-limited' slot (whose throttle
+# a real `claude -p` through Claude Code's own OAuth flow can clear -- this is
+# the recovery path out of the "frozen on rate-limited until restart" state).
+# expired / unauthorized / no-oauth / error rows are NOT eligible: a `claude -p`
+# would not fix them and would burn a billable call. A 5h window can only be
+# RE-opened after it closes, so for ok slots this is reactive by necessity.
 #
 # $WarmupTimes (slot name -> last attempt [DateTime], mutated in place)
 # gates repeated attempts via $Script:WarmupCooldownMin. A successful warm
@@ -4470,6 +4541,35 @@ function Invoke-WarmAllSlots {
 # The footer latch explains the brief lag where the table still shows a
 # just-warmed row as cold. Never throws: a warm-path exception is caught and
 # surfaced as a '[Warmup] Re-warm failed! ...' line so the loop never aborts.
+
+# Pure predicate deciding whether the keep-warm step should re-open a slot's
+# 5h window this tick. Extracted from Invoke-KeepWarmStep so the eligibility
+# policy is unit-testable without the orchestration (swap / activate / mirror)
+# and its mocks. $Now is the current UTC instant (passed in for determinism).
+#
+#   'rate-limited' -> eligible: cached window data can't be trusted, and a real
+#                     `claude -p` can clear the throttle and refresh tokens.
+#   'ok'           -> eligible only when the five_hour window is closed/unknown
+#                     (bucket missing, or resets_at null / already past). A
+#                     mid-window slot carries a FUTURE resets_at: leave it.
+#   anything else  -> not eligible (expired / unauthorized / no-oauth / error):
+#                     a billable `claude -p` would not fix it.
+function Test-WarmEligible {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Row,
+        [Parameter(Mandatory)] [DateTimeOffset] $Now
+    )
+
+    if ($Row.Status -eq 'rate-limited') { return $true }
+    if ($Row.Status -ne 'ok')          { return $false }
+
+    $reset = $null
+    if ($Row.Data -and $Row.Data.five_hour) {
+        $reset = ConvertTo-DateTimeOffsetOrNull $Row.Data.five_hour.resets_at
+    }
+    return -not ($null -ne $reset -and $reset -gt $Now)
+}
+
 function Invoke-KeepWarmStep {
     Param (
         [Parameter(Mandatory)] [pscustomobject] $Snapshot,
@@ -4486,14 +4586,7 @@ function Invoke-KeepWarmStep {
     $nowUtc = [DateTimeOffset]::UtcNow
     $cold   = @(
         foreach ($r in $results) {
-            if ($r.Status -ne 'ok') { continue }
-
-            $reset = $null
-            if ($r.Data -and $r.Data.five_hour) {
-                $reset = ConvertTo-DateTimeOffsetOrNull $r.Data.five_hour.resets_at
-            }
-            # A future reset means the window is still open: leave it alone.
-            if ($null -ne $reset -and $reset -gt $nowUtc) { continue }
+            if (-not (Test-WarmEligible -Row $r -Now $nowUtc)) { continue }
 
             $last = $WarmupTimes[$r.Name]
             if ($last -and ($now - $last).TotalMinutes -lt $CooldownMin) { continue }
@@ -4502,7 +4595,17 @@ function Invoke-KeepWarmStep {
         }
     )
 
-    if ($cold.Count -eq 0) { return $CurrentLatch }
+    if ($cold.Count -eq 0) {
+        # Nothing to warm this tick. If slots are throttled but currently held
+        # off (cooldown not yet elapsed), say so rather than keep claiming
+        # "Keeping all slots warm." -- that line is only honest when every slot
+        # is genuinely warm. The yellow rate-limit advisory above the table
+        # already names which slots are affected.
+        if (@($results | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0) {
+            return '[Warmup] Rate-limited; will re-warm when cooldown clears.'
+        }
+        return $CurrentLatch
+    }
 
     if (Test-ClaudeRunning) {
         return '[Warmup] Re-warm refused! Claude Code is running.'
