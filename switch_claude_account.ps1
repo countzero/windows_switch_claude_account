@@ -78,8 +78,9 @@ Param (
     # anchor of its own (its set is selected by the positional Action,
     # which parameter sets cannot key off). [ValidateRange] rejects zero /
     # negatives at bind time; the 60-second floor is a runtime
-    # clamp-with-advisory inside Invoke-UsageWatch (see AGENTS.md "Watch
-    # mode"). Ignored by actions other than `usage -Watch` / `monitor`.
+    # clamp-with-advisory inside Invoke-UsageWatch (see "Watch mode" in
+    # .claude/rules/script-internals.md). Ignored by actions other than
+    # `usage -Watch` / `monitor`.
     [ValidateRange(1, [int]::MaxValue)]
     [int] $Interval = 60,
 
@@ -507,7 +508,7 @@ function Update-ScaState {
 # `~/.claude.json` config file. The /status screen's "Email:" line reads
 # `oauthAccount.emailAddress` from this cache; the cache is populated once at
 # login (from /api/oauth/profile) and is NOT refreshed on subsequent token
-# refreshes (see binary RE in AGENTS.md). This file is therefore the single
+# refreshes. This file is therefore the single
 # authoritative source of "what email is Claude Code displaying right now."
 #
 # sca uses ~/.claude.json two ways:
@@ -522,7 +523,7 @@ function Update-ScaState {
 # in an in-memory cache (Un.config) that is not auto-invalidated on external
 # changes, and a flush from a running Claude Code instance would silently
 # overwrite our oauthAccount mutation. Refuse-while-running is the chosen
-# mitigation; see decision (2) in AGENTS.md's planning history.
+# mitigation.
 
 # Returns $true if any process named 'claude' is running on the host.
 # Get-Process enumerates processes from ALL users on the system (limited
@@ -631,7 +632,7 @@ function Get-SHA256Hex {
 # would wipe Claude Code's cached identity when the sidecar carries the
 # /api/oauth/profile-fallback's null defaults) is blocked.
 #
-# Pre-flight test (AGENTS.md history) verified this approach: editing
+# A pre-flight test verified this approach: editing
 # emailAddress and restarting Claude Code makes /status report the new
 # value, and the rest of the file round-trips byte-equal.
 #
@@ -1526,8 +1527,7 @@ function Invoke-SaveAction {
     # in-memory cache and may flush back to disk at any moment. Saving
     # while Claude Code runs would silently capture stale identity into
     # the sidecar AND risk overwriting our writes if a flush races our
-    # write. Refuse-while-running is the chosen mitigation; see
-    # AGENTS.md's planning history for the binary-RE rationale.
+    # write. Refuse-while-running is the chosen mitigation.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca save' so identity capture is consistent."
     }
@@ -1761,7 +1761,7 @@ function Invoke-SwitchAction {
     # oauthAccount block from the destination slot's sidecar, and a
     # running Claude Code instance keeps that file in an in-memory
     # cache that may flush and clobber our update. Refusing is the
-    # simplest reliability guarantee; see AGENTS.md's planning history.
+    # simplest reliability guarantee.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca switch' so the email-display change applies cleanly."
     }

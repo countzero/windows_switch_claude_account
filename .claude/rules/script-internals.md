@@ -162,9 +162,8 @@ Header line + table:
   }
   // Plus internal/unreleased buckets (null for external subs):
   // seven_day_oauth_apps, seven_day_cowork, seven_day_omelette,
-  // iguana_necktie, omelette_promotional. Format-UsageVerbose iterates
-  // $Data.PSObject.Properties so any future non-null bucket surfaces
-  // with a '? <key>' prefix without code changes.
+  // iguana_necktie, omelette_promotional. These are NOT rendered in any
+  // view; they round-trip only via -Json.
 }
 ```
 
@@ -204,7 +203,7 @@ Self-refreshing live view. Re-polls every `-Interval` seconds (default + floor *
 - VT control sequences emitted via `Write-VTSequence` (which calls `[Console]::Out.Write` + `Flush`) so they bypass the `Write-Host` -> `StringDecorated.AnsiRegex` filter that `OutputRendering = 'PlainText'` (set by `-NoColor` / `NO_COLOR`) applies. The filter strips DEC private modes (`ESC[?...h/l`) including the DEC 2026 envelope and the `ESC[?1049h` alt-buffer toggle, which would re-introduce the pre-`36e5e27` flicker. Verified against PowerShell `StringDecorated.cs`.
 
 **Design split**:
-- `Get-UsageSnapshot`: pure data-gathering: enumerates slots, calls `Get-SlotUsage`, returns `{ Results, NoSlots, HasCacheFallback }`. Never renders. Used by both one-shot and watch paths. Reconcile runs once per poll boundary.
+- `Get-UsageSnapshot`: pure data-gathering: enumerates slots, calls `Get-SlotUsage`, returns `{ Results, NoSlots, HasCacheFallback, HasRateLimited }`. Never renders. Used by both one-shot and watch paths. Reconcile runs once per poll boundary.
 - `Format-UsageFrame`: pure renderer: snapshot + optional footer → table-or-verbose + optional advisory + footer. Used identically from both paths.
 - `Invoke-UsageWatch`: the loop itself (untested). Alt-buffer + sync-mode wrapper around `Format-UsageFrame` on a 1 s `Start-Sleep` tick. No keyboard listeners; Ctrl-C terminates via runtime default; `finally` emits `ESC[?25h` + `ESC[?1049l` and restores `[Console]::CursorVisible`.
 

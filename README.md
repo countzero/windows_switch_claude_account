@@ -120,7 +120,7 @@ When the slot name already equals the OAuth email, the filename is deduplicated 
 
 ```powershell
 sca usage                         # one-shot table for every slot
-sca usage work                    # verbose single-slot block (opus / sonnet / overage)
+sca usage work                    # verbose single-slot block (Session / Week, absolute reset times)
 sca usage -Json                   # machine-readable per-slot output
 sca usage -NoColor                # strip ANSI color (also: $env:NO_COLOR='1')
 ```
@@ -149,7 +149,7 @@ sca usage work
   <img src="docs/images/usage-verbose.svg" alt="sca usage work: yellow [Usage] header, dim Account line, green Status: ok, then Session and Week rows with absolute reset times in Europe/Berlin" width="720">
 </p>
 
-`list`, `switch`, and `usage` run a quiet **reconcile** pass before doing their work: if `.credentials.json` has changed since the last sync (Claude Code refreshed a token, or you logged into a different account inside Claude Code), the new bytes are captured into the tracked slot, or auto-saved under `auto-<UTC-timestamp>(<email>).json` if the email differs.
+`list`, `switch`, `usage`, `warmup`, and `monitor` (per poll) run a quiet **reconcile** pass before doing their work: if `.credentials.json` has changed since the last sync (Claude Code refreshed a token, or you logged into a different account inside Claude Code), the new bytes are captured into the tracked slot, or auto-saved under `auto-<UTC-timestamp>(<email>).json` if the email differs.
 
 > [!WARNING]
 > **Unofficial API.** `sca usage` calls `api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` uses internally. Undocumented by Anthropic and may break on Claude Code upgrades; when that happens, see the extraction recipe at the top of `switch_claude_account.ps1` to re-pin the constants. The endpoint is not a public API and may be changed or withdrawn at Anthropic's discretion; use accordingly.
@@ -246,11 +246,12 @@ If Claude Code is running when you invoke `save` or `switch`, the action exits i
 ## Windows Notes
 
 ### Name sanitization
-Spaces, Windows-invalid filename characters (`\ / : * ? " < > |` and control chars), and PowerShell wildcard brackets (`[` `]`) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected.
+Spaces, Windows-invalid filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and parentheses (`(` `)`) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected.
 
 - `my personal` → `my_personal`
 - `foo/bar` → `foo_bar`
 - `foo[bar]` → `foo_bar_`
+- `foo(bar)` → `foo_bar_`
 - `foo.` → `foo`
 - `CON` → error (reserved device name)
 
