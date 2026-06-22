@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-06-22
+
+### Added
+- `sca monitor` action: the live, side-effecting supervisor. It always auto-rotates to the next eligible slot when the active slot reaches `-Threshold` (default 95), and `-KeepWarm` additionally keeps every slot warm by re-opening closed 5h windows on each poll. Auto-rotation remains OpenCode-scoped and refuses to run while Claude Code is open.
+
+### Changed
+- **BREAKING**: `sca usage` is now read-only. It keeps `[name]`, `-Watch`, `-Interval`, and `-Json`; the live auto-rotation and keep-warm modes moved to the new `sca monitor` action.
+- **BREAKING**: auto-rotation is invoked as `sca monitor` (rotation is unconditional, so there is no `-Auto` flag) instead of `sca usage -Watch -Auto`. Tune the rotation point with `sca monitor -Threshold <n>`.
+- **BREAKING**: keep-warm is invoked as `sca monitor -KeepWarm` instead of `sca usage -Watch -Warmup`.
+- The auto-rotation watch footer is now labelled `[Monitor]` (was `[Auto]`); the keep-warm footer keeps the `[Warmup]` label it shares with the standalone `warmup` action.
+- `sca` help corrects the FILES section to the real slot filename (`.credentials.<name>(<email>).json` plus the `.account.json` sidecar and `.sca-state.json` state file).
+
+### Removed
+- **BREAKING**: the `-Auto`, `-Threshold`, and `-Warmup` flags on `sca usage`. Use `sca monitor` / `sca monitor -Threshold <n>` / `sca monitor -KeepWarm`.
+
+## [2.5.0] - 2026-06-18
+
+### Changed
+- `sca usage -Watch -Warmup` now keeps every slot warm for the life of the watch: in addition to the startup pass it re-opens any slot whose 5h session window has closed, checked at each poll, so the slots no longer all expire ~5h after startup and stay dark. A per-slot cooldown (`$Script:WarmupCooldownMin`, default 5 min) bounds repeated re-warms of a slot whose warm attempt keeps failing. Still combines with `-Auto`.
+- `sca usage -Watch -Warmup` now also re-warms a slot whose status is `rate-limited` (not only one whose 5h window has closed), so a slot throttled on the unofficial usage/token endpoint recovers through a real `claude -p` instead of staying inert. The per-slot cooldown still bounds repeated attempts. Warm-eligibility moved into the pure `Test-WarmEligible` predicate.
+
+### Fixed
+- `sca usage -Watch` no longer stays frozen on `rate-limited` until the process is restarted. After a 429, a slot's live token/usage HTTP is suppressed for a short backoff window (`$Script:RateLimitBackoffSec`, default 120 s) recorded on its cache entry, so the watch loop stops re-hitting (and re-tripping) a hot rate limiter every poll and recovers on the next clear poll or warm pass. The `[Warmup] Keeping all slots warm.` footer now reports when slots are throttled and awaiting re-warm instead of claiming everything is warm.
+
 ## [2.4.0] - 2026-06-17
 
 ### Added

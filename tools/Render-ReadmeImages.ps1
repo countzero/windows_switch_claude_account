@@ -6,8 +6,9 @@
     `charmbracelet/freeze`.
 
 .DESCRIPTION
-    The README.md embeds three ANSI terminal blocks that demonstrate
-    `sca usage`, `sca usage -Watch`, and `sca usage <name>` output. Plain
+    The README.md embeds four ANSI terminal blocks that demonstrate
+    `sca usage`, `sca usage -Watch`, `sca usage <name>`, and `sca monitor`
+    output. Plain
     code-fences cannot show the colors that the live tool emits, so this
     script splices ANSI SGR escapes into the README's literal text and
     pipes the result to `freeze` to produce SVGs.
@@ -188,8 +189,8 @@ $verboseLines = @(
     "  Week        42%  Resets Apr 28, 9am Europe/Berlin"
 )
 
-# --- Block 4: usage -Watch -Auto -------------------------------------------
-# Same five-row watch frame as Block 1, plus the two auto-mode artifacts:
+# --- Block 4: monitor ------------------------------------------------------
+# Same five-row watch frame as Block 1, plus the two auto-rotation artifacts:
 #
 #   1. Right-aligned header indicator '▶ switching slot at 95%'. Glyph
 #      in Gray (white-ish, high-contrast lozenge); text in DarkGray
@@ -209,7 +210,7 @@ $verboseLines = @(
 #      branch in Format-UsageTable, switch_claude_account.ps1:2816-2818)
 #      to balance the visually busier right-aligned indicator.
 #
-#   3. Latched '[Auto] Rotated from "<from>" to "<to>" at HH:mm:ss'
+#   3. Latched '[Monitor] Rotated from "<from>" to "<to>" at HH:mm:ss'
 #      footer line above the '[Watch] Last poll' line. Wording matches
 #      Invoke-AutoRotationStep at switch_claude_account.ps1:3607.
 #      Narrative: the active slot in the table (marked with '*') is
@@ -238,7 +239,7 @@ $watchAutoLines = @(
     "$YELLO    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit$RESET",
     "$RED    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d$RESET",
     "",
-    "$DKGRY[Auto] Rotated from `"legacy`" to `"work`" at 14:31:58$RESET",
+    "$DKGRY[Monitor] Rotated from `"legacy`" to `"work`" at 14:31:58$RESET",
     "$DKGRY[Watch] Last poll at 14:32:07$RESET"
 )
 
@@ -246,7 +247,7 @@ $scenarios = @(
     [pscustomobject]@{ Name = 'usage-watch';      Lines = $watchLines     },
     [pscustomobject]@{ Name = 'usage-table';      Lines = $tableLines     },
     [pscustomobject]@{ Name = 'usage-verbose';    Lines = $verboseLines   },
-    [pscustomobject]@{ Name = 'usage-watch-auto'; Lines = $watchAutoLines }
+    [pscustomobject]@{ Name = 'monitor';          Lines = $watchAutoLines }
 )
 
 # --- Render -----------------------------------------------------------------
@@ -272,10 +273,11 @@ $scenarios = @(
 #                          gain empty dark space on the right; that's the
 #                          deliberate cost of uniform on-screen sizing.
 #
-#                          README contract: the four <img> refs in README.md
-#                          cap rendering at this width (width="720" HTML
-#                          attribute, 1x intrinsic). If you change --width
-#                          here in either direction, change the four width
+#                          README contract: the five <img> refs in README.md
+#                          (monitor.svg is referenced twice) cap rendering at
+#                          this width (width="720" HTML attribute, 1x
+#                          intrinsic). If you change --width here in either
+#                          direction, change the five width
 #                          values in README.md to match: width below --width
 #                          crops the panel; width above --width re-introduces
 #                          blurry upscaling of the embedded monospace text.

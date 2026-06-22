@@ -213,7 +213,7 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Show-Help' {
-        It 'prints the ACTIONS header and lists all 8 actions' {
+        It 'prints the ACTIONS header and lists the slot/operation actions' {
             $out = Show-Help 6>&1 | Out-String
 
             $out | Should -Match 'ACTIONS'
@@ -222,28 +222,43 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'list'
             $out | Should -Match 'remove <name>'
             $out | Should -Match 'usage \[name\]'
+            $out | Should -Match 'monitor'
+            $out | Should -Match 'warmup \[name\]'
             $out | Should -Match 'install'
             $out | Should -Match 'uninstall'
-            $out | Should -Match 'help, -h'
         }
 
-        It 'documents the -NoColor option and the NO_COLOR env var' {
+        It 'documents the monitor options (-Threshold / -KeepWarm)' {
             $out = Show-Help 6>&1 | Out-String
             $out | Should -Match 'OPTIONS'
-            $out | Should -Match '-NoColor'
-            $out | Should -Match 'NO_COLOR'
+            $out | Should -Match '-Threshold'
+            $out | Should -Match '-KeepWarm'
         }
 
-        # Without the install action's profile aliases, Get-Alias returns
-        # nothing and Show-Help prints '.\switch_claude_account.ps1' (the
-        # default test environment). When the alias IS present (post-
-        # install or sourced via a profile that runs the install block),
-        # the USAGE line should print 'sca' instead. Pin both branches.
-        It 'uses the sca alias in USAGE when Get-Alias sca resolves' {
-            Set-Alias -Name sca -Value $script:ScriptPath -Scope Local
+        It 'documents the -NoColor option under the GLOBAL options group' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'GLOBAL'
+            $out | Should -Match '-NoColor'
+        }
+
+        # Help moved -h / -Help into the GLOBAL options group (no standalone
+        # 'help' action line in the displayed help).
+        It 'documents -h / -Help in the options instead of an ACTIONS entry' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match '-h, -Help'
+        }
+
+        # Help is written with the canonical 'sca' invocation (matching every
+        # other user-facing message in the script), not a conditional path.
+        It 'shows the sca invocation in USAGE' {
             $out = Show-Help 6>&1 | Out-String
             $out | Should -Match 'sca <action>'
-            $out | Should -Not -Match '\.\\switch_claude_account\.ps1 <action>'
+        }
+
+        It 'groups the actions under MANAGEMENT and OPERATIONS' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'MANAGEMENT'
+            $out | Should -Match 'OPERATIONS'
         }
 
         It 'documents the -Version option' {
@@ -307,6 +322,41 @@ Describe 'switch_claude_account' {
             $m = [regex]::Match($changelog, '##\s+\[(\d+\.\d+\.\d+)\]\s+-\s+\d{4}-\d{2}-\d{2}')
             $m.Success           | Should -BeTrue
             $Script:ScriptVersion | Should -Be $m.Groups[1].Value
+        }
+    }
+
+    Context 'monitor dispatch and flag-misuse guards' {
+        # Invoke-Main routes the `monitor` action to Invoke-MonitorAction and
+        # rejects the switch flags that belong to the other live verb
+        # (-Watch / -Json on monitor; -KeepWarm anywhere but monitor). Same
+        # dynamic-scope pattern as the '-Version flag' context: assign the
+        # Param() variables in the It body and let Invoke-Main read them.
+
+        It 'routes the monitor action to Invoke-MonitorAction' {
+            Mock Invoke-MonitorAction { }
+            $Action = 'monitor'
+            Invoke-Main
+            Should -Invoke Invoke-MonitorAction -Times 1 -Exactly
+        }
+
+        It 'rejects -Watch on monitor with a pointer to usage -Watch' {
+            $Action = 'monitor'
+            $Watch  = $true
+            { Invoke-Main 6>$null } | Should -Throw -ExpectedMessage "*sca usage -Watch*"
+        }
+
+        It 'rejects -Json on monitor' {
+            $Action = 'monitor'
+            $Json   = $true
+            { Invoke-Main 6>$null } | Should -Throw -ExpectedMessage "*monitor*"
+        }
+
+        It 'rejects -KeepWarm on a non-monitor action' {
+            Mock Invoke-UsageAction { }
+            $Action   = 'usage'
+            $KeepWarm  = $true
+            { Invoke-Main 6>$null } | Should -Throw -ExpectedMessage "*-KeepWarm applies only*"
+            Should -Invoke Invoke-UsageAction -Times 0
         }
     }
 
@@ -992,6 +1042,45 @@ Describe 'switch_claude_account' {
                     'suppress information stream; the [Switch] advisory ' +
                     'on ~/.claude.json write failure would flash sub-frame ' +
                     'before the next watch frame ESC[2J wipes it.')
+            }
+        }
+
+        It 'Invoke-KeepWarmStep suppresses Invoke-WarmAllSlots information stream' {
+            # Sibling assertion to the Invoke-AutoRotationStep check above:
+            # the re-warm arm of Invoke-KeepWarmStep calls Invoke-WarmAllSlots,
+            # whose nested Invoke-SlotSwap / Invoke-Reconcile / Get-SlotUsage
+            # emit yellow advisories (e.g. [Warmup] restore-failure, [Sync]
+            # token-propagation). Keep-warm owns its own footer line; the
+            # inner advisory would flash sub-frame before the next ESC[2J.
+            #
+            # Walk CommandAst nodes (real invocations) rather than regexing
+            # the body text, so a comment mentioning Invoke-WarmAllSlots is
+            # not mistaken for a call site missing its 6>$null.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-KeepWarmStep'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-KeepWarmStep must exist'
+
+            $warmInvocations = @($func.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.CommandAst]
+            }, $true) | Where-Object { $_.GetCommandName() -eq 'Invoke-WarmAllSlots' })
+            $warmInvocations.Count | Should -BeGreaterOrEqual 1 -Because 're-warm arm must call Invoke-WarmAllSlots'
+
+            foreach ($cmd in $warmInvocations) {
+                $hasInfoSuppression = @($cmd.Redirections | Where-Object {
+                    $_ -is [System.Management.Automation.Language.FileRedirectionAst] -and
+                    $_.FromStream -eq [System.Management.Automation.Language.RedirectionStream]::Information
+                }).Count -gt 0
+                $hasInfoSuppression | Should -BeTrue -Because (
+                    'Invoke-WarmAllSlots inside Invoke-KeepWarmStep must ' +
+                    'suppress information stream (6>$null); its nested ' +
+                    'advisories would flash sub-frame before the next watch ' +
+                    'frame ESC[2J wipes them.')
             }
         }
     }

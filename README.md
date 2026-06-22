@@ -2,20 +2,33 @@
 
 [![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.2+](https://img.shields.io/badge/PowerShell-7.2%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
 
-A zero-dependency PowerShell tool for Claude Code on Windows: a **live plan-usage dashboard** across multiple accounts with optional **auto-rotation** when a slot hits its limit, plus safe save / switch / rotate. Single self-contained `.ps1`, no companion files.
+A zero-dependency PowerShell utility for Claude Code on Windows that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
 
 <p align="center">
-  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Auto] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+  <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 ## Features
 
-- **Live plan-usage dashboard**: `sca usage -Watch` polls Anthropic's `/api/oauth/usage` and renders a flicker-free, auto-refreshing view of Session (5h) and Week (7d) limits across every slot; the terminal-tab title is updated each poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab
+**Account & identity**
+
 - **Identity-aware slots**: each slot's OAuth email is captured at save time, baked into the filename, and locked in a sidecar; what you see in `list` is guaranteed to be who the tokens actually belong to
-- **Auto-reconcile**: silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
-- **Transparent token refresh**: expired access tokens are refreshed before usage queries and mirrored back into the active credentials file
-- **Atomic-safe writes**: slot-file updates survive a running Claude Code via `MoveFileEx` with retry; `save` / `switch` still refuse to run while it's open (single source of truth on `~/.claude.json`)
 - **Named slots with rotation**: unlimited accounts under any name (Windows-invalid characters auto-sanitized); `sca switch` with no name cycles through them alphabetically
+
+**Live usage monitoring**
+
+- **Live plan-usage dashboard**: `sca usage -Watch` polls Anthropic's `/api/oauth/usage` and renders a flicker-free, auto-refreshing view of Session (5h) and Week (7d) limits across every slot; the terminal-tab title is updated each poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab
+- **Transparent token refresh**: expired access tokens are refreshed before usage queries and mirrored back into the active credentials file
+
+**Automation**
+
+- **Auto-reconcile**: silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
+- **Smart rotation (OpenCode only)**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); refuses to run while Claude Code is open
+- **Cold-slot warmup**: `sca warmup` (and `sca monitor -KeepWarm`) opens each dormant slot's 5h window by running the real Claude Code CLI, so Anthropic reports usage data for every account (billable)
+
+**Reliability & footprint**
+
+- **Atomic-safe writes**: slot-file updates use `MoveFileEx` with retry so they survive a running Claude Code on `.credentials.json`; `save` / `switch` still refuse to run while it's open to protect `~/.claude.json`
 - **Zero dependencies**: pure PowerShell 7.2+, no external packages, no companion assets
 
 ## Installation
@@ -173,29 +186,31 @@ Anthropic only reports `/api/oauth/usage` data for slots that have an open serve
 ```powershell
 sca warmup                            # warm every slot once, print the table, exit
 sca warmup slot-2                     # warm just one slot
-sca usage -Watch -Warmup              # warm all slots, then keep watching
-sca usage -Watch -Auto -Warmup        # warm + auto-rotate (recommended pairing)
+sca monitor -KeepWarm                 # auto-rotate AND keep every slot warm for the whole watch
 ```
 
-Warmup refuses to operate while Claude Code is running (the per-slot swap writes `~/.claude.json`) and requires the `claude` CLI to be installed and logged in. A slot whose token refresh is temporarily rate-limited is reported and skipped, not retried. Pair `-Warmup` with `-Auto` for the typical use case: `-Auto` needs every peer slot reporting real data to make rotation decisions.
+`sca monitor -KeepWarm` does more than the one-shot pass: at each poll it re-opens any slot whose 5h window has since closed, so a long session keeps every slot warm instead of letting them all expire ~5h after startup. (A 5h window can only be reopened *after* it closes, so a just-expired slot is re-warmed within one poll, not before.) A per-slot cooldown keeps a slot whose warm keeps failing from being retried every poll.
+
+Both `sca warmup` and `sca monitor -KeepWarm` refuse to operate while Claude Code is running (the per-slot swap writes `~/.claude.json`) and require the `claude` CLI to be installed and logged in. A slot whose token refresh is temporarily rate-limited is reported and skipped, not retried. `-KeepWarm` is the typical companion to `monitor`: rotation needs every peer slot reporting real data to make good decisions, which keeping them warm guarantees.
 
 ### Auto-rotate on usage limit (OpenCode only)
 
-Add `-Auto` to the watch loop to auto-rotate to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold:
+`sca monitor` is a live watch that auto-rotates to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold. Rotation is what `monitor` is for, so it is always on (there is no `-Auto` flag); for a read-only live view use `sca usage -Watch` instead.
 
 ```powershell
-sca usage -Watch -Auto                  # rotate when active slot hits 95% (default)
-sca usage -Watch -Auto -Threshold 90    # rotate earlier on either bucket
+sca monitor                  # rotate when active slot hits 95% (default)
+sca monitor -Threshold 90    # rotate earlier on either bucket
+sca monitor -KeepWarm        # also keep every slot warm (billable)
 ```
 
-Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Auto] No free slot available! Cooling down for 1h 12m.`. Auto-mode is indicated on every frame by a right-aligned `▶ switching slot at N%` header indicator plus a latched `[Auto] …` footer line.
+Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Monitor] No free slot available! Cooling down for 1h 12m.`. The mode is indicated on every frame by a right-aligned `▶ switching slot at N%` header indicator plus a latched `[Monitor] …` footer line.
 
 <p align="center">
-  <img src="docs/images/usage-watch-auto.svg" alt="sca usage -Watch -Auto: same five-row slot table as the watch view, with a right-aligned '▶ switching slot at 95%' header indicator and a '[Auto] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+  <img src="docs/images/monitor.svg" alt="sca monitor: same five-row slot table as the watch view, with a right-aligned '▶ switching slot at 95%' header indicator and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 > [!IMPORTANT]
-> **OpenCode-scoped feature.** Requires [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, which re-reads `~/.claude/.credentials.json` on cache miss so a swap propagates to a running OpenCode process without restart. **Claude Code itself is NOT supported**: its in-memory `~/.claude.json` cache would race the swap, so `sca usage -Auto` refuses to start (and to rotate mid-watch) while `claude.exe` is running. Close Claude Code before enabling `-Auto`; OpenCode can keep running.
+> **OpenCode-scoped feature.** Requires [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, which re-reads `~/.claude/.credentials.json` on cache miss so a swap propagates to a running OpenCode process without restart. **Claude Code itself is NOT supported**: its in-memory `~/.claude.json` cache would race the swap, so `sca monitor` refuses to start (and to rotate mid-watch) while `claude.exe` is running. Close Claude Code before running `sca monitor`; OpenCode can keep running.
 
 ### Install / uninstall alias
 

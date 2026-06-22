@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
-# Pester 5 tests for the `sca usage -Watch -Auto` auto-rotation helpers
+# Pester 5 tests for the `sca monitor` auto-rotation helpers
 # in switch_claude_account.ps1:
 #
 #   * Get-AutoRotationDecision  - pure: snapshot + threshold -> decision
@@ -319,13 +319,13 @@ Describe 'switch_claude_account' {
 
         It 'on noop preserves the current latch verbatim' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{ Action = 'noop' } }
-            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
-            $out | Should -Be '[Auto] Automatic slot switching is enabled.'
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
+            $out | Should -Be '[Monitor] Automatic slot switching is enabled.'
         }
 
         It 'on noop preserves a previously-latched Rotated line' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{ Action = 'noop' } }
-            $prev = '[Auto] Rotated from "a" to "b" at 12:00:00'
+            $prev = '[Monitor] Rotated from "a" to "b" at 12:00:00'
             $out  = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch $prev
             $out | Should -Be $prev
         }
@@ -339,10 +339,10 @@ Describe 'switch_claude_account' {
             Mock Find-SlotByName  { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap  { }
 
-            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
 
             Should -Invoke Invoke-SlotSwap -Times 1
-            $out | Should -Match '^\[Auto\] Rotated from "work" to "personal" at \d{2}:\d{2}:\d{2}$'
+            $out | Should -Match '^\[Monitor\] Rotated from "work" to "personal" at \d{2}:\d{2}:\d{2}$'
         }
 
         It 'on rotate with Claude Code running: refuses, does NOT call Invoke-SlotSwap' {
@@ -354,10 +354,10 @@ Describe 'switch_claude_account' {
             Mock Test-ClaudeRunning { $true }
             Mock Invoke-SlotSwap    { }
 
-            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
 
             Should -Invoke Invoke-SlotSwap -Times 0
-            $out | Should -Be '[Auto] Rotation refused! Claude Code is running.'
+            $out | Should -Be '[Monitor] Rotation refused! Claude Code is running.'
         }
 
         It 'on rotate when swap throws, returns Rotation failed!' {
@@ -369,8 +369,8 @@ Describe 'switch_claude_account' {
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { throw [System.IO.IOException]::new('locked file') }
 
-            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
-            $out | Should -Match '^\[Auto\] Rotation failed! .*locked file'
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
+            $out | Should -Match '^\[Monitor\] Rotation failed! .*locked file'
         }
 
         It 'on rotate when slot lookup returns null, returns Rotation failed!' {
@@ -382,9 +382,9 @@ Describe 'switch_claude_account' {
             Mock Find-SlotByName { return $null }
             Mock Invoke-SlotSwap { }
 
-            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
             Should -Invoke Invoke-SlotSwap -Times 0
-            $out | Should -Match '^\[Auto\] Rotation failed! Slot ''personal'' not found'
+            $out | Should -Match '^\[Monitor\] Rotation failed! Slot ''personal'' not found'
         }
 
         It 'on no-eligible with a future reset, returns cooldown line with a delta' {
@@ -394,8 +394,8 @@ Describe 'switch_claude_account' {
                 SuggestionResetsAt = $future
             } }
 
-            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
-            $out | Should -Match '^\[Auto\] No free slot available! Cooling down for 1h (11|12)m\.$'
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
+            $out | Should -Match '^\[Monitor\] No free slot available! Cooling down for 1h (11|12)m\.$'
         }
 
         It 'on no-eligible without any future reset, returns a generic line' {
@@ -404,8 +404,8 @@ Describe 'switch_claude_account' {
                 SuggestionResetsAt = $null
             } }
 
-            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
-            $out | Should -Be '[Auto] No free slot available! Waiting for the next poll.'
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
+            $out | Should -Be '[Monitor] No free slot available! Waiting for the next poll.'
         }
 
         # Regression guard for the default arm: if Get-AutoRotationDecision
@@ -418,8 +418,8 @@ Describe 'switch_claude_account' {
                 Action = 'something-unexpected'
             } }
 
-            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Auto] Automatic slot switching is enabled.'
-            $out | Should -Be '[Auto] Automatic slot switching is enabled.'
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
+            $out | Should -Be '[Monitor] Automatic slot switching is enabled.'
         }
     }
 
