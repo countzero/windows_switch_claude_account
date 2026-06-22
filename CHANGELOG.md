@@ -19,15 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - **BREAKING**: the `-Auto`, `-Threshold`, and `-Warmup` flags on `sca usage`. Use `sca monitor` / `sca monitor -Threshold <n>` / `sca monitor -KeepWarm`.
 
-## [2.5.0] - 2026-06-18
-
-### Changed
-- `sca usage -Watch -Warmup` now keeps every slot warm for the life of the watch: in addition to the startup pass it re-opens any slot whose 5h session window has closed, checked at each poll, so the slots no longer all expire ~5h after startup and stay dark. A per-slot cooldown (`$Script:WarmupCooldownMin`, default 5 min) bounds repeated re-warms of a slot whose warm attempt keeps failing. Still combines with `-Auto`.
-- `sca usage -Watch -Warmup` now also re-warms a slot whose status is `rate-limited` (not only one whose 5h window has closed), so a slot throttled on the unofficial usage/token endpoint recovers through a real `claude -p` instead of staying inert. The per-slot cooldown still bounds repeated attempts. Warm-eligibility moved into the pure `Test-WarmEligible` predicate.
-
-### Fixed
-- `sca usage -Watch` no longer stays frozen on `rate-limited` until the process is restarted. After a 429, a slot's live token/usage HTTP is suppressed for a short backoff window (`$Script:RateLimitBackoffSec`, default 120 s) recorded on its cache entry, so the watch loop stops re-hitting (and re-tripping) a hot rate limiter every poll and recovers on the next clear poll or warm pass. The `[Warmup] Keeping all slots warm.` footer now reports when slots are throttled and awaiting re-warm instead of claiming everything is warm.
-
 ## [2.4.0] - 2026-06-17
 
 ### Added
