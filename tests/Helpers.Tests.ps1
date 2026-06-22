@@ -213,7 +213,7 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Show-Help' {
-        It 'prints the ACTIONS header and lists all 10 actions' {
+        It 'prints the ACTIONS header and lists the slot/operation actions' {
             $out = Show-Help 6>&1 | Out-String
 
             $out | Should -Match 'ACTIONS'
@@ -226,32 +226,39 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'warmup \[name\]'
             $out | Should -Match 'install'
             $out | Should -Match 'uninstall'
-            $out | Should -Match 'help, -h'
         }
 
         It 'documents the monitor options (-Threshold / -KeepWarm)' {
             $out = Show-Help 6>&1 | Out-String
-            $out | Should -Match 'MONITOR OPTIONS'
+            $out | Should -Match 'OPTIONS'
             $out | Should -Match '-Threshold'
             $out | Should -Match '-KeepWarm'
         }
 
-        It 'documents the -NoColor option under GLOBAL OPTIONS' {
+        It 'documents the -NoColor option under the GLOBAL options group' {
             $out = Show-Help 6>&1 | Out-String
-            $out | Should -Match 'GLOBAL OPTIONS'
+            $out | Should -Match 'GLOBAL'
             $out | Should -Match '-NoColor'
         }
 
-        # Without the install action's profile aliases, Get-Alias returns
-        # nothing and Show-Help prints '.\switch_claude_account.ps1' (the
-        # default test environment). When the alias IS present (post-
-        # install or sourced via a profile that runs the install block),
-        # the USAGE line should print 'sca' instead. Pin both branches.
-        It 'uses the sca alias in USAGE when Get-Alias sca resolves' {
-            Set-Alias -Name sca -Value $script:ScriptPath -Scope Local
+        # Help moved -h / -Help into the GLOBAL options group (no standalone
+        # 'help' action line in the displayed help).
+        It 'documents -h / -Help in the options instead of an ACTIONS entry' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match '-h, -Help'
+        }
+
+        # Help is written with the canonical 'sca' invocation (matching every
+        # other user-facing message in the script), not a conditional path.
+        It 'shows the sca invocation in USAGE' {
             $out = Show-Help 6>&1 | Out-String
             $out | Should -Match 'sca <action>'
-            $out | Should -Not -Match '\.\\switch_claude_account\.ps1 <action>'
+        }
+
+        It 'groups the actions under MANAGEMENT and OPERATIONS' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'MANAGEMENT'
+            $out | Should -Match 'OPERATIONS'
         }
 
         It 'documents the -Version option' {
