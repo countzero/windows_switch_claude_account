@@ -10,12 +10,25 @@ A zero-dependency PowerShell utility for Claude Code on Windows that combines se
 
 ## Features
 
-- **Live plan-usage dashboard**: `sca usage -Watch` polls Anthropic's `/api/oauth/usage` and renders a flicker-free, auto-refreshing view of Session (5h) and Week (7d) limits across every slot; the terminal-tab title is updated each poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab
+**Account & identity**
+
 - **Identity-aware slots**: each slot's OAuth email is captured at save time, baked into the filename, and locked in a sidecar; what you see in `list` is guaranteed to be who the tokens actually belong to
-- **Auto-reconcile**: silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
-- **Transparent token refresh**: expired access tokens are refreshed before usage queries and mirrored back into the active credentials file
-- **Atomic-safe writes**: slot-file updates survive a running Claude Code via `MoveFileEx` with retry; `save` / `switch` still refuse to run while it's open (single source of truth on `~/.claude.json`)
 - **Named slots with rotation**: unlimited accounts under any name (Windows-invalid characters auto-sanitized); `sca switch` with no name cycles through them alphabetically
+
+**Live usage monitoring**
+
+- **Live plan-usage dashboard**: `sca usage -Watch` polls Anthropic's `/api/oauth/usage` and renders a flicker-free, auto-refreshing view of Session (5h) and Week (7d) limits across every slot; the terminal-tab title is updated each poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab
+- **Transparent token refresh**: expired access tokens are refreshed before usage queries and mirrored back into the active credentials file
+
+**Automation**
+
+- **Auto-reconcile**: silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
+- **Smart rotation (OpenCode only)**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); refuses to run while Claude Code is open
+- **Cold-slot warmup**: `sca warmup` (and `sca monitor -KeepWarm`) opens each dormant slot's 5h window by running the real Claude Code CLI, so Anthropic reports usage data for every account (billable)
+
+**Reliability & footprint**
+
+- **Atomic-safe writes**: slot-file updates use `MoveFileEx` with retry so they survive a running Claude Code on `.credentials.json`; `save` / `switch` still refuse to run while it's open to protect `~/.claude.json`
 - **Zero dependencies**: pure PowerShell 7.2+, no external packages, no companion assets
 
 ## Installation
