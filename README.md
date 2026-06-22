@@ -2,7 +2,7 @@
 
 [![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.2+](https://img.shields.io/badge/PowerShell-7.2%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
 
-Zero-dependency PowerShell manager for Claude Code on Windows. Features multi-account usage tracking, auto-rotating limit monitoring, and secure profile switching.
+A zero-dependency PowerShell utility for Claude Code on Windows that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
 
 <p align="center">
   <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
