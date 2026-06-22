@@ -1272,7 +1272,7 @@ Describe 'switch_claude_account' {
         # Pure-helper unit tests for the pool-mean utilization math.
         # Get-PoolMeanUtilization is shared by Format-AggregateBars (the
         # bar above the table) and Format-WatchTitle -Aggregate (the
-        # -Watch -Auto terminal title). Pinning the math here means a
+        # monitor terminal title). Pinning the math here means a
         # change to one site cannot silently drift from the other; the
         # Format-AggregateBars Context above pins the rendering side.
         BeforeAll {
@@ -2883,7 +2883,7 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Invoke-KeepWarmStep' {
-        # The per-poll keep-warm step for `-Watch -Warmup`. Mirrors
+        # The per-poll keep-warm step for `sca monitor -KeepWarm`. Mirrors
         # Invoke-AutoRotationStep: decides which slots have a CLOSED 5h
         # window, re-warms them via Invoke-WarmAllSlots (mocked here), and
         # returns a latched footer string. Cold = Status='ok' AND
