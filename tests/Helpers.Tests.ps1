@@ -213,7 +213,7 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Show-Help' {
-        It 'prints the ACTIONS header and lists all 8 actions' {
+        It 'prints the ACTIONS header and lists all 10 actions' {
             $out = Show-Help 6>&1 | Out-String
 
             $out | Should -Match 'ACTIONS'
@@ -222,16 +222,24 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'list'
             $out | Should -Match 'remove <name>'
             $out | Should -Match 'usage \[name\]'
+            $out | Should -Match 'monitor'
+            $out | Should -Match 'warmup \[name\]'
             $out | Should -Match 'install'
             $out | Should -Match 'uninstall'
             $out | Should -Match 'help, -h'
         }
 
-        It 'documents the -NoColor option and the NO_COLOR env var' {
+        It 'documents the monitor options (-Threshold / -KeepWarm)' {
             $out = Show-Help 6>&1 | Out-String
-            $out | Should -Match 'OPTIONS'
+            $out | Should -Match 'MONITOR OPTIONS'
+            $out | Should -Match '-Threshold'
+            $out | Should -Match '-KeepWarm'
+        }
+
+        It 'documents the -NoColor option under GLOBAL OPTIONS' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'GLOBAL OPTIONS'
             $out | Should -Match '-NoColor'
-            $out | Should -Match 'NO_COLOR'
         }
 
         # Without the install action's profile aliases, Get-Alias returns
@@ -307,6 +315,41 @@ Describe 'switch_claude_account' {
             $m = [regex]::Match($changelog, '##\s+\[(\d+\.\d+\.\d+)\]\s+-\s+\d{4}-\d{2}-\d{2}')
             $m.Success           | Should -BeTrue
             $Script:ScriptVersion | Should -Be $m.Groups[1].Value
+        }
+    }
+
+    Context 'monitor dispatch and flag-misuse guards' {
+        # Invoke-Main routes the `monitor` action to Invoke-MonitorAction and
+        # rejects the switch flags that belong to the other live verb
+        # (-Watch / -Json on monitor; -KeepWarm anywhere but monitor). Same
+        # dynamic-scope pattern as the '-Version flag' context: assign the
+        # Param() variables in the It body and let Invoke-Main read them.
+
+        It 'routes the monitor action to Invoke-MonitorAction' {
+            Mock Invoke-MonitorAction { }
+            $Action = 'monitor'
+            Invoke-Main
+            Should -Invoke Invoke-MonitorAction -Times 1 -Exactly
+        }
+
+        It 'rejects -Watch on monitor with a pointer to usage -Watch' {
+            $Action = 'monitor'
+            $Watch  = $true
+            { Invoke-Main 6>$null } | Should -Throw -ExpectedMessage "*sca usage -Watch*"
+        }
+
+        It 'rejects -Json on monitor' {
+            $Action = 'monitor'
+            $Json   = $true
+            { Invoke-Main 6>$null } | Should -Throw -ExpectedMessage "*monitor*"
+        }
+
+        It 'rejects -KeepWarm on a non-monitor action' {
+            Mock Invoke-UsageAction { }
+            $Action   = 'usage'
+            $KeepWarm  = $true
+            { Invoke-Main 6>$null } | Should -Throw -ExpectedMessage "*-KeepWarm applies only*"
+            Should -Invoke Invoke-UsageAction -Times 0
         }
     }
 

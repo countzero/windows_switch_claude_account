@@ -44,7 +44,7 @@ characters are automatically sanitized to underscores.
 [CmdletBinding(DefaultParameterSetName = 'Default')]
 Param (
     [Parameter(Position = 0)]
-    [ValidateSet('save', 'switch', 'list', 'remove', 'usage', 'warmup', 'install', 'uninstall', 'help')]
+    [ValidateSet('save', 'switch', 'list', 'remove', 'usage', 'monitor', 'warmup', 'install', 'uninstall', 'help')]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -65,71 +65,50 @@ Param (
     # (so reset deltas refresh and a terminal resize is reflected within
     # ~1 s rather than at the next poll). Interactive only; exits on
     # Ctrl-C (runtime default). Mutually exclusive with -Json (enforced
-    # by parameter sets). Ignored by other actions.
-    # Mandatory in the 'Watch' set so it anchors the set: passing -Interval
-    # alone resolves the binder to the 'Watch' set and then fails with
-    # "Cannot process command because of one or more missing mandatory
-    # parameters: Watch", giving an immediate diagnosis instead of silently
-    # falling through to a non-watch usage call.
+    # by parameter sets). READ-ONLY: `usage -Watch` never rotates or
+    # spends money. The side-effecting live modes (auto-rotation and
+    # keep-warm) moved to the `monitor` action in 3.0.0.
+    # Mandatory in the 'Watch' set so it anchors the set and the binder
+    # keeps -Watch and -Json on separate syntax forms.
     [Parameter(ParameterSetName = 'Watch', Mandatory = $true)]
     [switch] $Watch,
 
-    # -Interval: seconds between HTTP polls when -Watch is set. Bound to
-    # the 'Watch' parameter set so the binder rejects -Interval without
-    # -Watch (-Watch is the set's mandatory anchor; see above).
-    # [ValidateRange] rejects zero / negatives at bind time. The
-    # 60-second floor is enforced as a runtime clamp-with-advisory inside
-    # Invoke-UsageWatch (deliberate; see AGENTS.md "Watch mode").
-    [Parameter(ParameterSetName = 'Watch')]
+    # -Interval: seconds between HTTP polls for `usage -Watch` and for
+    # `monitor`. In __AllParameterSets because `monitor` has no switch
+    # anchor of its own (its set is selected by the positional Action,
+    # which parameter sets cannot key off). [ValidateRange] rejects zero /
+    # negatives at bind time; the 60-second floor is a runtime
+    # clamp-with-advisory inside Invoke-UsageWatch (see AGENTS.md "Watch
+    # mode"). Ignored by actions other than `usage -Watch` / `monitor`.
     [ValidateRange(1, [int]::MaxValue)]
     [int] $Interval = 60,
 
-    # -Auto: in `sca usage -Watch -Auto`, auto-rotate to the next eligible
-    # slot when the active slot's max(five_hour, seven_day) utilization
-    # reaches -Threshold. Bound to the 'Watch' parameter set so the
-    # binder rejects -Auto without -Watch. OpenCode-scoped (matches
-    # issue #8): the opencode-claude-auth plugin re-reads .credentials.json
-    # on cache miss (v1.5.4+), so rotation propagates without restarting
-    # OpenCode. Claude Code's in-memory ~/.claude.json cache makes the
-    # same rotation unsafe under a running Claude Code, so -Auto refuses
-    # to operate while claude.exe is running (same guard as `sca switch`).
-    [Parameter(ParameterSetName = 'Watch')]
-    [switch] $Auto,
-
-    # -Threshold: utilization percentage at or above which -Auto rotates.
-    # Applied to max(five_hour.utilization, seven_day.utilization) on the
-    # active slot; null bucket counts as 0%. Bound to the 'Watch' set so
-    # the binder rejects it without -Watch. Range [1, 100]; default 95
-    # leaves a small safety margin because /api/oauth/usage reporting
-    # lags real consumption; rotating exactly at 100 risks overshooting
-    # before the next poll lands. Ignored when -Auto is absent.
-    [Parameter(ParameterSetName = 'Watch')]
+    # -Threshold: utilization percentage at or above which `sca monitor`
+    # rotates to the next eligible slot. Applied to
+    # max(five_hour.utilization, seven_day.utilization) on the active slot;
+    # null bucket counts as 0%. Range [1, 100]; default 95 leaves a small
+    # safety margin because /api/oauth/usage reporting lags real
+    # consumption; rotating exactly at 100 risks overshooting before the
+    # next poll lands. In __AllParameterSets (monitor has no switch anchor;
+    # see -Interval); a non-monitor action ignores it.
     [ValidateRange(1, 100)]
     [int] $Threshold = 95,
 
-    # -Warmup: in `sca usage -Watch`, KEEP every saved slot warm for the
+    # -KeepWarm: in `sca monitor`, also keep every saved slot warm for the
     # life of the watch. Before the first poll, activate every slot in
     # alphabetical order: Invoke-WarmAllSlots makes the slot active
     # (Invoke-SlotSwap) then runs the real Claude Code CLI (`claude -p`, via
     # Invoke-SlotActivator) so Anthropic opens a server-side 5h session
     # window for the slot. Then, at each poll, Invoke-KeepWarmStep re-opens
     # any slot whose 5h window has since closed, so the slots do not all
-    # expire ~5h after startup and stay dark. Subsequent /api/oauth/usage
-    # polls return real bucket data instead of empty/rate-limited responses.
-    # Cost: ~$0.004 per slot per warmup on
-    # the pinned Haiku model (a real one-turn "Hi" message; Claude Code
-    # always sends its base system prompt, so it is ~3k input tokens, not
-    # a bare request). Bound to the 'Watch' parameter set so the binder
-    # rejects -Warmup without -Watch. Independent of -Auto: works with
-    # bare -Watch and with -Watch -Auto. The pre-loop Test-ClaudeRunning
-    # guard refuses to operate when Claude Code is ALREADY running because
-    # the per-slot swap writes ~/.claude.json's oauthAccount, which a live
-    # Claude Code keeps in an in-memory cache (the short-lived `claude -p`
-    # the warmup itself spawns is awaited to exit before the next swap,
-    # so it never races a file write). See also the standalone `warmup`
-    # action for a one-shot warm pass without the live watch view.
-    [Parameter(ParameterSetName = 'Watch')]
-    [switch] $Warmup,
+    # expire ~5h after startup and stay dark. Cost: ~$0.004 per slot per
+    # warmup on the pinned Haiku model (a real one-turn "Hi" message;
+    # Claude Code always sends its base system prompt, so it is ~3k input
+    # tokens, not a bare request). In __AllParameterSets (monitor has no
+    # switch anchor); rejected on non-monitor actions by Invoke-Main. The
+    # warming activity keeps the [Warmup] footer label it shares with the
+    # standalone `warmup` action.
+    [switch] $KeepWarm,
 
     # -NoColor: suppress all ANSI color output for this invocation. We
     # implement no-color via two cooperating pieces:
@@ -185,7 +164,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '2.5.0'
+$Script:ScriptVersion = '3.0.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -894,50 +873,56 @@ function Show-Help {
         "",
         "ACTIONS",
         "  save <name>      Snapshot the active login into a named slot",
-        "  switch [name]    Restore a named slot; without <name>, rotate to the next slot (alphabetical, wraps)",
-        "  list             List saved slots (active slot marked with *)",
+        "  switch [name]    Restore a named slot; without <name>, rotate to the next slot",
+        "  list             List saved slots",
         "  remove <name>    Delete a named slot",
-        "  usage [name]     Show Session / Week plan usage per slot (network; unofficial Anthropic API)",
-        "  warmup [name]    Open each slot's 5h session window by running 'claude -p' as that slot (billable)",
+        "  usage [name]     Show session and week plan usage per slot",
+        "  monitor          Live watch that auto-rotates to the next slot at the usage threshold",
+        "  warmup [name]    Open each slot's 5h session window",
         "  install          Add 'sca' + 'switch-claude-account' aliases to your PS profile",
         "  uninstall        Remove the aliases from your PS profile",
         "  help, -h         Show this help",
         "",
-        "OPTIONS",
-        "  -NoColor         Suppress all ANSI color output (also: set NO_COLOR env var)",
+        "USAGE OPTIONS",
+        "  -Watch           Live view that polls every 60 seconds",
+        "  -Interval <sec>  Seconds between polls when -Watch is set (default 60)",
+        "  -Json            Emit usage as machine-readable JSON",
+        "",
+        "MONITOR OPTIONS",
+        "  -Threshold <n>   Utilization % at or above which monitor rotates slots (default 95)",
+        "  -KeepWarm        Keeps every slot warm by re-opening closed 5h windows on each poll",
+        "  -Interval <sec>  Seconds between polls (default 60)",
+        "",
+        "GLOBAL OPTIONS",
+        "  -NoColor         Suppress all ANSI color output",
         "  -Version         Print the script version and exit",
         "",
         "EXAMPLES",
-        "  $cmd save slot-1                       # save current login as 'slot-1'",
-        "  $cmd switch slot-2                     # activate the 'slot-2' slot",
-        "  $cmd switch                            # rotate to the next saved slot",
-        "  $cmd list                              # show all slots",
-        "  $cmd remove slot-1                     # delete a slot",
-        "  $cmd usage                             # show Session + Week usage for every slot",
-        "  $cmd usage -Watch                      # live refresh; 60s polls; Ctrl-C to quit",
-        "  $cmd usage -Watch -Interval 300        # slower refresh (floor is 60s)",
-        "  $cmd warmup                            # open every slot's 5h window via 'claude -p' (billable; ~`$0.004/slot)",
-        "  $cmd warmup slot-2                     # warm just one slot",
-        "  $cmd usage -Watch -Warmup              # keep all slots warm (re-warms closed 5h windows) (billable)",
-        "  $cmd usage -Watch -Auto                # auto-rotate when active slot hits 95% (OpenCode only)",
-        "  $cmd usage -Watch -Auto -Threshold 90  # rotate earlier (default is 95%)",
-        "  $cmd usage -Watch -Auto -Warmup        # auto-rotate and keep all slots warm (recommended)",
-        "  $cmd usage -Json                       # emit usage as JSON for scripting",
-        "  $cmd usage -NoColor                    # B&W output (or: `$env:NO_COLOR='1'; $cmd usage)",
+        "  $cmd save slot-1                  # save current login as 'slot-1'",
+        "  $cmd switch slot-2                # activate the 'slot-2' slot",
+        "  $cmd switch                       # rotate to the next saved slot",
+        "  $cmd list                         # show all slots",
+        "  $cmd remove slot-1                # delete a slot",
+        "  $cmd usage                        # session and week plan usage for every slot",
+        "  $cmd usage -Watch                 # live view that polls every 60 seconds",
+        "  $cmd usage -Watch -Interval 300   # slower refresh",
+        "  $cmd usage -Json                  # emit usage as JSON for scripting",
+        "  $cmd warmup                       # open every slot's 5h window",
+        "  $cmd warmup slot-2                # warm just one slot",
+        "  $cmd monitor                      # auto-rotate when the active slot hits 95%",
+        "  $cmd monitor -Threshold 90        # rotate earlier (default is 95%)",
+        "  $cmd monitor -KeepWarm            # auto-rotate AND keep all slots warm (recommended)",
         "",
         "FILES",
         "  Active login : %USERPROFILE%\.claude\.credentials.json",
-        "  Saved slots  : %USERPROFILE%\.claude\.credentials.<name>.json",
+        "  Saved slots  : %USERPROFILE%\.claude\.credentials.<name>(<email>).json (+ .account.json sidecar)",
+        "  State        : %USERPROFILE%\.claude\.sca-state.json",
         "  PS profile   : %USERPROFILE%\Documents\PowerShell\profile.ps1",
         "",
         "NOTES",
-        "  * Close Claude Code / VS Code before 'save' or 'switch' (file locks).",
-        "  * OAuth tokens expire after ~1h idle; stale slots need re-saving.",
-        "  * Invalid Windows filename chars in <name> are replaced with '_'.",
-        "  * -Auto requires Claude Code to be closed (it writes ~/.claude.json's identity",
-        "    block; Claude Code caches it in memory). OpenCode + opencode-claude-auth",
-        "    >= 1.5.4 picks up the credentials swap from .credentials.json automatically;",
-        "    no OpenCode restart needed.",
+        "  * Close Claude Code / VS Code before 'save', 'switch', 'warmup', or 'monitor'.",
+        "  * 'sca monitor' auto-rotates by default. For a read-only live view, use 'sca usage -Watch'.",
+        "  * OpenCode + opencode-claude-auth support swapping Anthropic accounts without restart.",
         ""
     )
 
@@ -3117,7 +3102,7 @@ function Format-UsageTable {
         # width minus 1 (preserves a 1-char right margin); when the
         # terminal is too narrow to fit the left header AND a 2-space
         # gap AND the indicator, the indicator is silently dropped
-        # (the footer's [Auto] line still carries the state). When
+        # (the footer's [Monitor] line still carries the state). When
         # -Auto is set, an extra blank line is inserted under the
         # header to balance the visually-busier right-aligned indicator.
         [int]      $AutoThreshold = 0
@@ -3227,7 +3212,7 @@ function Format-UsageTable {
     # width ([Console]::WindowWidth) so it floats to the right edge with
     # a 1-column right margin. Width-aware fallback: when the terminal
     # is too narrow to fit both segments with a 2-space minimum gap, the
-    # indicator is silently dropped (the footer's [Auto] line still
+    # indicator is silently dropped (the footer's [Monitor] line still
     # carries the state, so no information is lost). [Console]::WindowWidth
     # can throw in non-interactive hosts (tests, ssh-tty absent); we
     # treat that as "narrow" and drop the indicator.
@@ -3237,7 +3222,7 @@ function Format-UsageTable {
     #           (high-contrast lozenge so the auto-mode signal pops
     #            against the dimmer header / footer text).
     #   text  = 'switching slot at N%', DarkGray (matches the footer
-    #           '[Watch]' / '[Auto]' line color so the indicator recedes
+    #           '[Watch]' / '[Monitor]' line color so the indicator recedes
     #           into ambient-metadata weight).
     # Rendered via three Write-Color calls with -NoNewline so each segment
     # carries its own SGR color while the line is still a single logical
@@ -3595,7 +3580,7 @@ function Format-RateLimitAdvisory {
 #                   Width-aware: if the terminal is too narrow to fit
 #                   both the left header and the indicator with a
 #                   2-space gap, the indicator is silently dropped
-#                   (the footer's `[Auto]` line still
+#                   (the footer's `[Monitor]` line still
 #                   carries the state, so no info is lost).
 function Format-UsageFrame {
     Param (
@@ -3628,7 +3613,7 @@ function Format-UsageFrame {
 
     # Cache-fallback / rate-limit advisory (wording + slot naming in
     # Format-RateLimitAdvisory). Rendered in the footer block (alongside the
-    # [Auto] / [Watch] lines), NOT directly under the table: the advisory
+    # [Monitor] / [Watch] lines), NOT directly under the table: the advisory
     # leads the footer group so the rate-limit signal sits with the other
     # per-frame status lines instead of crowding the table's last row.
     $advisory = Format-RateLimitAdvisory -Snapshot $Snapshot
@@ -3644,7 +3629,7 @@ function Format-UsageFrame {
 # for Format-UsageFrame; extracted so the watch loop and any future
 # footer-consumers share one wrapping policy.
 #
-# -Footer   : the [Watch] / [Auto] lines (DarkGray). Kept as the first
+# -Footer   : the [Watch] / [Monitor] lines (DarkGray). Kept as the first
 #             positional parameter so the existing positional call sites
 #             (`Format-UsageFooter $Footer`) bind unchanged.
 # -Advisory : optional rate-limit advisory (Yellow). Leads the footer
@@ -3822,24 +3807,7 @@ function Invoke-UsageAction {
         [string] $Name,
         [switch] $Json,
         [switch] $Watch,
-        [int]    $Interval = $Script:UsageWatchMinInterval,
-        # -Auto: when set with -Watch, the watch loop auto-rotates to the
-        # next eligible slot when the active slot's max(five_hour,
-        # seven_day) utilization reaches -Threshold. Bound to the 'Watch'
-        # parameter set at the top of the script, so the binder rejects
-        # -Auto without -Watch; this runtime guard catches direct callers
-        # (notably the test suite) that bypass the top-level Param.
-        [switch] $Auto,
-        # -Threshold: percentage at or above which -Auto rotates. Default
-        # 95 leaves a small safety margin because /api/oauth/usage
-        # reporting lags real consumption; range enforced by
-        # [ValidateRange(1,100)] on the top-level Param block.
-        [int]    $Threshold = 95,
-        # -Warmup: keep every saved slot warm via the real Claude Code CLI
-        # (`claude -p`): a startup pass before the first poll, then a per-poll
-        # re-warm of any slot whose 5h window has closed (Invoke-KeepWarmStep).
-        # Requires -Watch. Independent of -Auto.
-        [switch] $Warmup
+        [int]    $Interval = $Script:UsageWatchMinInterval
     )
 
     # The top-level Param block enforces -Json/-Watch mutual exclusion via
@@ -3849,23 +3817,11 @@ function Invoke-UsageAction {
         throw "-Watch and -Json cannot be combined; -Watch is interactive, -Json is for scripting."
     }
 
-    # -Auto / -Threshold require -Watch. The top-level parameter set
-    # already enforces this for CLI invocations; the runtime guard
-    # catches test-suite direct calls. -Threshold defaults to 100 even
-    # when -Auto is absent, so the guard fires only on -Auto.
-    if ($Auto -and -not $Watch) {
-        throw "-Auto requires -Watch; auto-rotation runs as part of the watch loop."
-    }
-
-    # -Warmup requires -Watch. The top-level parameter set already enforces
-    # this for CLI invocations; the runtime guard catches direct callers
-    # (notably the test suite) that bypass Invoke-Main.
-    if ($Warmup -and -not $Watch) {
-        throw "-Warmup requires -Watch; warmup runs as part of the watch loop's startup."
-    }
-
     if ($Watch) {
-        Invoke-UsageWatch -Name $Name -Interval $Interval -Auto:$Auto -Threshold $Threshold -Warmup:$Warmup
+        # Read-only live view: no auto-rotation, no keep-warm. Those modes
+        # are `sca monitor` (Invoke-MonitorAction), which calls the same
+        # watch engine with -Auto / -Warmup set.
+        Invoke-UsageWatch -Name $Name -Interval $Interval
         return
     }
 
@@ -3921,6 +3877,26 @@ function Invoke-UsageAction {
     }
 
     Format-UsageFrame -Name $Name -Snapshot $snapshot
+}
+
+# `sca monitor`: the live, side-effecting supervisor. Always a watch loop
+# that auto-rotates to the next eligible slot when the active slot reaches
+# -Threshold (the headline job, hence no -Auto flag); -KeepWarm adds the
+# per-poll keep-warm pass. Thin adapter over the shared watch engine
+# (Invoke-UsageWatch), which keeps its internal -Auto / -Warmup parameter
+# names; the public surface is `monitor` (rotation is unconditional) and
+# -KeepWarm. A positional <name> is ignored: rotation and keep-warm span
+# the whole slot fleet, so scoping to one slot is meaningless. The
+# Claude-Code-running refusal lives in Invoke-UsageWatch's pre-loop guard.
+function Invoke-MonitorAction {
+    Param (
+        [string] $Name,
+        [int]    $Threshold = 95,
+        [switch] $KeepWarm,
+        [int]    $Interval  = $Script:UsageWatchMinInterval
+    )
+
+    Invoke-UsageWatch -Interval $Interval -Auto -Threshold $Threshold -Warmup:$KeepWarm
 }
 
 # `sca warmup [name]`: one-shot, non-watch warm pass. Activates every saved
@@ -4083,7 +4059,7 @@ function Get-AutoRotationDecision {
     # No eligible peer. Find the soonest FUTURE reset across all slots
     # and both buckets; that is the moment at which auto-rotation can
     # next return something other than 'no-eligible'. Used by the
-    # watch loop's "[Auto] No free slot available! Cooling down for
+    # watch loop's "[Monitor] No free slot available! Cooling down for
     # <delta>" footer line.
     $soonestSlot   = $null
     $soonestBucket = $null
@@ -4140,7 +4116,7 @@ function Get-RowMaxUtilization {
 }
 
 # Render a positive future reset duration as a compact "Xh Ym" / "Xm"
-# string for the [Auto] "Cooling down for <delta>" footer line. Uses
+# string for the [Monitor] "Cooling down for <delta>" footer line. Uses
 # Format-ResetDelta's shape with the surrounding parentheses stripped
 # (parentheses are a table-cell convention; the footer reads as prose).
 #
@@ -4183,20 +4159,20 @@ function Format-AutoCooldownDelta {
 #      next state change.
 #
 # Returns the new footer-latch string. Never throws: any exception from
-# the swap path is caught and rendered as '[Auto] Rotation failed! …'
+# the swap path is caught and rendered as '[Monitor] Rotation failed! …'
 # so the watch loop never aborts because of an auto-rotation issue.
 #
 # -CurrentLatch carries the previous frame's latched string. Used for
 # two distinct cases:
 #   * Decision 'noop' AND no prior rotation event: preserves the
-#     initial '[Auto] Automatic slot switching is enabled.' line (or
+#     initial '[Monitor] Automatic slot switching is enabled.' line (or
 #     whatever steady-state caller supplied).
 #   * Decision 'noop' AFTER a prior rotation: the 'Rotated …' line
 #     stays latched. The user choice (this conversation) was that
 #     transition lines stay visible until the next state change, not
 #     revert to the steady-state line on every tick.
 #
-# All [Auto] lines start with a capital letter per the user's locked
+# All [Monitor] lines start with a capital letter per the user's locked
 # convention.
 function Invoke-AutoRotationStep {
     Param (
@@ -4211,7 +4187,7 @@ function Invoke-AutoRotationStep {
         'noop' {
             # No state change. Preserve whatever latch the caller had.
             # On the very first tick that hits 'noop' the caller's
-            # initialiser ('[Auto] Enabled') is preserved; after a
+            # initialiser ('[Monitor] Enabled') is preserved; after a
             # prior 'rotate' the 'Rotated A -> B at HH:mm:ss' string
             # stays latched until the next state change.
             return $CurrentLatch
@@ -4221,9 +4197,9 @@ function Invoke-AutoRotationStep {
             # Per-rotation Test-ClaudeRunning re-check. The pre-loop
             # guard caught the startup case; this catches the "Claude
             # Code launched mid-watch" race. Surface the refusal as
-            # a [Auto] line; the credentials swap does NOT happen.
+            # a [Monitor] line; the credentials swap does NOT happen.
             if (Test-ClaudeRunning) {
-                return '[Auto] Rotation refused! Claude Code is running.'
+                return '[Monitor] Rotation refused! Claude Code is running.'
             }
 
             try {
@@ -4231,14 +4207,14 @@ function Invoke-AutoRotationStep {
                 if (-not $slot) {
                     # Sidecar disappeared between snapshot and lookup.
                     # Rare; surfaces as a 'Rotation failed' line.
-                    return "[Auto] Rotation failed! Slot '$($decision.ToName)' not found (or missing its identity sidecar)."
+                    return "[Monitor] Rotation failed! Slot '$($decision.ToName)' not found (or missing its identity sidecar)."
                 }
                 Invoke-SlotSwap -Slot $slot 6>$null
                 $ts = [DateTime]::Now.ToString('HH:mm:ss')
-                return ('[Auto] Rotated from "{0}" to "{1}" at {2}' -f $decision.FromName, $decision.ToName, $ts)
+                return ('[Monitor] Rotated from "{0}" to "{1}" at {2}' -f $decision.FromName, $decision.ToName, $ts)
             }
             catch {
-                return "[Auto] Rotation failed! $($_.Exception.Message)"
+                return "[Monitor] Rotation failed! $($_.Exception.Message)"
             }
         }
 
@@ -4248,13 +4224,13 @@ function Invoke-AutoRotationStep {
             # concrete cooldown ETA.
             if ($decision.SuggestionResetsAt) {
                 $delta = Format-AutoCooldownDelta $decision.SuggestionResetsAt
-                return ('[Auto] No free slot available! Cooling down for {0}.' -f $delta)
+                return ('[Monitor] No free slot available! Cooling down for {0}.' -f $delta)
             }
             # No future reset across any slot is rare (would mean every
             # bucket has resets_at=null, i.e. no slot has made a live
             # API call yet). Give the user a short message rather than
             # interpolating a useless 'unknown'.
-            return '[Auto] No free slot available! Waiting for the next poll.'
+            return '[Monitor] No free slot available! Waiting for the next poll.'
         }
 
         default {
@@ -4716,17 +4692,18 @@ function Invoke-UsageWatch {
     # short-lived `claude -p` the warmup spawns is awaited to exit before
     # the next swap, so it never overlaps a file write.
     # Same guard / wording as Invoke-SwitchAction so the user sees a
-    # consistent message regardless of entry point. -Auto additionally
-    # re-checks Test-ClaudeRunning before every rotation attempt to
-    # cover the "Claude Code launched mid-watch" race; -Warmup's window
-    # is short enough (one round-robin pass) that the pre-loop check
-    # is the only one needed.
+    # consistent message regardless of entry point. Only `sca monitor`
+    # reaches this branch ($Auto is always set by Invoke-MonitorAction;
+    # `usage -Watch` is read-only and sets neither switch). -Auto
+    # additionally re-checks Test-ClaudeRunning before every rotation
+    # attempt to cover the "Claude Code launched mid-watch" race;
+    # -Warmup's window is short enough (one round-robin pass) that the
+    # pre-loop check is the only one needed.
     # Checked BEFORE the IsOutputRedirected guard so the user sees the
     # more actionable "close Claude Code" message rather than the
     # interactive-terminal one (which the test harness always hits).
     if (($Auto -or $Warmup) -and (Test-ClaudeRunning)) {
-        $flag = if ($Auto) { '-Auto' } else { '-Warmup' }
-        throw "Claude Code is running. Close it before 'sca usage $flag' so the credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
+        throw "Claude Code is running. Close it before 'sca monitor' so the credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
     }
 
     if ([Console]::IsOutputRedirected) {
@@ -4765,7 +4742,7 @@ function Invoke-UsageWatch {
         # appended (in DarkGray, like the [Watch] lines) to every frame
         # until the next state change. Initial value 'Enabled' shows the
         # mode is engaged before the first rotation event.
-        $lastAutoFooter = if ($Auto) { '[Auto] Automatic slot switching is enabled.' } else { $null }
+        $lastAutoFooter = if ($Auto) { '[Monitor] Automatic slot switching is enabled.' } else { $null }
 
         # -Warmup footer-line latch + per-slot last-re-warm map. The latch
         # parallels $lastAutoFooter (steady-state line until a keep-warm
@@ -4909,9 +4886,9 @@ function Invoke-UsageWatch {
             # poll boundaries (timestamp updates only on poll), but the
             # rebuild is a cheap concat and keeps the redraw path single-
             # branch. Multi-line only when the previous poll failed.
-            # Order: [Auto] state (if -Auto) -> [Warmup] state (if -Warmup)
+            # Order: [Monitor] state (if -Auto) -> [Warmup] state (if -Warmup)
             # -> [Watch] Last poll -> [Watch] Last poll failed (if any).
-            # The mode-state lines ([Auto], [Warmup]) lead the block so the
+            # The mode-state lines ([Monitor], [Warmup]) lead the block so the
             # user's eye finds them first; transport-level details (poll
             # timestamp, failure tail) follow underneath.
             $footer = ''
@@ -4945,7 +4922,7 @@ function Invoke-UsageWatch {
                 Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
             } else {
                 # First poll failed and we have nothing to render yet.
-                # $footer already leads with the [Auto] line (when -Auto
+                # $footer already leads with the [Monitor] line (when -Auto
                 # is set) via the composition above, so a single
                 # Format-UsageFooter call places auto-mode state above
                 # the 'Waiting...' advisory; no separate standalone
@@ -5021,6 +4998,17 @@ function Invoke-Main {
         return
     }
 
+    # Cross-action flag-misuse guards. Only the switch flags are guarded:
+    # -Watch / -Json belong to read-only `usage`, -KeepWarm to `monitor`.
+    # The int flags (-Threshold / -Interval) live in __AllParameterSets and
+    # are harmless when an action ignores them, so they need no guard.
+    if ($Action -eq 'monitor' -and ($Watch -or $Json)) {
+        throw "'monitor' is always a live, side-effecting watch; -Watch / -Json do not apply. For a read-only live view use 'sca usage -Watch'."
+    }
+    if ($KeepWarm -and $Action -ne 'monitor') {
+        throw "-KeepWarm applies only to 'sca monitor'. Did you mean 'sca monitor -KeepWarm'?"
+    }
+
     # We are ensuring the credentials directory exists before
     # attempting any file operations within it.
     if (-not (Test-Path -LiteralPath $CredDir)) {
@@ -5040,8 +5028,9 @@ function Invoke-Main {
             "switch"    { Invoke-SwitchAction -Name $Name }
             "list"      { Invoke-ListAction }
             "remove"    { Invoke-RemoveAction -Name $Name }
-            "usage"     { Invoke-UsageAction  -Name $Name -Json:$Json -Watch:$Watch -Interval $Interval -Auto:$Auto -Threshold $Threshold -Warmup:$Warmup }
-            "warmup"    { Invoke-WarmupAction -Name $Name }
+            "usage"     { Invoke-UsageAction   -Name $Name -Json:$Json -Watch:$Watch -Interval $Interval }
+            "monitor"   { Invoke-MonitorAction -Name $Name -Threshold $Threshold -KeepWarm:$KeepWarm -Interval $Interval }
+            "warmup"    { Invoke-WarmupAction  -Name $Name }
         }
     }
     finally {

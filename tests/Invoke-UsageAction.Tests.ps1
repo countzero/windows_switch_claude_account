@@ -1026,7 +1026,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match "'cached' is currently rate-limited by Anthropic; showing last known usage\."
         }
 
-        It 'Format-UsageFrame renders the advisory in the footer block, leading the [Auto]/[Watch] lines' {
+        It 'Format-UsageFrame renders the advisory in the footer block, leading the [Monitor]/[Watch] lines' {
             $snap = [pscustomobject]@{
                 Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
                     Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
@@ -1038,7 +1038,7 @@ Describe 'switch_claude_account' {
             $out = Format-UsageFrame -Snapshot $snap -Footer "[Watch] Last poll at 07:56:48" 6>&1 | Out-String
 
             # Advisory moved out from under the table and into the footer
-            # block, leading the [Watch] line (and, when present, [Auto]).
+            # block, leading the [Watch] line (and, when present, [Monitor]).
             # 'throttled' appears first in the table row, then again in the
             # advisory; the advisory-only phrase anchors the ordering check.
             ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('currently rate-limited'))
@@ -2300,88 +2300,10 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'Invoke-UsageAction -Auto integration' {
-        # These exercise Invoke-UsageAction's own -Auto plumbing (not the
-        # watch loop, which requires an interactive terminal). The watch
-        # loop's auto-rotation step is unit-tested in
-        # Invoke-AutoRotation.Tests.ps1; here we cover the action-level
-        # contract: param mutual-exclusion guards and the Claude-Code
-        # running startup refusal that fires inside Invoke-UsageWatch.
-
-        It '-Auto without -Watch is rejected by the runtime guard' {
-            { Invoke-UsageAction -Auto 6>$null } | Should -Throw -ExpectedMessage '*-Auto requires -Watch*'
-        }
-
-        It '-Watch -Auto with Claude Code running throws at startup before entering the alt-screen buffer' {
-            # The Claude-Code guard runs BEFORE the IsOutputRedirected
-            # guard inside Invoke-UsageWatch, so this test is safe to
-            # run on an interactive terminal: Test-ClaudeRunning mocked
-            # to $true short-circuits before the alt-screen `Write-VTSequence`
-            # ever fires.
-            Mock Test-ClaudeRunning -MockWith { $true }
-
-            { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*sca usage -Auto*'
-        }
-
-        It '-Watch -Auto with Claude Code NOT running passes the startup guard and short-circuits on IsOutputRedirected' {
-            # Test-ClaudeRunning's default mock returns $false. The guard
-            # silently passes; the alt-screen / IsOutputRedirected guard
-            # throws next because Pester's stdout is redirected.
-            #
-            # BUT: on an interactive terminal (running the test runner
-            # directly without output redirection), IsOutputRedirected
-            # is $false and the guard does NOT fire. Execution then
-            # proceeds to the alt-screen `Write-VTSequence "`e[?1049h"`,
-            # which BLANKS THE TERMINAL until the watch loop exits. The
-            # established pattern at line 973-976 above is to skip this
-            # test when the host is interactive; do the same here.
-            if (-not [Console]::IsOutputRedirected) {
-                Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
-                return
-            }
-            { Invoke-UsageWatch -Auto 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
-        }
-    }
-
-    Context 'Invoke-UsageAction -Warmup integration' {
-        # Action-level contract for the -Warmup flag: the runtime guard
-        # rejects -Warmup without -Watch (catches direct callers that
-        # bypass the top-level Param block's parameter-set binding),
-        # AND -Watch -Warmup with Claude Code running is refused at
-        # startup (v2.5.0: warmup writes ~/.claude.json's oauthAccount
-        # block via Invoke-SlotSwap, same race as -Auto).
-
-        It '-Warmup without -Watch is rejected by the runtime guard' {
-            { Invoke-UsageAction -Warmup 6>$null } | Should -Throw -ExpectedMessage '*-Warmup requires -Watch*'
-        }
-
-        It '-Watch -Warmup with Claude Code running throws at startup before entering the alt-screen buffer' {
-            # v2.5.0: warmup performs Invoke-SlotSwap per slot in a
-            # round-robin, which writes ~/.claude.json. Same race as
-            # -Auto against Claude Code's in-memory ~/.claude.json
-            # cache, so the same pre-loop guard applies. Test mirrors
-            # the -Auto version above; the throw message names the
-            # specific flag.
-            Mock Test-ClaudeRunning -MockWith { $true }
-
-            { Invoke-UsageWatch -Warmup 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*sca usage -Warmup*'
-        }
-
-        It '-Watch -Warmup with Claude Code NOT running passes the startup guard and short-circuits on IsOutputRedirected' {
-            # Test-ClaudeRunning's default mock returns $false. The guard
-            # silently passes; the IsOutputRedirected guard throws next
-            # because Pester's stdout is redirected. On an interactive
-            # terminal (test runner invoked without redirection),
-            # IsOutputRedirected is $false and the alt-screen would
-            # blank the terminal; skip in that case (same pattern as
-            # the -Auto sibling test above).
-            if (-not [Console]::IsOutputRedirected) {
-                Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
-                return
-            }
-            { Invoke-UsageWatch -Warmup 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
-        }
-    }
+    # The `usage -Auto` / `usage -Warmup` integration contexts were removed
+    # in 3.0.0: those flags moved to the `monitor` action. The watch-engine
+    # guards they exercised (Claude-Code refusal, interactive-terminal
+    # requirement) are now covered in Invoke-MonitorAction.Tests.ps1.
 
     Context 'anthropic-version header propagation' {
         # Defense-in-depth: assert that every authenticated request adds
