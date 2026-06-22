@@ -921,7 +921,6 @@ function Show-Help {
         "",
         "NOTES",
         "  * Close Claude Code / VS Code before 'save', 'switch', 'warmup', or 'monitor'.",
-        "  * 'sca monitor' auto-rotates by default. For a read-only live view, use 'sca usage -Watch'.",
         "  * OpenCode + opencode-claude-auth support swapping Anthropic accounts without restart.",
         ""
     )
