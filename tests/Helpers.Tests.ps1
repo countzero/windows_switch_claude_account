@@ -864,9 +864,10 @@ Describe 'switch_claude_account' {
             #                                  inner site already wraps the
             #                                  swap in 6>$null)
             #
-            # All three land in the alt buffer BEFORE the frame's ESC[2J
-            # clear, so without 6>$null suppression the user sees a
-            # sub-frame flash (<100 ms) that no human can read. The
+            # All three print straight to the alt buffer, OUTSIDE the
+            # captured frame; without 6>$null suppression the in-place
+            # repaint (no ESC[2J) never overwrites them and the user is
+            # left with a stray advisory line they cannot dismiss. The
             # outer-most call sites for #1 and #2 must therefore carry
             # 6>$null; #3's inner site is asserted separately by the
             # Invoke-AutoRotationStep tests.
@@ -927,9 +928,9 @@ Describe 'switch_claude_account' {
                 $hasInfoSuppression | Should -BeTrue -Because (
                     'every Invoke-Reconcile inside Invoke-UsageWatch must ' +
                     'suppress information stream (6>$null); without it the ' +
-                    "[Sync] auto-save / identity-change advisories flash " +
-                    'in the alt buffer for a few milliseconds before the ' +
-                    'next frame ESC[2J wipes them.')
+                    "[Sync] auto-save / identity-change advisories print " +
+                    'to the alt buffer outside the captured frame, where ' +
+                    'the in-place repaint (no ESC[2J) never clears them.')
             }
 
             $snapshotInvocations = @($allCommands | Where-Object {
@@ -953,8 +954,9 @@ Describe 'switch_claude_account' {
                     'every Get-UsageSnapshot inside Invoke-UsageWatch must ' +
                     'suppress information stream (6>$null); Update-SlotTokens ' +
                     "(called via Get-SlotUsage) writes [Sync] yellow advisories " +
-                    'on its two unhappy paths and those would flash in the ' +
-                    'alt buffer before ESC[2J wipes them.')
+                    'on its two unhappy paths and those would print to the ' +
+                    'alt buffer outside the captured frame, lingering past ' +
+                    'the in-place repaint (no ESC[2J clears them).')
             }
         }
 
@@ -1040,8 +1042,8 @@ Describe 'switch_claude_account' {
                 $m.Value | Should -Match '6>\$null' -Because (
                     'Invoke-SlotSwap inside Invoke-AutoRotationStep must ' +
                     'suppress information stream; the [Switch] advisory ' +
-                    'on ~/.claude.json write failure would flash sub-frame ' +
-                    'before the next watch frame ESC[2J wipes it.')
+                    'on ~/.claude.json write failure would print outside ' +
+                    'the captured frame and linger past the in-place repaint.')
             }
         }
 
@@ -1051,7 +1053,8 @@ Describe 'switch_claude_account' {
             # whose nested Invoke-SlotSwap / Invoke-Reconcile / Get-SlotUsage
             # emit yellow advisories (e.g. [Warmup] restore-failure, [Sync]
             # token-propagation). Keep-warm owns its own footer line; the
-            # inner advisory would flash sub-frame before the next ESC[2J.
+            # inner advisory would print outside the captured frame and
+            # linger past the in-place repaint (no ESC[2J clears it).
             #
             # Walk CommandAst nodes (real invocations) rather than regexing
             # the body text, so a comment mentioning Invoke-WarmAllSlots is
@@ -1079,9 +1082,119 @@ Describe 'switch_claude_account' {
                 $hasInfoSuppression | Should -BeTrue -Because (
                     'Invoke-WarmAllSlots inside Invoke-KeepWarmStep must ' +
                     'suppress information stream (6>$null); its nested ' +
-                    'advisories would flash sub-frame before the next watch ' +
-                    'frame ESC[2J wipes them.')
+                    'advisories would print outside the captured frame and ' +
+                    'linger past the in-place repaint (no ESC[2J).')
             }
+        }
+    }
+
+    Context 'Watch-mode frame capture and in-place repaint' {
+        # Unit coverage for the two helpers that make the watch loop's
+        # single-write, no-clear repaint work (the flicker fix): the loop is
+        # an infinite Start-Sleep loop and stays untested, but these helpers
+        # are pure enough to drive directly.
+
+        It 'ConvertTo-WatchFrameSequence homes the cursor and ends with erase-below' {
+            $seq = ConvertTo-WatchFrameSequence "line1`nline2"
+            $seq.StartsWith("`e[H")  | Should -BeTrue -Because 'frame must re-home, not scroll'
+            $seq.EndsWith("`e[0J")   | Should -BeTrue -Because 'trailing erase-below drops rows left by a taller previous frame'
+        }
+
+        It 'ConvertTo-WatchFrameSequence never full-clears (no ESC[2J)' {
+            # The core of the flicker fix: a clear-then-redraw blanks to black
+            # and -- when DEC 2026 is unavailable or the machine is loaded --
+            # the user sees "black -> row for row". In-place overwrite must
+            # never emit ESC[2J.
+            $seq = ConvertTo-WatchFrameSequence "a`nb`nc"
+            $seq.Contains("`e[2J") | Should -BeFalse
+        }
+
+        It 'ConvertTo-WatchFrameSequence appends one ESC[K (erase-to-EOL) per line' {
+            # Per-line erase-to-EOL is what lets a line that shrank between
+            # frames overwrite its stale tail in place without a full clear.
+            $seq = ConvertTo-WatchFrameSequence "aaa`nbbb`nccc"
+            ([regex]::Matches($seq, [regex]::Escape("`e[K"))).Count |
+                Should -Be 3
+        }
+
+        It 'ConvertTo-WatchFrameSequence tolerates empty input' {
+            ConvertTo-WatchFrameSequence '' | Should -Be "`e[H`e[K`e[0J"
+        }
+
+        It 'Get-WatchFrameText keeps a -NoNewline segment chain on one line' {
+            # The -Auto header is built from several `Write-* -NoNewline`
+            # segments plus a terminating newline; the capture must rejoin
+            # them as a single line, not split per segment.
+            Get-WatchFrameText { Write-Host 'A' -NoNewline; Write-Host 'B' } |
+                Should -Be "AB`n"
+            Get-WatchFrameText { Write-Host 'A'; Write-Host 'B' } |
+                Should -Be "A`nB`n"
+        }
+
+        It 'Get-WatchFrameText strips SGR under OutputRendering=PlainText (-NoColor)' {
+            # Common.ps1 sets PlainText for the session. The captured
+            # .Message carries raw SGR that [Console]::Out.Write would not
+            # strip, so Get-WatchFrameText must drop it itself in PlainText.
+            $text = Get-WatchFrameText { Write-Color 'X' 'Red' }
+            $text | Should -Be "X`n"
+            $text.Contains("`e[") | Should -BeFalse
+        }
+
+        It 'Get-WatchFrameText preserves SGR when OutputRendering is not PlainText' {
+            $prev = $PSStyle.OutputRendering
+            try {
+                $PSStyle.OutputRendering = 'Ansi'
+                $text = Get-WatchFrameText { Write-Color 'X' 'Red' }
+                $text.Contains("`e[") | Should -BeTrue -Because 'color frames keep their SGR for [Console]::Out.Write'
+            } finally {
+                $PSStyle.OutputRendering = $prev
+            }
+        }
+
+        It 'Get-WatchFrameText round-trips a stray non-Write-Host success object as text' {
+            # Defensive branch: a renderer that leaks a pipeline object must
+            # not crash the capture (no .MessageData on a bare string).
+            $text = Get-WatchFrameText { 'leaked'; Write-Host 'B' }
+            $text | Should -Be "leaked`nB`n"
+        }
+
+        It 'Invoke-UsageWatch never full-clears the screen (no ESC[2J literal)' {
+            # AST guard for the flicker fix: a future edit that reintroduces
+            # a clear-then-redraw fails here. Prose mentions of "ESC[2J" use
+            # the spelled-out form, so the backtick-e literal match ignores
+            # them.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-UsageWatch'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+            $func.Extent.Text | Should -Not -Match '`e\[2J' -Because (
+                'the watch repaints in place (home + per-line ESC[K + trailing ' +
+                'ESC[0J); an ESC[2J reintroduces the black -> row-by-row flash.')
+        }
+
+        It 'Invoke-UsageWatch forces UTF-8 console output encoding and restores it (glyph regression)' {
+            # Regression guard: the frame body is painted via [Console]::Out
+            # .Write, which encodes through [Console]::OutputEncoding. On a
+            # legacy OEM codepage (e.g. CP850) the bar / play / ellipsis
+            # glyphs become '?'. The watch must force UTF-8 and restore the
+            # original on exit.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-UsageWatch'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+            $body = $func.Extent.Text
+            $body | Should -Match 'OutputEncoding\s*=\s*\[System\.Text\.UTF8Encoding\]' -Because (
+                'frame glyphs degrade to "?" unless [Console]::Out writes UTF-8')
+            $body | Should -Match '\$origEncoding' -Because (
+                'the pre-watch console encoding must be captured and restored on exit')
         }
     }
 

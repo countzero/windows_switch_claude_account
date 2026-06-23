@@ -7,7 +7,7 @@ paths:
 
 ## Layout
 
-- One file per action under `tests/Invoke-<Action>Action.Tests.ps1`, plus `Helpers.Tests.ps1` and `Profile-Install.Tests.ps1`.
+- One file per action under `tests/Invoke-<Action>Action.Tests.ps1`, plus cross-cutting suites for non-action units: `Helpers.Tests.ps1`, `Profile-Install.Tests.ps1`, `Invoke-Reconcile.Tests.ps1`, `Invoke-AutoRotation.Tests.ps1`, and `State-File.Tests.ps1`.
 - Each file's outer `Describe` is named `'switch_claude_account'` so `-FullNameFilter` recipes work uniformly across files.
 - Shared per-test setup lives in `tests/Common.ps1`, dot-sourced from each file's `BeforeEach`.
 

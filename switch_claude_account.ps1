@@ -78,8 +78,9 @@ Param (
     # anchor of its own (its set is selected by the positional Action,
     # which parameter sets cannot key off). [ValidateRange] rejects zero /
     # negatives at bind time; the 60-second floor is a runtime
-    # clamp-with-advisory inside Invoke-UsageWatch (see AGENTS.md "Watch
-    # mode"). Ignored by actions other than `usage -Watch` / `monitor`.
+    # clamp-with-advisory inside Invoke-UsageWatch (see "Watch mode" in
+    # .claude/rules/script-internals.md). Ignored by actions other than
+    # `usage -Watch` / `monitor`.
     [ValidateRange(1, [int]::MaxValue)]
     [int] $Interval = 60,
 
@@ -155,7 +156,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '3.0.0'
+$Script:ScriptVersion = '3.0.1'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -507,7 +508,7 @@ function Update-ScaState {
 # `~/.claude.json` config file. The /status screen's "Email:" line reads
 # `oauthAccount.emailAddress` from this cache; the cache is populated once at
 # login (from /api/oauth/profile) and is NOT refreshed on subsequent token
-# refreshes (see binary RE in AGENTS.md). This file is therefore the single
+# refreshes. This file is therefore the single
 # authoritative source of "what email is Claude Code displaying right now."
 #
 # sca uses ~/.claude.json two ways:
@@ -522,7 +523,7 @@ function Update-ScaState {
 # in an in-memory cache (Un.config) that is not auto-invalidated on external
 # changes, and a flush from a running Claude Code instance would silently
 # overwrite our oauthAccount mutation. Refuse-while-running is the chosen
-# mitigation; see decision (2) in AGENTS.md's planning history.
+# mitigation.
 
 # Returns $true if any process named 'claude' is running on the host.
 # Get-Process enumerates processes from ALL users on the system (limited
@@ -631,7 +632,7 @@ function Get-SHA256Hex {
 # would wipe Claude Code's cached identity when the sidecar carries the
 # /api/oauth/profile-fallback's null defaults) is blocked.
 #
-# Pre-flight test (AGENTS.md history) verified this approach: editing
+# A pre-flight test verified this approach: editing
 # emailAddress and restarting Claude Code makes /status report the new
 # value, and the rest of the file round-trips byte-equal.
 #
@@ -1016,6 +1017,56 @@ function Write-VTSequence {
 
     [Console]::Out.Write($Sequence)
     [Console]::Out.Flush()
+}
+
+# Capture a frame renderer's Write-Host / Write-Color output as one string.
+# The renderer writes to the information stream (6); `6>&1` merges it so we
+# can rebuild the line breaks from each record's NoNewLine flag (which keeps
+# the -Auto header's multi-segment line -- built with `Write-* -NoNewline`
+# -- as a single line). The captured `.Message` carries the raw SGR bytes
+# that Write-Color embedded; [Console]::Out.Write does NOT strip them, so we
+# drop SGR ourselves when -NoColor / NO_COLOR put OutputRendering into
+# PlainText, mirroring the StringDecorated filter Write-Host would apply (see
+# Write-VTSequence docblock for the regex). This is the capture half of the
+# watch loop's flicker-free single-write paint; ConvertTo-WatchFrameSequence
+# is the transform half.
+function Get-WatchFrameText {
+    Param ([Parameter(Mandatory)] [scriptblock] $RenderScript)
+
+    $sb = [System.Text.StringBuilder]::new()
+    foreach ($rec in (& $RenderScript 6>&1)) {
+        $md = $rec.MessageData
+        if ($md -is [System.Management.Automation.HostInformationMessage]) {
+            [void]$sb.Append($md.Message)
+            if (-not $md.NoNewLine) { [void]$sb.Append("`n") }
+        } else {
+            # Defensive: a renderer that leaks a non-Write-Host object to the
+            # success stream still round-trips as text rather than crashing.
+            [void]$sb.Append([string]$rec).Append("`n")
+        }
+    }
+    $text = $sb.ToString()
+    if ($PSStyle.OutputRendering -eq 'PlainText') {
+        $text = [regex]::Replace($text, "`e\[[0-9;]*m", '')
+    }
+    return $text
+}
+
+# Turn a captured frame string into an in-place-overwrite VT sequence:
+# cursor-home (ESC[H), every line self-clearing its tail (ESC[K), then a
+# trailing erase-below (ESC[0J) to drop any rows left by a taller previous
+# frame. Deliberately NO ESC[2J: the frame is never blanked to black, so a
+# render tick that lands mid-paint on a loaded machine shows the previous
+# frame under the new one (imperceptible, the frames are near-identical)
+# instead of the "black -> row for row" flash that a clear-then-redraw
+# produces when the terminal lacks DEC 2026 or is too busy to honor it.
+# This is the ANSI equivalent of how PSReadLine / SetBufferContents repaint:
+# overwrite in place, never clear.
+function ConvertTo-WatchFrameSequence {
+    Param ([AllowEmptyString()] [AllowNull()] [string] $FrameText)
+
+    $body = (($FrameText -split "`n") | ForEach-Object { $_ + "`e[K" }) -join "`n"
+    return "`e[H" + $body + "`e[0J"
 }
 
 # We are sanitizing names to ensure compatibility with the
@@ -1526,8 +1577,7 @@ function Invoke-SaveAction {
     # in-memory cache and may flush back to disk at any moment. Saving
     # while Claude Code runs would silently capture stale identity into
     # the sidecar AND risk overwriting our writes if a flush races our
-    # write. Refuse-while-running is the chosen mitigation; see
-    # AGENTS.md's planning history for the binary-RE rationale.
+    # write. Refuse-while-running is the chosen mitigation.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca save' so identity capture is consistent."
     }
@@ -1761,7 +1811,7 @@ function Invoke-SwitchAction {
     # oauthAccount block from the destination slot's sidecar, and a
     # running Claude Code instance keeps that file in an in-memory
     # cache that may flush and clobber our update. Refusing is the
-    # simplest reliability guarantee; see AGENTS.md's planning history.
+    # simplest reliability guarantee.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca switch' so the email-display change applies cleanly."
     }
@@ -4590,21 +4640,27 @@ function Get-EarlyRepollLastPoll {
 # visibility. On HTTP failure the previous snapshot stays visible and
 # an advisory is appended to the footer so the display never blanks.
 #
-# Flicker-free rendering. Each frame is wrapped in DEC mode 2026
-# (synchronized output: ESC[?2026h … ESC[?2026l) with ESC[2J + cursor-
-# home (ESC[H) at the start. Inside the sync envelope the terminal
-# buffers the clear-and-redraw and presents one atomic frame, so the
-# user never sees the intermediate "blank screen" frame that Clear-Host
-# produced. The watch also enters the alternate screen buffer
-# (ESC[?1049h) so the pre-watch terminal scrollback is restored on
-# exit, mirroring how top / htop / vim behave. Terminals without DEC
-# 2026 support (e.g. legacy ConHost) silently ignore the unknown DEC
-# private mode and fall back to the previous Clear-Host-style flicker.
-# No regression. Renderer functions are reused unchanged; only this
-# loop emits the wrapper sequences.
+# Flicker-free rendering. Each frame is rendered to a string
+# (Get-WatchFrameText), then painted in a single write as cursor-home
+# (ESC[H) + per-line erase-to-EOL (ESC[K) + trailing erase-below (ESC[0J)
+# via ConvertTo-WatchFrameSequence, wrapped in the DEC 2026 sync envelope
+# (ESC[?2026h … ESC[?2026l). The frame is overwritten in place and never
+# blanked to black -- there is no ESC[2J -- so even when the terminal
+# lacks DEC 2026 or is too loaded to honor it, a render tick that lands
+# mid-paint shows the previous (near-identical) frame underneath instead
+# of the "black -> row for row" flash a clear-then-redraw produces. This
+# is the ANSI equivalent of how PSReadLine / SetBufferContents repaint:
+# overwrite in place, never clear. DEC 2026 (Win Terminal >= 1.23, VS
+# Code, iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal, mintty,
+# modern ConHost) is now a bonus tier that also suppresses sub-frame
+# tearing on capable terminals; older terminals ignore the unknown DEC
+# private mode with no regression. The watch also enters the alternate
+# screen buffer (ESC[?1049h) so the pre-watch terminal scrollback is
+# restored on exit, mirroring how top / htop / vim behave. Renderer
+# functions are reused unchanged; this loop captures and repaints them.
 #
-# VT control sequences (alt buffer, sync mode, cursor hide/show, clear,
-# home) are emitted via `Write-VTSequence` so they bypass the
+# VT control sequences (alt buffer, sync mode, cursor hide/show, home,
+# erase) are emitted via `Write-VTSequence` so they bypass the
 # `Write-Host` -> `StringDecorated.AnsiRegex` filter that
 # `OutputRendering = 'PlainText'` (set by `-NoColor` / `NO_COLOR`)
 # applies. The filter strips DEC private modes (`ESC[?...h/l`) including
@@ -4672,6 +4728,17 @@ function Invoke-UsageWatch {
     }
 
     $origCursor = [Console]::CursorVisible
+    # Capture the pre-watch console output encoding. The frame body is
+    # painted via Write-VTSequence -> [Console]::Out.Write, which encodes
+    # the string through [Console]::OutputEncoding; on Windows that defaults
+    # to a legacy OEM codepage (e.g. CP850) that cannot represent the bar
+    # glyphs (█ ▓), the auto-mode glyph (▶), the ellipsis (…), or the em
+    # dash (—), so they render as '?'. Write-Host did not hit this because
+    # the PowerShell host writes UTF-16 to the console (WriteConsoleW),
+    # bypassing the codepage. Forcing UTF-8 for the watch's duration makes
+    # [Console]::Out.Write emit those glyphs correctly; the finally restores
+    # the original encoding so the user's post-watch shell is unaffected.
+    $origEncoding = [Console]::OutputEncoding
     # Capture the pre-watch terminal title so the `finally` block can
     # restore it on Ctrl-C. $Host.UI.RawUI.WindowTitle is the only
     # portable read path (no terminal protocol reliably reports the
@@ -4681,6 +4748,11 @@ function Invoke-UsageWatch {
     $origTitle  = try { $Host.UI.RawUI.WindowTitle } catch { $null }
     $enteredAlt = $false
     try {
+        # UTF-8 so [Console]::Out.Write renders the non-ASCII frame glyphs
+        # (see $origEncoding capture above). Wrapped in try so a host that
+        # forbids the change (rare) does not abort the watch; the glyphs
+        # would degrade to '?' but the loop still runs.
+        try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { Write-Verbose "UTF-8 console encoding not settable: $_" }
         # Enter alt screen buffer + hide cursor in one write. The alt
         # buffer gives a clean canvas and ensures the user's pre-watch
         # scrollback is restored on exit. Cursor-hide stops the caret
@@ -4727,9 +4799,14 @@ function Invoke-UsageWatch {
                 $startupFooter = ''
                 if ($lastAutoFooter)   { $startupFooter = $lastAutoFooter + "`n" }
                 if ($lastWarmupFooter) { $startupFooter += $lastWarmupFooter }
-                Write-VTSequence "`e[?2026h`e[2J`e[H"
-                Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
-                Write-VTSequence "`e[?2026l"
+                # Same in-place-overwrite single-write paint as the polling
+                # loop (no ESC[2J); the alt buffer is already blank on entry,
+                # so the first warmup repaint has nothing stale to clear and
+                # each subsequent per-slot repaint overwrites in place.
+                $frameText = Get-WatchFrameText {
+                    Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
+                }
+                Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
             }
             if ($null -ne $snapshot) {
                 $lastPoll = [DateTime]::Now
@@ -4769,17 +4846,20 @@ function Invoke-UsageWatch {
                     # happened since the last poll is captured into the
                     # tracked slot before we read its bytes for the
                     # /api/oauth/usage call. Suppressed stdout; any
-                    # advisory the reconcile emits would flash on every
-                    # poll and the per-frame ESC[2J would shred it anyway.
+                    # advisory the reconcile emits would print straight to
+                    # the alt buffer (outside the captured frame) and the
+                    # in-place repaint would not overwrite it cleanly anyway.
                     Invoke-Reconcile 6>$null | Out-Null
                     # 6>$null on Get-UsageSnapshot: Update-SlotTokens
                     # (called via Get-SlotUsage when a token is within 60s
                     # of expiry) emits yellow [Sync] advisories on its two
                     # unhappy paths (propagation-to-.credentials.json
                     # failure, or active slot sidecar-orphaned). Those
-                    # Write-Host calls would land in the alt buffer
-                    # BEFORE the next frame's ESC[2J wipes it, producing
-                    # a sub-frame flash the user cannot read. Suppress
+                    # Write-Host calls would print to the alt buffer outside
+                    # the captured frame and linger (the in-place repaint
+                    # overwrites only the cells the frame occupies, never
+                    # ESC[2J-clears), producing a stray line the user cannot
+                    # dismiss. Suppress
                     # them here; the user still sees the same condition
                     # in non-watch contexts (`sca usage`, `sca list`).
                     # Matches the Invoke-Reconcile 6>$null above and the
@@ -4864,29 +4944,36 @@ function Invoke-UsageWatch {
             # 0 as "no tag").
             $autoHeaderThreshold = if ($Auto) { $Threshold } else { 0 }
 
-            # Atomic frame: begin sync update, clear screen, cursor home,
-            # draw via the existing renderer, end sync update. All output
-            # between ESC[?2026h and ESC[?2026l is buffered by the
-            # terminal and presented in one swap; no flicker on
-            # terminals that support the mode (Win Terminal, VS Code,
-            # iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal,
-            # mintty, modern ConHost). Older terminals ignore the
-            # unknown DEC mode markers and exhibit the prior
-            # Clear-Host-style flicker; no regression.
-            Write-VTSequence "`e[?2026h`e[2J`e[H"
-            if ($null -ne $snapshot) {
-                Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
-            } else {
-                # First poll failed and we have nothing to render yet.
-                # $footer already leads with the [Monitor] line (when -Auto
-                # is set) via the composition above, so a single
-                # Format-UsageFooter call places auto-mode state above
-                # the 'Waiting...' advisory; no separate standalone
-                # print needed.
-                Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Yellow'
-                Format-UsageFooter $footer
+            # In-place-overwrite frame: render to a string, then paint it in
+            # a single write as cursor-home + per-line erase-to-EOL + trailing
+            # erase-below (ConvertTo-WatchFrameSequence), wrapped in the DEC
+            # 2026 sync envelope. The single write + the absence of ESC[2J is
+            # what makes this flicker-free even on a loaded machine or a
+            # terminal without DEC 2026: nothing is ever blanked to black, so
+            # a mid-paint render tick shows the previous (near-identical)
+            # frame underneath rather than the "black -> row for row" flash a
+            # clear-then-redraw produces. DEC 2026 (Win Terminal >= 1.23, VS
+            # Code, iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal,
+            # mintty, modern ConHost) is now a bonus that also suppresses
+            # sub-frame tearing, not the sole defense. The repaint runs every
+            # tick unconditionally, which also self-heals a terminal resize
+            # within ~1 s (the per-line ESC[K + trailing ESC[0J reclaim any
+            # stale cells from the old geometry).
+            $frameText = Get-WatchFrameText {
+                if ($null -ne $snapshot) {
+                    Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
+                } else {
+                    # First poll failed and we have nothing to render yet.
+                    # $footer already leads with the [Monitor] line (when -Auto
+                    # is set) via the composition above, so a single
+                    # Format-UsageFooter call places auto-mode state above
+                    # the 'Waiting...' advisory; no separate standalone
+                    # print needed.
+                    Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Yellow'
+                    Format-UsageFooter $footer
+                }
             }
-            Write-VTSequence "`e[?2026l"
+            Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
 
             # 1-second inter-frame wait. Decoupling redraw cadence from
             # poll cadence lets the screen self-heal on terminal resize
@@ -4915,6 +5002,12 @@ function Invoke-UsageWatch {
             Write-VTSequence "`e[?25h`e[?1049l"
         }
         [Console]::CursorVisible = $origCursor
+        # Restore the pre-watch console output encoding last, after the
+        # alt-buffer leave + title restore have been written through the
+        # UTF-8 writer (the original title may itself carry non-ASCII).
+        if ($origEncoding) {
+            try { [Console]::OutputEncoding = $origEncoding } catch { Write-Verbose "Restoring console encoding failed: $_" }
+        }
     }
 }
 

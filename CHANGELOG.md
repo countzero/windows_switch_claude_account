@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] - 2026-06-23
+
+### Fixed
+- `sca usage -Watch` and `sca monitor` no longer flash to black and repaint row by row on a heavily loaded machine. Each frame is now painted as a single in-place overwrite (cursor-home, per-line erase, no full-screen clear), so the terminal can never be caught showing a half-drawn frame; DEC 2026 synchronized output is now a bonus on capable terminals rather than the sole safeguard.
+- The live watch renders the aggregate bars (`█` / `▓`), the auto-rotation `▶` indicator, and the `…` / `—` glyphs correctly instead of as `?` on a legacy OEM codepage (e.g. CP850); it now writes UTF-8 to the console and restores the previous encoding on exit.
+
 ## [3.0.0] - 2026-06-22
 
 ### Added
