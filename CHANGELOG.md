@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] - 2026-06-23
+
+### Fixed
+- `sca usage -Watch` / `sca monitor` no longer flash black and repaint row-by-row on a loaded machine. Each frame is now rendered to a string and painted in a single in-place overwrite (cursor-home + per-line erase-to-EOL + erase-below) with no full-screen clear, so a clear-then-redraw can never expose a half-drawn frame. DEC 2026 synchronized output remains a bonus on capable terminals rather than the sole defense.
+- The watch now forces UTF-8 console output encoding (restored on exit) so the aggregate bars (`█`/`▓`), the auto-rotation `▶` indicator, the ellipsis, and the em dash render correctly instead of as `?` on a legacy OEM codepage (e.g. CP850).
+
 ## [3.0.0] - 2026-06-22
 
 ### Added
