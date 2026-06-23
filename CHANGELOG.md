@@ -7,8 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.0.1] - 2026-06-23
 
 ### Fixed
-- `sca usage -Watch` / `sca monitor` no longer flash black and repaint row-by-row on a loaded machine. Each frame is now rendered to a string and painted in a single in-place overwrite (cursor-home + per-line erase-to-EOL + erase-below) with no full-screen clear, so a clear-then-redraw can never expose a half-drawn frame. DEC 2026 synchronized output remains a bonus on capable terminals rather than the sole defense.
-- The watch now forces UTF-8 console output encoding (restored on exit) so the aggregate bars (`█`/`▓`), the auto-rotation `▶` indicator, the ellipsis, and the em dash render correctly instead of as `?` on a legacy OEM codepage (e.g. CP850).
+- `sca usage -Watch` and `sca monitor` no longer flash to black and repaint row by row on a heavily loaded machine. Each frame is now painted as a single in-place overwrite (cursor-home, per-line erase, no full-screen clear), so the terminal can never be caught showing a half-drawn frame; DEC 2026 synchronized output is now a bonus on capable terminals rather than the sole safeguard.
+- The live watch renders the aggregate bars (`█` / `▓`), the auto-rotation `▶` indicator, and the `…` / `—` glyphs correctly instead of as `?` on a legacy OEM codepage (e.g. CP850); it now writes UTF-8 to the console and restores the previous encoding on exit.
 
 ## [3.0.0] - 2026-06-22
 
