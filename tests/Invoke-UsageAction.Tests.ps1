@@ -957,6 +957,58 @@ Describe 'switch_claude_account' {
             $snap.HasCacheFallback | Should -BeTrue
         }
 
+        It 'Get-UsageSnapshot sets HasError when a row could not be read' {
+            New-Slot -Name 'beta' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new('The request was canceled due to the configured HttpClient.Timeout of 12 seconds elapsing.')
+            }
+
+            $snap = Get-UsageSnapshot
+            $snap.HasError         | Should -BeTrue
+            $snap.HasRateLimited   | Should -BeFalse
+            $snap.HasCacheFallback | Should -BeFalse
+        }
+
+        # Regression guard for the blind spot that hid this for two releases:
+        # Format-UsageTable's 'error <code>' arm reads $Row.HttpStatus, but
+        # Get-UsageSnapshot did not project it, so the arm was unreachable in
+        # every real code path while its unit test passed against a hand-built
+        # row that already carried the field.
+        It 'Get-UsageSnapshot projects HttpStatus onto the row' {
+            New-Slot -Name 'beta' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 529 }
+                $inner = [System.Exception]::new('Response status code does not indicate success: 529.')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $snap = Get-UsageSnapshot
+            $row  = @($snap.Results)[0]
+            $row.Status     | Should -Be 'error'
+            $row.HttpStatus | Should -Be 529
+
+            # And the label the projection exists to enable actually renders.
+            $out = Format-UsageTable -Results @($row) 6>&1 | Out-String
+            $out | Should -Match 'error 529'
+            $out | Should -Not -Match 'does not indicate success'
+        }
+
+        It 'Get-UsageSnapshot projects FallbackReason onto the row' {
+            $slotPath = New-Slot -Name 'beta'
+            $Script:SlotUsageCache[$slotPath] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 4.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new('timeout')
+            }
+
+            $row = @((Get-UsageSnapshot).Results)[0]
+            $row.Status         | Should -Be 'ok'
+            $row.FallbackReason | Should -Be 'network'
+        }
+
         It 'Format-UsageFrame prints the footer under the table when -Footer is provided' {
             $snap = [pscustomobject]@{
                 Results = @([pscustomobject]@{ Name = 'alpha'; IsActive = $false; Status = 'ok';
@@ -1928,6 +1980,154 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Get-SlotUsage (network / timeout resilience)' {
+        # 3.1.0. A codeless transport failure (the HttpClient.Timeout case)
+        # used to return Status='error' immediately, discarding a perfectly
+        # good cached reading and wiping the row's numbers for a whole poll
+        # interval. It now runs the same fallback ladder as the 429 arm.
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+            Mock Start-Sleep -MockWith { }
+
+            function New-TimeoutSlot {
+                Param ([string] $Name)
+                $slot = Join-Path $script:CredDirPath ".credentials.$Name.json"
+                $payload = @{ claudeAiOauth = @{
+                    accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+                } } | ConvertTo-Json -Compress
+                Set-Content -LiteralPath $slot -Value $payload -NoNewline
+                return $slot
+            }
+
+            # The real message PS7 raises for -TimeoutSec: a TaskCanceledException
+            # carrying NO .Response, which is what made $status $null and sent the
+            # row down the generic arm.
+            $script:TimeoutMessage = 'The request was canceled due to the configured HttpClient.Timeout of 12 seconds elapsing.'
+        }
+
+        It 'serves a FRESH cache as ok, tagged as a network fallback' {
+            $slot = New-TimeoutSlot 'netfresh'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 22.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status                     | Should -Be 'ok'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.FallbackReason             | Should -Be 'network'
+            $r.Data.five_hour.utilization | Should -Be 22.0
+        }
+
+        It 'serves a STALE cache as error but keeps the numbers and the message' {
+            $slot = New-TimeoutSlot 'netstale'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 49.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status                     | Should -Be 'error'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.FallbackReason             | Should -Be 'network'
+            $r.Data.five_hour.utilization | Should -Be 49.0
+            $r.Error                      | Should -Match 'HttpClient.Timeout'
+        }
+
+        It 'retries once with NO sleep when nothing is cached, and succeeds' {
+            $slot = New-TimeoutSlot 'netretry'
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                if ($script:usageCall -eq 1) {
+                    throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+                }
+                return [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 7.0; resets_at = $null } }
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status                     | Should -Be 'ok'
+            $r.Data.five_hour.utilization | Should -Be 7.0
+            $script:usageCall             | Should -Be 2
+            # A timeout already burned the full HTTP budget; an extra sleep
+            # would only freeze the frame.
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+
+        It 'caches the successful retry so the next failure can fall back' {
+            $slot = New-TimeoutSlot 'netretrycache'
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                if ($script:usageCall -eq 1) {
+                    throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+                }
+                return [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 8.0; resets_at = $null } }
+            }
+
+            Get-SlotUsage -SlotPath $slot | Out-Null
+            $Script:SlotUsageCache.ContainsKey($slot)          | Should -BeTrue
+            $Script:SlotUsageCache[$slot].Data.five_hour.utilization | Should -Be 8.0
+        }
+
+        It 'returns error with the message when both attempts fail and nothing is cached' {
+            $slot = New-TimeoutSlot 'netdead'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.Error      | Should -Match 'HttpClient.Timeout'
+            $r.HttpStatus | Should -BeNullOrEmpty
+            $r.Data       | Should -BeNullOrEmpty
+        }
+
+        # A timeout is not a throttle. Stamping RateLimitedUntil would make the
+        # next poll short-circuit to 'rate-limited' for RateLimitBackoffSec and
+        # stop probing live for a fault that may already be gone.
+        It 'does NOT stamp a rate-limit backoff' {
+            $slot = New-TimeoutSlot 'nobackoff'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 10.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+            }
+
+            Get-SlotUsage -SlotPath $slot | Out-Null
+            $Script:SlotUsageCache[$slot].RateLimitedUntil | Should -BeNullOrEmpty
+        }
+
+        It 'carries HttpStatus through the stale fallback for a coded 5xx' {
+            $slot = New-TimeoutSlot 'net529'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 33.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 529 }
+                $inner = [System.Exception]::new('Response status code does not indicate success: 529.')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.HttpStatus | Should -Be 529
+            $r.Data.five_hour.utilization | Should -Be 33.0
+        }
+    }
+
     Context 'Get-SlotUsage (rate-limit backoff)' {
         # After a 429, RateLimitedUntil is stamped on the cache entry so the
         # NEXT poll short-circuits to cache without any token/usage HTTP --
@@ -2142,6 +2342,84 @@ Describe 'switch_claude_account' {
 
         It '-AllowStale still returns $null on a true cache miss' {
             (Get-CachedUsageOrNull -SlotPath 'missing/path.json' -AllowStale) | Should -BeNullOrEmpty
+        }
+
+        It 'stamps FallbackReason on a fresh hit, defaulting to rate-limit' {
+            $slot = 'reason/fresh.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0 } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot).FallbackReason                    | Should -Be 'rate-limit'
+            (Get-CachedUsageOrNull -SlotPath $slot -Reason 'network').FallbackReason   | Should -Be 'network'
+            # Freshness beats reason: a recent reading is served as live-quality.
+            (Get-CachedUsageOrNull -SlotPath $slot -Reason 'network').Status           | Should -Be 'ok'
+        }
+
+        It '-Reason picks the stale status label' {
+            $slot = 'reason/stale.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale).Status                     | Should -Be 'rate-limited'
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale -Reason 'network').Status   | Should -Be 'error'
+        }
+
+        It 'stamps ErrorMessage / HttpStatus on the stale result only' {
+            $slot = 'reason/stamp.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            $r = Get-CachedUsageOrNull -SlotPath $slot -AllowStale -Reason 'network' -ErrorMessage 'boom' -HttpStatus 503
+            $r.Error      | Should -Be 'boom'
+            $r.HttpStatus | Should -Be 503
+
+            # Fresh rows are live-quality; there is nothing to report on them.
+            $Script:SlotUsageCache[$slot].Timestamp = [DateTime]::UtcNow
+            $fresh = Get-CachedUsageOrNull -SlotPath $slot -Reason 'network' -ErrorMessage 'boom' -HttpStatus 503
+            $fresh.Error      | Should -BeNullOrEmpty
+            $fresh.HttpStatus | Should -BeNullOrEmpty
+        }
+
+        It 'rejects an unknown -Reason at bind time' {
+            { Get-CachedUsageOrNull -SlotPath 'x' -Reason 'nonsense' } | Should -Throw
+        }
+    }
+
+    Context 'Resolve-UsageFailureFallback' {
+        # The shared ladder both catch arms of Get-SlotUsage run before
+        # deciding whether to retry.
+        It 'returns $null when nothing is cached, so the caller retries' {
+            Resolve-UsageFailureFallback -SlotPath 'ladder/miss.json' -Reason 'network' |
+                Should -BeNullOrEmpty
+        }
+
+        It 'prefers a fresh entry over the stale path' {
+            $slot = 'ladder/fresh.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 12.0 } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            $r = Resolve-UsageFailureFallback -SlotPath $slot -Reason 'network' -ErrorMessage 'boom'
+            $r.Status | Should -Be 'ok'
+            # No error is attached to a live-quality row.
+            $r.Error  | Should -BeNullOrEmpty
+        }
+
+        It 'falls through to the stale entry, carrying the reason and message' {
+            $slot = 'ladder/stale.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 12.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            $r = Resolve-UsageFailureFallback -SlotPath $slot -Reason 'network' -ErrorMessage 'boom' -HttpStatus 500
+            $r.Status                     | Should -Be 'error'
+            $r.FallbackReason             | Should -Be 'network'
+            $r.Error                      | Should -Be 'boom'
+            $r.HttpStatus                 | Should -Be 500
+            $r.Data.five_hour.utilization | Should -Be 12.0
         }
     }
 
@@ -2844,33 +3122,35 @@ Describe 'switch_claude_account' {
 
     Context 'Test-WarmEligible' {
         # Pure predicate behind Invoke-KeepWarmStep's cold-slot selection.
+        # -Threshold 95 matches `sca monitor`'s default; the rows below sit
+        # well under it unless a test says otherwise.
         BeforeEach { $script:Now = [DateTimeOffset]::UtcNow }
 
         It 'rate-limited is eligible regardless of data (recovery path)' {
             $row = [pscustomobject]@{ Status = 'rate-limited'; Data = $null }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 
         It 'ok with a FUTURE five_hour reset is not eligible (window open)' {
             $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{
                 five_hour = [pscustomobject]@{ resets_at = $script:Now.AddHours(2).ToString('o', [Globalization.CultureInfo]::InvariantCulture) } } }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeFalse
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
         }
 
         It 'ok with a PAST five_hour reset is eligible (window closed)' {
             $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{
                 five_hour = [pscustomobject]@{ resets_at = $script:Now.AddMinutes(-5).ToString('o', [Globalization.CultureInfo]::InvariantCulture) } } }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 
         It 'ok with a null five_hour reset is eligible' {
             $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ resets_at = $null } } }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 
         It 'ok with no Data is eligible' {
             $row = [pscustomobject]@{ Status = 'ok'; Data = $null }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 
         It 'hard-fail statuses are not eligible' -TestCases @(
@@ -2878,7 +3158,40 @@ Describe 'switch_claude_account' {
         ) {
             Param ($S)
             $row = [pscustomobject]@{ Status = $S; Data = $null }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeFalse
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
+        }
+
+        # 3.1.0: warming opens the 5h window, so a slot whose window is already
+        # open and full has nothing to gain from a billable `claude -p`. The
+        # at-limit check runs first so it also gates the rate-limited branch,
+        # which is where an exhausted slot usually surfaces.
+        It 'a rate-limited slot at or above threshold is NOT eligible' {
+            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:Now.AddMinutes(12).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                seven_day = $null } }
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
+        }
+
+        It 'an ok slot with a closed 5h window but an exhausted 7d cap is NOT eligible' {
+            $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 0.0;  resets_at = $null }
+                seven_day = [pscustomobject]@{ utilization = 98.0; resets_at = $script:Now.AddDays(3).ToString('o', [Globalization.CultureInfo]::InvariantCulture) } } }
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
+        }
+
+        It 'a rate-limited slot becomes eligible again once its window has reset' {
+            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:Now.AddMinutes(-5).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                seven_day = $null } }
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
+        }
+
+        It 'honours a lowered threshold' {
+            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 60.0; resets_at = $script:Now.AddMinutes(12).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                seven_day = $null } }
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 50 | Should -BeFalse
         }
     }
 
@@ -2935,21 +3248,21 @@ Describe 'switch_claude_account' {
 
         It 'returns the current latch and does NOT warm when every window is open' {
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $script:Future) )
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
 
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 
         It 'returns the current latch when the snapshot has no slots' {
-            $out = Invoke-KeepWarmStep -Snapshot (New-KwSnapshot @()) -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot (New-KwSnapshot @()) -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 
         It 'returns the current latch when Results is empty but NoSlots is false' {
             $snap = [pscustomobject]@{ Results = @(); NoSlots = $false; HasCacheFallback = $false }
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
@@ -2958,7 +3271,7 @@ Describe 'switch_claude_account' {
             $times = @{}
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
 
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' -and @($Names).Count -eq 1 }
             $out | Should -Match "^\[Warmup\] Re-warmed 'a' at \d{2}:\d{2}:\d{2}$"
@@ -2967,20 +3280,20 @@ Describe 'switch_claude_account' {
 
         It 're-warms a slot whose five_hour.resets_at is in the past' {
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $script:Past) )
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
             $out | Should -Match "^\[Warmup\] Re-warmed 'a' at"
         }
 
         It 're-warms an ok row whose Data is null (no plan data)' {
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -NoData) )
-            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x' | Out-Null
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x' | Out-Null
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' }
         }
 
         It 're-warms an ok row whose five_hour bucket is missing' {
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -NoFiveBucket) )
-            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x' | Out-Null
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x' | Out-Null
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' }
         }
 
@@ -2992,7 +3305,7 @@ Describe 'switch_claude_account' {
                 (New-KwRow -Name 'c' -Status 'no-oauth'),
                 (New-KwRow -Name 'd' -Status 'error')
             )
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
@@ -3002,7 +3315,7 @@ Describe 'switch_claude_account' {
             # restart" state: a real `claude -p` refreshes tokens through
             # Claude Code's own OAuth flow and reopens the 5h window.
             $snap = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
-            $out  = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out  = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'b' -and @($Names).Count -eq 1 }
             $out | Should -Match "^\[Warmup\] Re-warmed 'b' at"
         }
@@ -3010,7 +3323,7 @@ Describe 'switch_claude_account' {
         It 'reports a throttled-but-cooling latch when rate-limited slots are all within cooldown' {
             $times = @{ 'b' = [DateTime]::Now }   # just attempted
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
-            $out   = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out   = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Rate-limited; will re-warm when cooldown clears.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
@@ -3019,7 +3332,7 @@ Describe 'switch_claude_account' {
             $times = @{ 'a' = [DateTime]::Now }   # just re-warmed
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
 
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
@@ -3029,7 +3342,7 @@ Describe 'switch_claude_account' {
             $times = @{ 'a' = [DateTime]::Now.AddMinutes(-10) }
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch 'x' | Out-Null
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CooldownMin 5 -CurrentLatch 'x' | Out-Null
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
         }
 
@@ -3037,7 +3350,7 @@ Describe 'switch_claude_account' {
             Mock Test-ClaudeRunning { $true }
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
 
             $out | Should -Be '[Warmup] Re-warm refused! Claude Code is running.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
@@ -3048,7 +3361,7 @@ Describe 'switch_claude_account' {
             $times = @{}
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CurrentLatch 'x'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CurrentLatch 'x'
 
             $out | Should -Match '^\[Warmup\] Re-warm failed! .*locked slot file'
             $times.ContainsKey('a') | Should -BeTrue
@@ -3061,7 +3374,7 @@ Describe 'switch_claude_account' {
                 (New-KwRow -Name 'c' -FiveResetsAt $script:Past)
             )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
 
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter {
                 @($Names).Count -eq 2 -and (@($Names) -contains 'b') -and (@($Names) -contains 'c')

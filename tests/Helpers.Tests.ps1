@@ -1086,6 +1086,37 @@ Describe 'switch_claude_account' {
                     'linger past the in-place repaint (no ESC[2J).')
             }
         }
+
+        It 'Invoke-UsageWatch stamps $lastPoll after the poll, never from the pre-poll $now' {
+            # The loop is an infinite Start-Sleep loop and cannot be driven
+            # directly, so this guards the shape instead. $lastPoll = $now uses
+            # the timestamp captured BEFORE the HTTP work, which pre-credits the
+            # interval with the poll's own duration: a poll slower than
+            # -Interval then makes the next iteration due immediately and the
+            # loop polls back-to-back with no delay, hammering an endpoint whose
+            # limiter trips after a handful of calls in a few seconds.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-UsageWatch'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+
+            $assignments = @($func.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $n.Left.Extent.Text -eq '$lastPoll'
+            }, $true))
+            $assignments.Count | Should -BeGreaterOrEqual 1
+
+            foreach ($a in $assignments) {
+                $a.Right.Extent.Text | Should -Not -Be '$now' -Because (
+                    'the poll interval must be measured from when the poll ' +
+                    'finished, not from the timestamp captured before it ran')
+            }
+        }
     }
 
     Context 'Watch-mode frame capture and in-place repaint' {
@@ -1448,63 +1479,132 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'Format-RateLimitAdvisory' {
+    Context 'Format-UsageAdvisory' {
         BeforeAll {
             function New-RlSnapshot {
-                Param ($Results, [bool] $Cache, [bool] $Rl)
+                Param ($Results, [bool] $Cache, [bool] $Rl, [bool] $Err = $false)
                 [pscustomobject]@{
                     Results = @($Results); NoSlots = $false
-                    HasCacheFallback = $Cache; HasRateLimited = $Rl
+                    HasCacheFallback = $Cache; HasRateLimited = $Rl; HasError = $Err
                 }
             }
             function New-RlRow {
-                Param ([string] $Name, [string] $Status = 'rate-limited', [bool] $Cached = $false)
-                [pscustomobject]@{ Name = $Name; Status = $Status; IsCachedFallback = $Cached;
-                    Data = $null; Error = $null; Email = $null; IsActive = $false }
+                Param (
+                    [string] $Name,
+                    [string] $Status = 'rate-limited',
+                    [bool]   $Cached = $false,
+                    [string] $Reason = 'rate-limit'
+                )
+                $fallbackReason = if ($Cached) { $Reason } else { $null }
+                [pscustomobject]@{
+                    Name             = $Name
+                    Status           = $Status
+                    IsCachedFallback = $Cached
+                    FallbackReason   = $fallbackReason
+                    Data             = $null
+                    Error            = $null
+                    Email            = $null
+                    IsActive         = $false
+                }
             }
         }
 
-        It 'returns $null when nothing is rate-limited' {
+        It 'returns $null when every row read cleanly' {
             $snap = New-RlSnapshot -Results @((New-RlRow -Name 'a' -Status 'ok')) -Cache $false -Rl $false
-            Format-RateLimitAdvisory -Snapshot $snap | Should -BeNullOrEmpty
+            Format-UsageAdvisory -Snapshot $snap | Should -BeNullOrEmpty
         }
 
         It 'returns $null for a null snapshot' {
-            Format-RateLimitAdvisory -Snapshot $null | Should -BeNullOrEmpty
+            Format-UsageAdvisory -Snapshot $null | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null for an empty Results set' {
+            Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results @() -Cache $false -Rl $false) |
+                Should -BeNullOrEmpty
         }
 
         It 'no-cache, one slot: names it with "is" and no last-known clause' {
             $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1')) -Cache $false -Rl $true
-            Format-RateLimitAdvisory -Snapshot $snap |
+            Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1' is currently rate-limited by Anthropic."
         }
 
         It 'no-cache, multiple slots: names them with "are"' {
             $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3')) -Cache $false -Rl $true
-            Format-RateLimitAdvisory -Snapshot $snap |
+            Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited by Anthropic."
         }
 
         It 'no-cache, >3 slots: collapses to "and N more" with plural verb' {
             $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ }
             $snap = New-RlSnapshot -Results $rows -Cache $false -Rl $true
-            Format-RateLimitAdvisory -Snapshot $snap |
+            Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited by Anthropic."
         }
 
         It 'cache branch: names the cached slot and adds the last-known clause' {
             $snap = New-RlSnapshot -Results @((New-RlRow -Name 'cached' -Cached $true)) -Cache $true -Rl $true
-            Format-RateLimitAdvisory -Snapshot $snap |
+            Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'cached' is currently rate-limited by Anthropic; showing last known usage."
         }
 
-        It 'cache branch takes precedence and names only the cached rows' {
-            $rows = @((New-RlRow -Name 'cached' -Cached $true), (New-RlRow -Name 'nocache' -Cached $false))
-            $snap = New-RlSnapshot -Results $rows -Cache $true -Rl $true
-            $out  = Format-RateLimitAdvisory -Snapshot $snap
-            $out | Should -Match "'cached'"
-            $out | Should -Not -Match 'nocache'
-            $out | Should -Match 'showing last known usage'
+        # 3.1.0: the cache branch used to win outright, so a hard failure could
+        # hide behind a "showing last known usage" note. Both conditions now get
+        # their own line and no row is named twice.
+        It 'emits one line per condition instead of letting the cache branch win' {
+            $rows = @(
+                (New-RlRow -Name 'cached'  -Cached $true),
+                (New-RlRow -Name 'nocache' -Cached $false)
+            )
+            $snap  = New-RlSnapshot -Results $rows -Cache $true -Rl $true
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            $lines.Count | Should -Be 2
+            ($lines -join "`n") | Should -Match "'cached'"
+            ($lines -join "`n") | Should -Match "'nocache'"
+            @($lines | Where-Object { $_ -match 'showing last known usage' }).Count | Should -Be 1
+        }
+
+        It 'words a network fallback as a failed live read, not a rate limit' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error' -Cached $true -Reason 'network')) -Cache $true -Rl $false
+            $out  = Format-UsageAdvisory -Snapshot $snap
+            $out | Should -Be "[Usage] 'slot-1' could not be read live; showing last known usage."
+            $out | Should -Not -Match 'rate-limited'
+        }
+
+        It 'names a hard error row with no cached data' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error')) -Cache $false -Rl $false -Err $true
+            Format-UsageAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'slot-1' could not be read from the usage API; usage unknown."
+        }
+
+        It 'reports a cached row once, under its fallback line only' {
+            # A stale network fallback carries Status='error' AND
+            # IsCachedFallback, so it matches two buckets by status alone.
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error' -Cached $true -Reason 'network')) -Cache $true -Rl $false -Err $true
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+            $lines.Count | Should -Be 1
+            $lines[0]    | Should -Match 'showing last known usage'
+        }
+
+        It 'orders no-data failures above cache fallbacks' {
+            $rows = @(
+                (New-RlRow -Name 'cached' -Status 'error' -Cached $true -Reason 'network'),
+                (New-RlRow -Name 'dead'   -Status 'error')
+            )
+            $snap  = New-RlSnapshot -Results $rows -Cache $true -Rl $false -Err $true
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+            $lines[0] | Should -Match "'dead'"
+            $lines[1] | Should -Match "'cached'"
+        }
+
+        It 'treats a cached row with no FallbackReason as a rate limit' {
+            # The backoff short-circuit in Get-SlotUsage builds its result
+            # inline; older callers/fixtures carry no reason at all.
+            $row = [pscustomobject]@{ Name = 'slot-1'; Status = 'rate-limited'; IsCachedFallback = $true
+                Data = $null; Error = $null; Email = $null; IsActive = $false }
+            $snap = New-RlSnapshot -Results @($row) -Cache $true -Rl $true
+            Format-UsageAdvisory -Snapshot $snap | Should -Match 'rate-limited by Anthropic; showing last known usage'
         }
     }
 

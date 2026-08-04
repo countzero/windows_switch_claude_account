@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-08-04
+
+### Changed
+- A single slow `/api/oauth/usage` response no longer erases a slot's numbers. A failed read now falls back to the last known percentages instead of collapsing the row to `error: The request was canceled due to the configured HttpClient.Timeout...`, and retries once when nothing is cached. The endpoint answers in 46-2108 ms in practice, so the previous shared 5-second budget left almost no headroom; usage now gets 12 seconds and the token refresh gets its own 15.
+- Auto-rotation reads a slot's cached percentages when a live read fails, instead of treating every non-`ok` row as 0% utilized. A throttled or briefly unreachable active slot at 100% now rotates rather than freezing. Rotation still refuses to move *into* a slot it could not verify.
+- A bucket whose reset time has already passed counts as 0% for rotation and keep-warm decisions, so cached data cannot report a slot as exhausted after its window has rolled.
+- `sca monitor -KeepWarm` no longer spends a billable `claude -p` on a slot that is already at the rotation threshold: warming re-opens the 5h window, which achieves nothing when that window is open and full.
+- The usage advisory prints one line per condition instead of letting the cache-fallback line suppress everything else, and distinguishes a failed live read from an Anthropic rate limit.
+- `sca usage -Json` may now emit `data` on a row whose `status` is `"error"`. Such a row always carries `is_cached_fallback: true`, which remains the only freshness marker.
+
+### Fixed
+- `sca monitor` no longer goes silently inert when the active slot's usage cannot be read. It previously kept displaying the last `Rotated from ... to ... at ...` line while being structurally unable to rotate; it now reports `[Monitor] Active slot usage unknown (<status>); rotation paused.`
+- The aggregate Session/Week bars no longer present one account's numbers as the whole pool when another slot's read fails transiently.
+- The compact `error <code>` status label (for example `error 529`) now actually renders. `HttpStatus` was dropped when building snapshot rows, so the label was unreachable and every coded failure fell back to a truncated .NET sentence.
+- A poll that outran `-Interval` pre-credited the interval with its own duration, so the watch loop re-polled immediately with no delay. The interval is now measured from when the poll finished.
+- A network timeout no longer stamps a rate-limit backoff, which had suppressed live probing for two minutes and mislabelled the slot as throttled.
+
 ## [3.0.1] - 2026-06-23
 
 ### Fixed

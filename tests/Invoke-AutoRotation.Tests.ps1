@@ -23,6 +23,10 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-RowMaxUtilization' {
+        BeforeAll {
+            $script:MaxNow = [DateTimeOffset]::new(2026, 8, 4, 12, 0, 0, [TimeSpan]::Zero)
+        }
+
         It 'returns max of two non-null utilizations' {
             $row = [pscustomobject]@{
                 Status = 'ok'
@@ -31,7 +35,7 @@ Describe 'switch_claude_account' {
                     seven_day = [pscustomobject]@{ utilization = 80.0; resets_at = $null }
                 }
             }
-            Get-RowMaxUtilization -Row $row | Should -Be 80.0
+            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 80.0
         }
 
         It 'treats null five_hour as 0 and returns seven_day' {
@@ -42,7 +46,7 @@ Describe 'switch_claude_account' {
                     seven_day = [pscustomobject]@{ utilization = 99.0; resets_at = $null }
                 }
             }
-            Get-RowMaxUtilization -Row $row | Should -Be 99.0
+            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 99.0
         }
 
         It 'treats both buckets null as 0' {
@@ -53,18 +57,93 @@ Describe 'switch_claude_account' {
                     seven_day = $null
                 }
             }
-            Get-RowMaxUtilization -Row $row | Should -Be 0.0
+            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 0.0
         }
 
-        It 'returns 0 for non-ok HTTP rows regardless of Data' {
+        It 'returns 0 when the row carries no Data at all' {
+            $row = [pscustomobject]@{ Status = 'error'; Data = $null }
+            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 0.0
+        }
+
+        # Behaviour change in 3.1.0. This used to return 0 for ANY non-ok row
+        # even when Data was present, which meant a single usage-endpoint
+        # timeout on the active slot made it look 0%-utilized and silently
+        # disarmed auto-rotation. Format-UsageTable already renders bucket
+        # percentages from Data regardless of Status, so a row good enough to
+        # show the user is now good enough to decide on.
+        It 'judges a non-ok row on its cached Data' {
+            foreach ($status in @('error', 'rate-limited', 'expired')) {
+                $row = [pscustomobject]@{
+                    Status = $status
+                    Data   = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = 99.0; resets_at = $null }
+                        seven_day = $null
+                    }
+                }
+                Get-RowMaxUtilization -Row $row -Now $script:MaxNow |
+                    Should -Be 99.0 -Because "status '$status' still carries usable percentages"
+            }
+        }
+
+        # Cached data has no upper age bound once stale, so without this a
+        # long-failing slot would keep reporting the utilization it had before
+        # its window reset, rotating away from a slot that is actually free.
+        It 'treats a bucket whose resets_at has passed as 0 (window rolled)' {
             $row = [pscustomobject]@{
-                Status = 'expired'
+                Status = 'ok'
                 Data   = [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 99.0; resets_at = $null }
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:MaxNow.AddHours(-1).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                    seven_day = [pscustomobject]@{ utilization = 20.0;  resets_at = $script:MaxNow.AddDays(3).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                }
+            }
+            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 20.0
+        }
+
+        It 'keeps a bucket whose resets_at is still in the future' {
+            $row = [pscustomobject]@{
+                Status = 'ok'
+                Data   = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:MaxNow.AddMinutes(12).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
                     seven_day = $null
                 }
             }
-            Get-RowMaxUtilization -Row $row | Should -Be 0.0
+            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 100.0
+        }
+
+        It 'ignores an unparseable resets_at rather than zeroing the bucket' {
+            $row = [pscustomobject]@{
+                Status = 'ok'
+                Data   = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 77.0; resets_at = 'garbage' }
+                    seven_day = $null
+                }
+            }
+            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 77.0
+        }
+    }
+
+    Context 'Get-BucketUtilizationOrZero' {
+        BeforeAll {
+            $script:BucketNow = [DateTimeOffset]::new(2026, 8, 4, 12, 0, 0, [TimeSpan]::Zero)
+        }
+
+        It 'returns 0 for a null bucket' {
+            Get-BucketUtilizationOrZero -Bucket $null -Now $script:BucketNow | Should -Be 0.0
+        }
+
+        It 'returns 0 when utilization is null' {
+            $b = [pscustomobject]@{ utilization = $null; resets_at = $null }
+            Get-BucketUtilizationOrZero -Bucket $b -Now $script:BucketNow | Should -Be 0.0
+        }
+
+        It 'returns 0 for utilization exactly at the reset instant' {
+            $b = [pscustomobject]@{ utilization = 50.0; resets_at = $script:BucketNow.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+            Get-BucketUtilizationOrZero -Bucket $b -Now $script:BucketNow | Should -Be 0.0
+        }
+
+        It 'returns the utilization when there is no resets_at' {
+            $b = [pscustomobject]@{ utilization = 50.0; resets_at = $null }
+            Get-BucketUtilizationOrZero -Bucket $b -Now $script:BucketNow | Should -Be 50.0
         }
     }
 
@@ -145,6 +224,34 @@ Describe 'switch_claude_account' {
                     Results          = @($Rows)
                     NoSlots          = ($null -eq $Rows -or $Rows.Count -eq 0)
                     HasCacheFallback = $false
+                    HasRateLimited   = $false
+                    HasError         = $false
+                }
+            }
+
+            # Row carrying cached percentages under a non-ok status, i.e. what
+            # Get-SlotUsage returns from the stale-cache fallback.
+            function New-CachedRow {
+                Param (
+                    [string] $Name,
+                    [bool]   $IsActive = $false,
+                    [string] $Status   = 'error',
+                    $FiveUtil          = 0.0,
+                    $SevenUtil         = 0.0
+                )
+                return [pscustomobject]@{
+                    Name             = $Name
+                    IsActive         = $IsActive
+                    Status           = $Status
+                    Data             = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = $FiveUtil;  resets_at = $null }
+                        seven_day = [pscustomobject]@{ utilization = $SevenUtil; resets_at = $null }
+                    }
+                    Error            = 'boom'
+                    Email            = "$Name@test.local"
+                    IsCachedFallback = $true
+                    FallbackReason   = 'network'
+                    HttpStatus       = $null
                 }
             }
         }
@@ -301,6 +408,65 @@ Describe 'switch_claude_account' {
             $d.Action         | Should -Be 'no-eligible'
             $d.SuggestionName | Should -Be 'only'
         }
+
+        # 3.1.0: a data-less non-ok active row used to fall into the
+        # below-threshold 'noop' branch, which preserved the previous latch and
+        # left the monitor silently unable to rotate for as long as the failure
+        # lasted. It now reports instead.
+        It 'returns active-unknown when the active row is non-ok with no Data' {
+            foreach ($status in @('error', 'expired', 'unauthorized', 'no-oauth', 'rate-limited')) {
+                $rows = @(
+                    (New-Row -Name 'a' -IsActive $true -Status $status),
+                    (New-Row -Name 'b' -FiveUtil 10.0 -SevenUtil 10.0)
+                )
+                $d = Get-AutoRotationDecision -Snapshot (New-Snapshot $rows) -Threshold 95
+                $d.Action       | Should -Be 'active-unknown' -Because "status '$status' carries no usable data"
+                $d.FromName     | Should -Be 'a'
+                $d.ToName       | Should -BeNullOrEmpty
+                $d.ActiveStatus | Should -Be $status
+            }
+        }
+
+        It 'a missing active row stays noop, not active-unknown (state problem, not network)' {
+            $rows = @(
+                (New-Row -Name 'a' -Status 'error'),
+                (New-Row -Name 'b' -Status 'error')
+            )
+            $d = Get-AutoRotationDecision -Snapshot (New-Snapshot $rows) -Threshold 95
+            $d.Action | Should -Be 'noop'
+        }
+
+        It 'rotates off a non-ok active row whose cached data is at threshold' {
+            $rows = @(
+                (New-CachedRow -Name 'a' -IsActive $true -FiveUtil 100.0 -SevenUtil 20.0),
+                (New-Row -Name 'b' -FiveUtil 10.0 -SevenUtil 10.0)
+            )
+            $d = Get-AutoRotationDecision -Snapshot (New-Snapshot $rows) -Threshold 95
+            $d.Action | Should -Be 'rotate'
+            $d.ToName | Should -Be 'b'
+        }
+
+        It 'stays noop on a non-ok active row whose cached data is below threshold' {
+            $rows = @(
+                (New-CachedRow -Name 'a' -IsActive $true -FiveUtil 40.0 -SevenUtil 20.0),
+                (New-Row -Name 'b' -FiveUtil 10.0 -SevenUtil 10.0)
+            )
+            $d = Get-AutoRotationDecision -Snapshot (New-Snapshot $rows) -Threshold 95
+            $d.Action   | Should -Be 'noop'
+            $d.FromName | Should -Be 'a'
+        }
+
+        # Cached data is good enough to decide to LEAVE a slot but not to
+        # ENTER one: a peer we cannot verify may be throttled or broken.
+        It 'never rotates INTO a non-ok peer even when its cached data looks free' {
+            $future = [DateTimeOffset]::UtcNow.AddHours(2).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+            $rows = @(
+                (New-Row -Name 'a' -IsActive $true -FiveUtil 100.0 -FiveResetsAt $future),
+                (New-CachedRow -Name 'b' -FiveUtil 5.0 -SevenUtil 5.0)
+            )
+            $d = Get-AutoRotationDecision -Snapshot (New-Snapshot $rows) -Threshold 95
+            $d.Action | Should -Be 'no-eligible'
+        }
     }
 
     Context 'Invoke-AutoRotationStep' {
@@ -328,6 +494,36 @@ Describe 'switch_claude_account' {
             $prev = '[Monitor] Rotated from "a" to "b" at 12:00:00'
             $out  = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch $prev
             $out | Should -Be $prev
+        }
+
+        # The whole point of the 'active-unknown' action: it must REPLACE a
+        # latched 'Rotated ...' line, because preserving that line is what made
+        # a blind monitor look like a working one.
+        It 'on active-unknown reports the status and replaces a latched Rotated line' {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action       = 'active-unknown'
+                FromName     = 'slot-1'
+                ActiveStatus = 'error'
+            } }
+            $prev = '[Monitor] Rotated from "slot-2" to "slot-1" at 11:00:09'
+            $out  = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 95 -CurrentLatch $prev
+
+            $out | Should -Be '[Monitor] Active slot usage unknown (error); rotation paused.'
+            $out | Should -Not -Be $prev
+        }
+
+        It 'on active-unknown does not swap' {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action       = 'active-unknown'
+                FromName     = 'slot-1'
+                ActiveStatus = 'rate-limited'
+            } }
+            Mock Invoke-SlotSwap { }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 95 -CurrentLatch 'x'
+
+            Should -Invoke Invoke-SlotSwap -Times 0
+            $out | Should -Be '[Monitor] Active slot usage unknown (rate-limited); rotation paused.'
         }
 
         It 'on rotate calls Invoke-SlotSwap and returns a quoted+timestamped Rotated line' {

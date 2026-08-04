@@ -156,7 +156,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '3.0.1'
+$Script:ScriptVersion = '3.1.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -203,7 +203,15 @@ $Script:AnthropicBeta       = "oauth-2025-04-20"
 # Claude Code itself ships with.
 $Script:AnthropicApiVersion = "2023-06-01"
 $Script:UsageUserAgent      = "claude-code/2.1.119"
-$Script:UsageTimeoutSec     = 5
+# Per-endpoint HTTP budgets. Measured /api/oauth/usage round-trips against
+# a live subscription span 46-2108 ms, so the previous shared 5 s left under
+# 2.4x headroom and a single latency spike collapsed a slot's row to
+# 'error: The request was canceled due to the configured HttpClient.Timeout'.
+# The refresh POST gets its own (larger) budget rather than borrowing the
+# usage constant: it does server-side crypto plus refresh-token rotation, so
+# it is the slowest of the three calls and was the one running tightest.
+$Script:UsageTimeoutSec     = 12
+$Script:TokenTimeoutSec     = 15
 $Script:ProfileTimeoutSec   = 10
 
 # Retry policy for /v1/oauth/token on a 429 response. Empirically the
@@ -1949,22 +1957,17 @@ function Invoke-RemoveAction {
 # --- usage action internals ---
 
 # True if $Exception came from an Invoke-RestMethod call that hit HTTP 429.
-# Tolerates the two shapes our codebase encounters in practice:
-#   * Real Microsoft.PowerShell.Commands.HttpResponseException whose
-#     .Response.StatusCode is a System.Net.HttpStatusCode enum value
-#     ([int][HttpStatusCode]::TooManyRequests = 429).
-#   * The lightweight pscustomobject Response shim used by tests
-#     (Invoke-UsageAction.Tests.ps1's 401 mock pattern), where
-#     .Response.StatusCode is already an integer.
-# Returns $false for null exceptions, exceptions without a Response member,
-# and any non-429 status; the caller's catch block falls through to its
+# Reads the status through Get-ExceptionHttpStatus so the two exception shapes
+# our codebase encounters (a real HttpResponseException whose .Response
+# .StatusCode is a System.Net.HttpStatusCode enum, and the pscustomobject
+# Response shim the tests use, where it is already an integer) are handled in
+# one place. Returns $false for null exceptions, exceptions without a Response
+# member, and any non-429 status; the caller's catch block falls through to its
 # pre-existing error handling for those.
 function Test-Is429 {
     Param ($Exception)
     if (-not $Exception) { return $false }
-    $r = $Exception.Response
-    if (-not $r -or -not $r.StatusCode) { return $false }
-    return ([int]$r.StatusCode -eq 429)
+    return ((Get-ExceptionHttpStatus $Exception) -eq 429)
 }
 
 # Collapse and tail-truncate an exception message for rendering inside the
@@ -2100,7 +2103,7 @@ function Update-SlotTokens {
                                       -Uri $Script:TokenEndpoint `
                                       -Headers $headers `
                                       -Body $body `
-                                      -TimeoutSec $Script:UsageTimeoutSec `
+                                      -TimeoutSec $Script:TokenTimeoutSec `
                                       -ErrorAction Stop
             break
         }
@@ -2213,35 +2216,87 @@ function Update-SlotTokens {
 # per-process cache and return it wrapped as an IsCachedFallback result.
 # Returns $null on cache miss (or on a stale entry unless -AllowStale).
 #
-# Used by Get-SlotUsage's two 429 fallback paths (token-endpoint catch
-# and usage-endpoint catch) to collapse what would otherwise be a 4-level
-# if-contains/if-fresh/return ladder into a single helper call.
+# Sole construction site for cache-fallback results, so every caller agrees
+# on the shape (Status / Data / IsCachedFallback / FallbackReason / Error /
+# HttpStatus).
 #
 # Freshness policy:
 #   * Fresh entry (within $Script:UsageCacheTTL minutes) -> served as
 #     'ok'+IsCachedFallback so the watch display stays fully functional
-#     during a brief rate-limit (usage data only changes every few hours).
-#   * Stale entry -> $null by default. With -AllowStale it is served as
-#     'rate-limited'+IsCachedFallback: the LAST-KNOWN percentages stay
-#     visible during a prolonged throttle (so the row keeps its numbers
-#     instead of collapsing to em-dashes and looking like a dead slot),
-#     but the status stays 'rate-limited' so the stale data is never
-#     mistaken for a live reading. The caller serves stale only as a last
-#     resort, after the fresh lookup and (where applicable) the retry have
-#     failed.
+#     during a brief failure (usage data only changes every few hours).
+#     'ok' is deliberate: aggregate bars and auto-rotation gate on it, and a
+#     reading this recent is trustworthy enough for both.
+#   * Stale entry -> $null by default. With -AllowStale the LAST-KNOWN
+#     percentages stay visible (so the row keeps its numbers instead of
+#     collapsing to em-dashes and looking like a dead slot) but the status
+#     drops out of 'ok' so stale data is never mistaken for a live reading.
+#
+# -Reason distinguishes WHY the live read failed. It picks the stale label
+# ('rate-limited' for a 429, 'error' for a network/transport failure) and is
+# stamped on the row so Format-UsageAdvisory can word the advisory
+# accurately instead of calling every fallback a rate limit.
+#
+# -ErrorMessage / -HttpStatus are stamped on the stale (non-ok) result only;
+# a fresh 'ok' row has nothing to report. They let the table render
+# 'error 529' or 'error: <tail>' on a stale network row that still shows
+# numbers.
 function Get-CachedUsageOrNull {
     Param (
         [String] $SlotPath,
-        [switch] $AllowStale
+        [switch] $AllowStale,
+        [ValidateSet('rate-limit', 'network')]
+        [String] $Reason = 'rate-limit',
+        [AllowNull()] [AllowEmptyString()] [String] $ErrorMessage,
+        [AllowNull()] $HttpStatus
     )
     if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) { return $null }
     $entry   = $Script:SlotUsageCache[$SlotPath]
     $isStale = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheTTL
     if ($isStale) {
         if (-not $AllowStale) { return $null }
-        return [pscustomobject]@{ Status = 'rate-limited'; Data = $entry.Data; IsCachedFallback = $true }
+        $staleStatus = if ($Reason -eq 'network') { 'error' } else { 'rate-limited' }
+        return [pscustomobject]@{
+            Status           = $staleStatus
+            Data             = $entry.Data
+            IsCachedFallback = $true
+            FallbackReason   = $Reason
+            Error            = $ErrorMessage
+            HttpStatus       = $HttpStatus
+        }
     }
-    return [pscustomobject]@{ Status = 'ok'; Data = $entry.Data; IsCachedFallback = $true }
+    return [pscustomobject]@{
+        Status           = 'ok'
+        Data             = $entry.Data
+        IsCachedFallback = $true
+        FallbackReason   = $Reason
+    }
+}
+
+# Shared resilience ladder for a failed /api/oauth/usage read. Both arms of
+# Get-SlotUsage's catch need the same decision and differ only in -Reason:
+#
+#   1. Fresh cache -> serve it as 'ok'.
+#   2. Stale cache -> serve the last-known percentages under a non-ok label.
+#                     No retry: a stale entry means we have been failing long
+#                     enough that another attempt in the same poll will not
+#                     change the outcome.
+#   3. Nothing cached -> $null, which tells the caller to run its own
+#                     retry-once path. The retry stays with the caller
+#                     because its shape differs per arm (the 429 arm sleeps
+#                     out the limiter window, the network arm does not).
+function Resolve-UsageFailureFallback {
+    Param (
+        [Parameter(Mandatory)] [String] $SlotPath,
+        [Parameter(Mandatory)] [ValidateSet('rate-limit', 'network')] [String] $Reason,
+        [AllowNull()] [AllowEmptyString()] [String] $ErrorMessage,
+        [AllowNull()] $HttpStatus
+    )
+
+    $fresh = Get-CachedUsageOrNull -SlotPath $SlotPath -Reason $Reason
+    if ($fresh) { return $fresh }
+
+    return Get-CachedUsageOrNull -SlotPath $SlotPath -AllowStale -Reason $Reason `
+                                 -ErrorMessage $ErrorMessage -HttpStatus $HttpStatus
 }
 
 # Mark a slot as throttled: stamp RateLimitedUntil on its cache entry so the
@@ -2338,14 +2393,21 @@ function Resolve-SlotAccessToken {
 # Call /api/oauth/usage for one slot. Auto-refreshes a token that is
 # expired or within 60s of expiry via Resolve-SlotAccessToken. Returns:
 #   @{ Status = 'ok';           Data = <parsed response> }
-#   @{ Status = 'ok'; Data; IsCachedFallback = $true }      # served from cache after a 429
+#   @{ Status = 'ok'; Data; IsCachedFallback; FallbackReason }  # fresh cache after any failure
 #   @{ Status = 'no-oauth' }                                # slot has no claudeAiOauth
 #   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed (non-429)
-#   @{ Status = 'rate-limited' }                            # 429 from refresh OR usage endpoint, no fresh cache
+#   @{ Status = 'rate-limited' }                            # 429 from refresh OR usage endpoint, no cache
+#   @{ Status = 'rate-limited'; Data; IsCachedFallback; FallbackReason }  # stale cache after a 429
 #   @{ Status = 'unauthorized' }                            # 401/403 from usage endpoint
-#   @{ Status = 'error';   Error = <msg> }                  # network / shape / other
+#   @{ Status = 'error'; HttpStatus; Error }                # network / shape / other, no cache
+#   @{ Status = 'error'; HttpStatus; Error; Data; IsCachedFallback; FallbackReason }  # stale cache
 # Never throws to callers; surfaces every failure mode as a Status value
 # so Invoke-UsageAction can render mixed-health tables without aborting.
+#
+# A failed read never discards known-good data: the two catch arms run the
+# Resolve-UsageFailureFallback ladder first, so a single transport blip
+# degrades the row to "last known percentages, labelled" instead of wiping
+# it to em-dashes for a whole poll interval.
 function Get-SlotUsage {
     Param (
         [String] $SlotPath
@@ -2355,7 +2417,8 @@ function Get-SlotUsage {
     # (Write-Progress / stream 4) so it does not paint over the watch
     # loop's alt-screen buffer between frames. See Update-SlotTokens
     # for the full rationale; same suppression is applied identically
-    # in Get-SlotProfile.
+    # in Get-SlotProfile and Invoke-UsageRequest. Kept here as well as in
+    # Invoke-UsageRequest so it also covers Resolve-SlotAccessToken below.
     $ProgressPreference = 'SilentlyContinue'
 
     # Backoff short-circuit: while a recent 429's RateLimitedUntil is still
@@ -2365,7 +2428,12 @@ function Get-SlotUsage {
     # keep-warm step can still recover the slot.
     $entry = $Script:SlotUsageCache[$SlotPath]
     if ($entry -and $entry.RateLimitedUntil -and [DateTime]::UtcNow -lt $entry.RateLimitedUntil) {
-        return [pscustomobject]@{ Status = 'rate-limited'; Data = $entry.Data; IsCachedFallback = $true }
+        return [pscustomobject]@{
+            Status           = 'rate-limited'
+            Data             = $entry.Data
+            IsCachedFallback = $true
+            FallbackReason   = 'rate-limit'
+        }
     }
 
     # Resolve a non-expired access token (refresh if needed). Rate-
@@ -2377,14 +2445,12 @@ function Get-SlotUsage {
             # Stamp the backoff so subsequent polls stop hammering the token
             # endpoint (the expired-idle-slot refresh storm).
             Set-SlotRateLimitBackoff -SlotPath $SlotPath
-            $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
-            if ($cached) { return $cached }
-            # Last resort: keep the last-known percentages visible (marked
-            # cached, status stays 'rate-limited') rather than dropping the
-            # row to a dead-looking em-dash line during a token-endpoint
-            # throttle.
-            $stale = Get-CachedUsageOrNull -SlotPath $SlotPath -AllowStale
-            if ($stale) { return $stale }
+            # Fresh cache, else last-known percentages, rather than dropping
+            # the row to a dead-looking em-dash line during a token-endpoint
+            # throttle. No retry arm here: the token endpoint has its own
+            # 429 retry loop inside Update-SlotTokens.
+            $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'rate-limit'
+            if ($fallback) { return $fallback }
         }
         return $tok
     }
@@ -2399,91 +2465,98 @@ function Get-SlotUsage {
     }
 
     try {
-        $resp = Invoke-RestMethod -Method Get `
-                                  -Uri $Script:UsageEndpoint `
-                                  -Headers $headers `
-                                  -TimeoutSec $Script:UsageTimeoutSec `
-                                  -ErrorAction Stop
-        # Cache the successful response so we can fall back on 429.
-        $Script:SlotUsageCache[$SlotPath] = @{
-            Data      = $resp
-            Timestamp = [DateTime]::UtcNow
-        }
-        return [pscustomobject]@{ Status = 'ok'; Data = $resp }
+        return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers
     }
     catch {
-        $status = $null
-        $resp   = $_.Exception.Response
-        if ($resp -and $resp.StatusCode) {
-            $status = [int]$resp.StatusCode
-        }
+        $status  = Get-ExceptionHttpStatus $_.Exception
+        $message = $_.Exception.Message
+
         if ($status -eq 401 -or $status -eq 403) {
             return [pscustomobject]@{ Status = 'unauthorized' }
         }
-        # On 429 (rate limited), fall back to cached data if available and
-        # still fresh. This keeps the watch display functional during rate-
-        # limited periods; usage data only changes every few hours at most.
-        # Three explicit branches (vs. the previous if/else where a stale
-        # cache fell through to the bottom 'error' return at the end of
-        # the catch; that hid behind Format-UsageTable's truncation but
-        # mislabeled the status):
-        #   1. Fresh cache  -> return cached as 'ok' with IsCachedFallback.
-        #   2. Stale cache  -> 'rate-limited' (no retry; the cache being
-        #                      stale means we've been seeing 429s for a
-        #                      while and a 5s sleep won't change that).
-        #   3. No cache yet -> one retry after a short delay; the original
-        #                      back-to-back-poll-collision case.
+
+        # Both arms below run the same Resolve-UsageFailureFallback ladder
+        # (fresh cache -> stale-with-numbers -> $null meaning "nothing cached,
+        # retry once"). They differ in the reason they report, in whether the
+        # retry sleeps first, and in how a doomed retry is labelled.
         if ($status -eq 429) {
             # Stamp the backoff (no-op without a prior entry; see
-            # Set-SlotRateLimitBackoff). Adds only RateLimitedUntil, so the
-            # ContainsKey retry decision below is unaffected.
+            # Set-SlotRateLimitBackoff) so subsequent polls stop re-tripping a
+            # hot limiter.
             Set-SlotRateLimitBackoff -SlotPath $SlotPath
-            $cached = Get-CachedUsageOrNull -SlotPath $SlotPath
-            if ($cached) { return $cached }
-            # Cache miss vs stale-entry both reach this point. If the
-            # slot has ANY cache entry (stale or otherwise), drop to
-            # 'rate-limited'; we've been seeing 429s long enough that
-            # a 5s sleep won't change the outcome. If no cache entry
-            # exists at all, retry once after a short delay so back-to-
-            # back slot polls don't all hit the rate limit simultaneously.
-            if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
-                # Stale entry: serve the last-known percentages (marked
-                # cached, status stays 'rate-limited') so the row keeps its
-                # numbers during a prolonged throttle instead of collapsing
-                # to em-dashes. No retry sleep: a stale entry means we've
-                # been throttled long enough that a 5s wait won't help.
-                $stale = Get-CachedUsageOrNull -SlotPath $SlotPath -AllowStale
-                if ($stale) { return $stale }
-                return [pscustomobject]@{ Status = 'rate-limited' }
-            }
+            $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'rate-limit'
+            if ($fallback) { return $fallback }
+            # Nothing cached: retry once after sleeping out the limiter window,
+            # so back-to-back slot polls don't all fail together on the first
+            # pass after startup.
             Start-Sleep -Seconds 5
-            try {
-                $resp2 = Invoke-RestMethod -Method Get `
-                                          -Uri $Script:UsageEndpoint `
-                                          -Headers $headers `
-                                          -TimeoutSec $Script:UsageTimeoutSec `
-                                          -ErrorAction Stop
-                # Cache the successful retry.
-                $Script:SlotUsageCache[$SlotPath] = @{
-                    Data      = $resp2
-                    Timestamp = [DateTime]::UtcNow
-                }
-                return [pscustomobject]@{ Status = 'ok'; Data = $resp2 }
-            }
-            catch {
-                # Second attempt also failed; return clean rate-limited status.
-                return [pscustomobject]@{ Status = 'rate-limited' }
+            try   { return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers }
+            catch { return [pscustomobject]@{ Status = 'rate-limited' } }
+        }
+
+        # Network / timeout / 5xx / shape failure. Deliberately does NOT call
+        # Set-SlotRateLimitBackoff: a timeout is not a throttle, and stamping
+        # RateLimitedUntil here would make the next poll short-circuit to
+        # 'rate-limited' for $Script:RateLimitBackoffSec and stop probing live
+        # for a fault that may already be gone.
+        $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'network' `
+                                                -ErrorMessage $message -HttpStatus $status
+        if ($fallback) { return $fallback }
+
+        # Nothing cached: retry once, without a sleep. A timeout has already
+        # burned $Script:UsageTimeoutSec of wall clock, far longer than any
+        # limiter pause would need, so an extra delay only freezes the frame.
+        try {
+            return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers
+        }
+        catch {
+            return [pscustomobject]@{
+                Status     = 'error'
+                HttpStatus = Get-ExceptionHttpStatus $_.Exception
+                Error      = $_.Exception.Message
             }
         }
-        # Generic fall-through. Surface the numeric HTTP status (when the
-        # exception carried a Response) so Format-UsageTable can render a
-        # short 'error <code>' label instead of the verbose .NET message
-        # ('Response status code does not indicate success: 529 ...'),
-        # which otherwise blows out the Status column and wraps the row.
-        # $status is $null for codeless network/timeout errors; the
-        # renderer falls back to the truncated message tail in that case.
-        return [pscustomobject]@{ Status = 'error'; HttpStatus = $status; Error = $_.Exception.Message }
     }
+}
+
+# One live GET against /api/oauth/usage: caches the body on success and returns
+# it wrapped as an 'ok' result. Throws on any failure so the caller's catch owns
+# the classification. Extracted because Get-SlotUsage makes this exact call in
+# three places (primary, 429 retry, network retry) and the cache write must not
+# drift between them.
+function Invoke-UsageRequest {
+    Param (
+        [Parameter(Mandatory)] [String]    $SlotPath,
+        [Parameter(Mandatory)] [hashtable] $Headers
+    )
+
+    # See Get-SlotUsage for the rationale; the suppression has to live in the
+    # function that actually calls Invoke-RestMethod.
+    $ProgressPreference = 'SilentlyContinue'
+
+    $resp = Invoke-RestMethod -Method Get `
+                              -Uri $Script:UsageEndpoint `
+                              -Headers $Headers `
+                              -TimeoutSec $Script:UsageTimeoutSec `
+                              -ErrorAction Stop
+
+    $Script:SlotUsageCache[$SlotPath] = @{
+        Data      = $resp
+        Timestamp = [DateTime]::UtcNow
+    }
+    return [pscustomobject]@{ Status = 'ok'; Data = $resp }
+}
+
+# Numeric HTTP status carried by a web exception, or $null when it has none.
+# $null is the normal case for a codeless transport failure (DNS, socket, and
+# the -TimeoutSec TaskCanceledException), which is exactly the distinction the
+# 'error <code>' vs 'error: <tail>' status label turns on.
+function Get-ExceptionHttpStatus {
+    Param ($Exception)
+
+    $resp = $Exception.Response
+    if ($resp -and $resp.StatusCode) { return [int]$resp.StatusCode }
+    return $null
 }
 
 # Resolve the OAuth account email for a slot. Returns one of:
@@ -3471,11 +3544,15 @@ function Format-UsageVerbose {
 # Snapshot shape (Get-UsageSnapshot):
 #   Results          : array of per-slot result rows
 #                      { Name, IsActive, Status, Data, Error, Email,
-#                        IsCachedFallback }
+#                        IsCachedFallback, HttpStatus, FallbackReason }
+#                      Invoke-WarmAllSlots builds the same shape for its
+#                      synthetic warmup rows; keep the two in step.
 #   NoSlots          : $true when there are zero saved slots. Caller
 #                      prints the "no slots" hint.
-#   HasCacheFallback : $true when at least one row served from the 429
-#                      cache fallback. Drives the post-table advisory.
+#   HasCacheFallback : $true when at least one row served from the cache
+#                      fallback. Drives a post-table advisory.
+#   HasRateLimited   : $true when at least one row is 'rate-limited'.
+#   HasError         : $true when at least one row is 'error'.
 #
 # The caller (Invoke-UsageAction) runs Invoke-Reconcile before invoking
 # this function, so by the time we enumerate slots, the active-slot file
@@ -3498,6 +3575,7 @@ function Get-UsageSnapshot {
             NoSlots          = $true
             HasCacheFallback = $false
             HasRateLimited   = $false
+            HasError         = $false
         }
     }
 
@@ -3520,6 +3598,14 @@ function Get-UsageSnapshot {
             Status   = $usage.Status
             Data     = $usage.Data
             Error    = $usage.Error
+            # HttpStatus must be projected, not dropped: Format-UsageTable's
+            # 'error' arm keys off it to render the compact 'error 529' label
+            # instead of the verbose .NET sentence. Omitting it here silently
+            # made that arm unreachable through every real code path.
+            HttpStatus     = $usage.HttpStatus
+            # Why the live read fell back to cache ('rate-limit' / 'network'),
+            # so Format-UsageAdvisory can word the advisory accurately.
+            FallbackReason = $usage.FallbackReason
             # Email comes from the slot filename via Get-Slots (parsed by
             # Get-SlotFileInfo). No HTTP call here; the only source of
             # truth for a slot's email is its filename, which was written
@@ -3534,10 +3620,12 @@ function Get-UsageSnapshot {
         NoSlots          = $false
         HasCacheFallback = ($results | Where-Object { $_.IsCachedFallback }).Count -gt 0
         # HasRateLimited drives the "transient throttle" advisory for the
-        # no-cache case, where the row has no Data to show. A row served
-        # from the cache fallback is also 'rate-limited' but is covered by
-        # the HasCacheFallback advisory branch (which takes precedence).
+        # no-cache case, where the row has no Data to show.
         HasRateLimited   = ($results | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0
+        # HasError drives an advisory naming slots whose live read failed
+        # outright. Without it the only signal is a 60-char truncated tail
+        # inside the Status cell, which cuts the reason mid-word.
+        HasError         = ($results | Where-Object { $_.Status -eq 'error' }).Count -gt 0
     }
 }
 
@@ -3559,41 +3647,67 @@ function Format-SlotNameList {
     return (($shown -join ', ') + " and $more more")
 }
 
-# Build the yellow rate-limit advisory line for a usage frame, or $null when
-# no row is rate-limited. Pure (no Write-Host) so it unit-tests without host
-# capture. Names the affected slot(s) so the user sees WHICH slot is
-# throttled: it is usually a non-active peer, not the '*' active slot, which
-# is exactly the confusion the old "transient, slot active." wording caused.
-# Two branches, cache-fallback taking precedence (matches the prior
-# single-line behavior; when both cached and no-cache rate-limited rows exist
-# only the cached ones are named):
-#   * HasCacheFallback : rows served stale from the 429 cache, so the table
-#     keeps last-known percentages and the advisory says so.
-#   * HasRateLimited    : no cache to show (em-dash cells). States the
-#     condition without promising recovery, because the renderer is shared by
-#     one-shot `sca usage` (no "next poll") and `sca usage -Watch`.
-function Format-RateLimitAdvisory {
+# Build the yellow advisory block for a usage frame, or $null when every row
+# read cleanly. Pure (no Write-Host) so it unit-tests without host capture.
+# Returns a newline-joined string; Format-UsageFooter splits and colours each
+# line the same way it already splits $Footer.
+#
+# Names the affected slot(s) so the user sees WHICH slot is affected: it is
+# usually a non-active peer, not the '*' active slot, which is exactly the
+# confusion the old "transient, slot active." wording caused.
+#
+# One line per distinct condition, worst first, because a slot can only be in
+# one of the four buckets. Earlier versions returned a single line and let the
+# cache branch win outright, which silently hid a hard failure behind a
+# "showing last known usage" note:
+#   * no-data failures  : the row shows em-dashes. States the condition
+#     without promising recovery, because the renderer is shared by one-shot
+#     `sca usage` (no "next poll") and the watch loop.
+#   * cache fallbacks   : the row keeps last-known percentages, so the line
+#     says so. Worded per FallbackReason so a network blip is not reported as
+#     a rate limit. A missing/null reason reads as 'rate-limit', which covers
+#     the inline backoff short-circuit in Get-SlotUsage.
+function Format-UsageAdvisory {
     Param ([pscustomobject] $Snapshot)
 
     if (-not $Snapshot) { return $null }
 
-    if ($Snapshot.HasCacheFallback) {
-        $names = @($Snapshot.Results | Where-Object { $_.IsCachedFallback } | ForEach-Object { $_.Name })
-        $list  = Format-SlotNameList -Names $names
-        if (-not $list) { return $null }
-        $verb  = if ($names.Count -eq 1) { 'is' } else { 'are' }
-        return "[Usage] $list $verb currently rate-limited by Anthropic; showing last known usage."
+    $rows = @($Snapshot.Results)
+    if ($rows.Count -eq 0) { return $null }
+
+    # Cached rows are excluded from the no-data buckets: a stale fallback row
+    # carries a non-ok Status too, and reporting it twice would contradict
+    # itself (once as "unreadable", once as "showing last known usage").
+    $bareError  = @($rows | Where-Object { $_.Status -eq 'error'        -and -not $_.IsCachedFallback })
+    $bareLimit  = @($rows | Where-Object { $_.Status -eq 'rate-limited' -and -not $_.IsCachedFallback })
+    $cachedNet  = @($rows | Where-Object { $_.IsCachedFallback -and $_.FallbackReason -eq 'network' })
+    $cachedLim  = @($rows | Where-Object { $_.IsCachedFallback -and $_.FallbackReason -ne 'network' })
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+
+    # NeedsCopula: the rate-limit tails read "<slots> is/are currently ..."; the
+    # read-failure tails carry their own verb, so injecting one would produce
+    # "'a' is could not be read".
+    foreach ($bucket in @(
+        @{ Rows = $bareError; NeedsCopula = $false; Tail = 'could not be read from the usage API; usage unknown.' },
+        @{ Rows = $bareLimit; NeedsCopula = $true;  Tail = 'currently rate-limited by Anthropic.' },
+        @{ Rows = $cachedNet; NeedsCopula = $false; Tail = 'could not be read live; showing last known usage.' },
+        @{ Rows = $cachedLim; NeedsCopula = $true;  Tail = 'currently rate-limited by Anthropic; showing last known usage.' }
+    )) {
+        $names = @($bucket.Rows | ForEach-Object { $_.Name })
+        if ($names.Count -eq 0) { continue }
+        $list = Format-SlotNameList -Names $names
+        if (-not $list) { continue }
+        if ($bucket.NeedsCopula) {
+            $verb = if ($names.Count -eq 1) { 'is' } else { 'are' }
+            $lines.Add("[Usage] $list $verb $($bucket.Tail)")
+        } else {
+            $lines.Add("[Usage] $list $($bucket.Tail)")
+        }
     }
 
-    if ($Snapshot.HasRateLimited) {
-        $names = @($Snapshot.Results | Where-Object { $_.Status -eq 'rate-limited' } | ForEach-Object { $_.Name })
-        $list  = Format-SlotNameList -Names $names
-        if (-not $list) { return $null }
-        $verb  = if ($names.Count -eq 1) { 'is' } else { 'are' }
-        return "[Usage] $list $verb currently rate-limited by Anthropic."
-    }
-
-    return $null
+    if ($lines.Count -eq 0) { return $null }
+    return ($lines -join "`n")
 }
 
 # Render one usage frame (table OR verbose view, plus optional advisory
@@ -3647,12 +3761,12 @@ function Format-UsageFrame {
         Format-UsageTable -Results @($results) -IncludeAggregateBars -AutoThreshold $AutoThreshold
     }
 
-    # Cache-fallback / rate-limit advisory (wording + slot naming in
-    # Format-RateLimitAdvisory). Rendered in the footer block (alongside the
+    # Read-failure / cache-fallback advisory (wording + slot naming in
+    # Format-UsageAdvisory). Rendered in the footer block (alongside the
     # [Monitor] / [Watch] lines), NOT directly under the table: the advisory
-    # leads the footer group so the rate-limit signal sits with the other
-    # per-frame status lines instead of crowding the table's last row.
-    $advisory = Format-RateLimitAdvisory -Snapshot $Snapshot
+    # leads the footer group so the signal sits with the other per-frame
+    # status lines instead of crowding the table's last row.
+    $advisory = Format-UsageAdvisory -Snapshot $Snapshot
 
     if ($Footer -or $advisory) {
         Format-UsageFooter -Footer $Footer -Advisory $advisory
@@ -3668,9 +3782,12 @@ function Format-UsageFrame {
 # -Footer   : the [Watch] / [Monitor] lines (DarkGray). Kept as the first
 #             positional parameter so the existing positional call sites
 #             (`Format-UsageFooter $Footer`) bind unchanged.
-# -Advisory : optional rate-limit advisory (Yellow). Leads the footer
-#             block, above the DarkGray footer lines, so the warning stays
-#             visually distinct while grouping with the per-frame status.
+# -Advisory : optional usage advisory (Yellow), one line per condition.
+#             Leads the footer block, above the DarkGray footer lines, so the
+#             warning stays visually distinct while grouping with the
+#             per-frame status. Split on newlines like $Footer, because
+#             several conditions (a throttled peer and an unreadable active
+#             slot, say) can hold at once.
 function Format-UsageFooter {
     Param (
         [AllowEmptyString()] [AllowNull()] [String] $Footer,
@@ -3686,7 +3803,9 @@ function Format-UsageFooter {
     Write-Host ""
     Write-Host ""
     if ($Advisory) {
-        Write-Color $Advisory 'Yellow'
+        foreach ($line in ($Advisory -split "`r?`n")) {
+            Write-Color $line 'Yellow'
+        }
     }
     if ($Footer) {
         foreach ($line in ($Footer -split "`r?`n")) {
@@ -3895,13 +4014,15 @@ function Invoke-UsageAction {
             if ($r.Status -eq 'ok') {
                 $entry.plan_status = Get-PlanStatus $r.Data
             }
-            # is_cached_fallback: true when the row's 'ok' status was
-            # served from $Script:SlotUsageCache after a 429 from either
-            # the usage endpoint or the token-refresh endpoint (rather
-            # than from a fresh live response). Exposed on the JSON
-            # contract so scripts can detect stale data without parsing
-            # the human-readable advisory text. Only emitted when true
-            # to keep the output minimal; absence == fresh.
+            # is_cached_fallback: true when the row was served from
+            # $Script:SlotUsageCache rather than from a fresh live response,
+            # after a 429 (usage or token-refresh endpoint) OR a network /
+            # transport failure. Exposed on the JSON contract so scripts can
+            # detect stale data without parsing the human-readable advisory
+            # text. Only emitted when true to keep the output minimal;
+            # absence == fresh. Note this is the ONLY freshness marker: a
+            # `status: "error"` row can now carry `data`, and it is flagged
+            # here rather than by a second field.
             if ($r.IsCachedFallback) { $entry.is_cached_fallback = $true }
             if ($r.Email) { $entry.account = [ordered]@{ email = $r.Email } }
             if ($r.Data)  { $entry.data    = $r.Data }
@@ -4014,12 +4135,17 @@ function Invoke-WarmupAction {
 #
 # Edge cases:
 #   * Empty snapshot, NoSlots snapshot, or no active row in the snapshot
-#     -> 'noop'. The watch loop's footer surfaces these out-of-band.
-#   * Active row HTTP-non-ok (expired / unauthorized / error /
-#     no-oauth / rate-limited): max(util) is undefined (treated as 0%),
-#     so 'noop' fires. The user already sees the HTTP-failure label
-#     in the table's Status column; auto-rotation does not act on
-#     transport-level failures.
+#     -> 'noop'. The watch loop's footer surfaces these out-of-band; a
+#     missing active row is a state problem, not a network one, so it must
+#     not be reported as 'active-unknown'.
+#   * Active row HTTP-non-ok WITH cached data (a stale fallback, or a
+#     throttled slot whose last reading survives): judged on that data like
+#     any other row. See Get-RowMaxUtilization for why.
+#   * Active row HTTP-non-ok with NO data -> 'active-unknown', carrying
+#     ActiveStatus so the caller can name the failure. Rotation does not
+#     fire: moving off a slot we know nothing about would burn a healthy
+#     account. Reporting is the point, because the previous 'noop' here
+#     silently disarmed rotation for as long as the failure lasted.
 function Get-AutoRotationDecision {
     Param (
         [Parameter(Mandatory)] [pscustomobject] $Snapshot,
@@ -4047,7 +4173,29 @@ function Get-AutoRotationDecision {
     $activeRow = $results | Where-Object { $_.IsActive } | Select-Object -First 1
     if (-not $activeRow) { return $noop }
 
-    $activeMax = Get-RowMaxUtilization -Row $activeRow
+    # Hoisted from the no-eligible reset walk below so the utilization reads
+    # and the cooldown suggestion share one instant.
+    $nowUtc = [DateTimeOffset]::UtcNow
+
+    # A non-ok active row with NO data at all is the one case where we cannot
+    # reason about the slot: reporting 0% would look like a healthy idle slot
+    # and silently disarm rotation, which is exactly how a single timeout used
+    # to freeze the monitor while it kept displaying a reassuring "Rotated ..."
+    # line. Surface it instead. A non-ok row that DOES carry cached data falls
+    # through and is judged on that data.
+    if ($activeRow.Status -ne 'ok' -and -not $activeRow.Data) {
+        return [pscustomobject]@{
+            Action             = 'active-unknown'
+            FromName           = $activeRow.Name
+            ToName             = $null
+            SuggestionName     = $null
+            SuggestionBucket   = $null
+            SuggestionResetsAt = $null
+            ActiveStatus       = $activeRow.Status
+        }
+    }
+
+    $activeMax = Get-RowMaxUtilization -Row $activeRow -Now $nowUtc
     if ($activeMax -lt $Threshold) {
         # Steady state: active is below threshold; nothing to do.
         return [pscustomobject]@{
@@ -4074,8 +4222,13 @@ function Get-AutoRotationDecision {
     $eligible = $null
     for ($offset = 1; $offset -lt $sorted.Count; $offset++) {
         $candidate = $sorted[($activeIdx + $offset) % $sorted.Count]
+        # Peers still require a live-quality 'ok'. Deciding to LEAVE an
+        # exhausted slot on cached evidence is safe; deciding to ENTER an
+        # unverified one is not, and a 'rate-limited' peer is by definition a
+        # bad destination. A fresh cache fallback already reports 'ok', so a
+        # transient blip does not disqualify a peer.
         if ($candidate.Status -ne 'ok')         { continue }
-        $candMax = Get-RowMaxUtilization -Row $candidate
+        $candMax = Get-RowMaxUtilization -Row $candidate -Now $nowUtc
         if ($candMax -ge $Threshold)            { continue }
         $eligible = $candidate
         break
@@ -4101,7 +4254,6 @@ function Get-AutoRotationDecision {
     $soonestBucket = $null
     $soonestTime   = $null
 
-    $nowUtc = [DateTimeOffset]::UtcNow
     foreach ($r in $results) {
         if (-not $r.Data) { continue }
         foreach ($pair in @(
@@ -4131,24 +4283,58 @@ function Get-AutoRotationDecision {
     }
 }
 
-# Pull the max(five_hour, seven_day) utilization from a snapshot row.
-# Null/missing buckets count as 0% (matches Format-AggregateBars and
-# Get-PlanStatus's 'ok (no plan data)' tier; an account that has not
-# made a live API call yet is by definition not utilized). Non-ok HTTP
-# rows fall through to 0% because $Row.Data is unset in that case.
-# Extracted to keep Get-AutoRotationDecision readable; Format-WatchTitle
-# and Get-PlanStatus do their own bucket walking with slightly
-# different semantics (Format-WatchTitle preserves nulls for display),
-# so this helper is auto-rotation-specific by design.
+# Pull the max(five_hour, seven_day) utilization from a snapshot row. Shared
+# by auto-rotation (Get-AutoRotationDecision) and keep-warm eligibility
+# (Test-WarmEligible) so "this slot is at limit" has exactly one definition.
+#
+# Judged on $Row.Data whenever it is present, regardless of Status. That
+# matches Format-UsageTable, which already renders bucket percentages from
+# Data alone: a row good enough to show numbers to the user is good enough to
+# decide on. Rows with no Data (including every hard HTTP failure) return 0%,
+# as do null/missing buckets, matching Get-PlanStatus's 'ok (no plan data)'
+# tier; an account that has not made a live API call yet is by definition not
+# utilized. Callers that must distinguish "0% because idle" from "0% because
+# unreadable" check $Row.Data themselves.
+#
+# A bucket whose resets_at has already passed contributes 0: its window has
+# rolled and the utilization we hold is known-obsolete. Without this, cached
+# data (which has no upper age bound once stale) could keep reporting a slot
+# as exhausted long after its window reset, rotating away from a slot that is
+# actually free. Same closed-window rule Test-WarmEligible applies.
+#
+# Format-WatchTitle and Get-PlanStatus keep their own bucket walking; their
+# semantics differ (Format-WatchTitle preserves nulls for display).
 function Get-RowMaxUtilization {
-    Param ([Parameter(Mandatory)] [pscustomobject] $Row)
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Row,
+        [Parameter(Mandatory)] [DateTimeOffset] $Now
+    )
 
-    if ($Row.Status -ne 'ok' -or -not $Row.Data) { return 0.0 }
+    if (-not $Row.Data) { return 0.0 }
 
-    $five  = if ($Row.Data.five_hour -and $null -ne $Row.Data.five_hour.utilization) { [double]$Row.Data.five_hour.utilization } else { 0.0 }
-    $seven = if ($Row.Data.seven_day -and $null -ne $Row.Data.seven_day.utilization) { [double]$Row.Data.seven_day.utilization } else { 0.0 }
+    $five  = Get-BucketUtilizationOrZero -Bucket $Row.Data.five_hour -Now $Now
+    $seven = Get-BucketUtilizationOrZero -Bucket $Row.Data.seven_day -Now $Now
     if ($five -ge $seven) { return $five }
     return $seven
+}
+
+# Utilization of one usage bucket, or 0 when it is missing, has no
+# utilization, or has already reset. Extracted so Get-RowMaxUtilization reads
+# as the max of two comparable numbers instead of two inline ternaries.
+function Get-BucketUtilizationOrZero {
+    Param (
+        [AllowNull()] $Bucket,
+        [Parameter(Mandatory)] [DateTimeOffset] $Now
+    )
+
+    if (-not $Bucket -or $null -eq $Bucket.utilization) { return 0.0 }
+
+    if ($Bucket.resets_at) {
+        $reset = ConvertTo-DateTimeOffsetOrNull $Bucket.resets_at
+        if ($null -ne $reset -and $reset -le $Now) { return 0.0 }
+    }
+
+    return [double]$Bucket.utilization
 }
 
 # Render a positive future reset duration as a compact "Xh Ym" / "Xm"
@@ -4227,6 +4413,16 @@ function Invoke-AutoRotationStep {
             # prior 'rotate' the 'Rotated A -> B at HH:mm:ss' string
             # stays latched until the next state change.
             return $CurrentLatch
+        }
+
+        'active-unknown' {
+            # The active slot's usage could not be read and no cached reading
+            # survives, so rotation has nothing to judge and deliberately does
+            # not fire (moving off a possibly-fine slot on no evidence would
+            # burn a healthy account). Say so: preserving the previous latch
+            # here is what used to leave a reassuring 'Rotated ...' line on
+            # screen while the monitor was blind and inert.
+            return ('[Monitor] Active slot usage unknown ({0}); rotation paused.' -f $decision.ActiveStatus)
         }
 
         'rotate' {
@@ -4413,9 +4609,19 @@ function Invoke-WarmAllSlots {
             Data             = $null
             Error            = $null
             IsCachedFallback = $false
+            # Same shape as Get-UsageSnapshot's rows so every renderer and
+            # predicate behaves identically on a warmup frame.
+            HttpStatus       = $null
+            FallbackReason   = $null
         }
     })
-    $snapshot = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false; HasRateLimited = $false }
+    $snapshot = [pscustomobject]@{
+        Results          = $rows
+        NoSlots          = $false
+        HasCacheFallback = $false
+        HasRateLimited   = $false
+        HasError         = $false
+    }
     & $Repaint $snapshot
 
     $origActive = $null
@@ -4478,6 +4684,8 @@ function Invoke-WarmAllSlots {
                     $row.Data             = $u.Data
                     $row.Error            = $u.Error
                     $row.IsCachedFallback = [bool]$u.IsCachedFallback
+                    $row.HttpStatus       = $u.HttpStatus
+                    $row.FallbackReason   = $u.FallbackReason
                 }
                 else {
                     # Activation failed (rate-limited / unauthorized /
@@ -4498,6 +4706,7 @@ function Invoke-WarmAllSlots {
             # transient-throttle note matches what the polling loop renders.
             $snapshot.HasCacheFallback = (@($rows | Where-Object { $_.IsCachedFallback }).Count -gt 0)
             $snapshot.HasRateLimited   = (@($rows | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0)
+            $snapshot.HasError         = (@($rows | Where-Object { $_.Status -eq 'error' }).Count -gt 0)
             & $Repaint $snapshot
 
             if ($i -lt $last -and $Script:WarmupSpacingMs -gt 0) {
@@ -4519,16 +4728,26 @@ function Invoke-WarmAllSlots {
 # unit-testable without the swap / activate / mirror orchestration. $Now is
 # the current UTC instant (passed in for determinism).
 #
-# A 'rate-limited' slot is eligible (a real `claude -p` can clear the
-# throttle); an 'ok' slot only once its five_hour window is closed (a
+# A slot already at limit is never eligible: warming opens the 5h window, and
+# a window that is open and full has nothing to gain from a billable
+# `claude -p`. Checked FIRST so it also gates the rate-limited branch, which
+# is where an exhausted slot usually shows up. Shares Get-RowMaxUtilization
+# with auto-rotation so "at limit" means the same thing to both, which is also
+# what keeps warm-eligible and rotation-source sets disjoint.
+#
+# Otherwise: a 'rate-limited' slot is eligible (a real `claude -p` can clear
+# the throttle); an 'ok' slot only once its five_hour window is closed (a
 # mid-window slot carries a FUTURE resets_at). Hard-fail rows (expired /
 # unauthorized / no-oauth / error) are not: a billable `claude -p` would
 # not fix them.
 function Test-WarmEligible {
     Param (
         [Parameter(Mandatory)] [pscustomobject] $Row,
-        [Parameter(Mandatory)] [DateTimeOffset] $Now
+        [Parameter(Mandatory)] [DateTimeOffset] $Now,
+        [Parameter(Mandatory)] [int]            $Threshold
     )
+
+    if ((Get-RowMaxUtilization -Row $Row -Now $Now) -ge $Threshold) { return $false }
 
     if ($Row.Status -eq 'rate-limited') { return $true }
     if ($Row.Status -ne 'ok')          { return $false }
@@ -4556,10 +4775,14 @@ function Test-WarmEligible {
 # rationale as Invoke-AutoRotationStep. Re-warmed rows are NOT merged back into
 # $Snapshot; the next poll re-reads /api/oauth/usage. Never throws: a warm-path
 # exception surfaces as a '[Warmup] Re-warm failed! ...' line.
+# -Threshold is mandatory rather than defaulted: it must be the SAME value
+# auto-rotation uses, and the caller always has it. A default here would let a
+# wiring mistake silently disable the at-limit skip instead of failing loudly.
 function Invoke-KeepWarmStep {
     Param (
         [Parameter(Mandatory)] [pscustomobject] $Snapshot,
         [Parameter(Mandatory)] [hashtable]      $WarmupTimes,
+        [Parameter(Mandatory)] [int]            $Threshold,
         [int]                                   $CooldownMin = $Script:WarmupCooldownMin,
         [AllowNull()] [AllowEmptyString()] [string] $CurrentLatch
     )
@@ -4572,7 +4795,7 @@ function Invoke-KeepWarmStep {
     $nowUtc = [DateTimeOffset]::UtcNow
     $cold   = @(
         foreach ($r in $results) {
-            if (-not (Test-WarmEligible -Row $r -Now $nowUtc)) { continue }
+            if (-not (Test-WarmEligible -Row $r -Now $nowUtc -Threshold $Threshold)) { continue }
 
             $last = $WarmupTimes[$r.Name]
             if ($last -and ($now - $last).TotalMinutes -lt $CooldownMin) { continue }
@@ -4900,12 +5123,15 @@ function Invoke-UsageWatch {
 
                     # Keep-warm decision after auto-rotation so the slot
                     # Invoke-WarmAllSlots restores to is the post-rotation
-                    # active one. Cold (~0% util, closed window) and at-limit
-                    # (>= threshold) are disjoint, so keep-warm and rotation
-                    # never fight over the same slot. Re-opens any slot whose
-                    # 5h window has closed; the latched footer reports it.
+                    # active one. Keep-warm and rotation cannot fight over a
+                    # slot: both gate on Get-RowMaxUtilization against the same
+                    # -Threshold, and Test-WarmEligible skips anything at or
+                    # above it, so a rotation source is never warm-eligible.
+                    # Re-opens any slot whose 5h window has closed; the latched
+                    # footer reports it.
                     if ($Warmup) {
-                        $lastWarmupFooter = Invoke-KeepWarmStep -Snapshot $snapshot -WarmupTimes $warmupTimes -CurrentLatch $lastWarmupFooter
+                        $lastWarmupFooter = Invoke-KeepWarmStep -Snapshot $snapshot -WarmupTimes $warmupTimes `
+                                                               -Threshold $Threshold -CurrentLatch $lastWarmupFooter
                     }
                 }
                 catch {
@@ -4915,7 +5141,13 @@ function Invoke-UsageWatch {
                     # error in the footer; the user can still quit cleanly.
                     $lastPollError = $_.Exception.Message
                 }
-                $lastPoll = $now
+                # Stamped AFTER the poll, not from the pre-poll $now: a poll
+                # that outruns -Interval (slow endpoint x N slots) would
+                # otherwise be pre-credited with its own duration and the next
+                # iteration would re-poll with zero delay, hammering a limiter
+                # that 429s after a handful of calls in a few seconds. Matches
+                # the post-warmup stamp above.
+                $lastPoll = [DateTime]::Now
             }
 
             # Footer rebuilt every tick. The string is constant between
