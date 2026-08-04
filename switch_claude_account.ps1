@@ -78,9 +78,8 @@ Param (
     # anchor of its own (its set is selected by the positional Action,
     # which parameter sets cannot key off). [ValidateRange] rejects zero /
     # negatives at bind time; the 60-second floor is a runtime
-    # clamp-with-advisory inside Invoke-UsageWatch (see "Watch mode" in
-    # .claude/rules/script-internals.md). Ignored by actions other than
-    # `usage -Watch` / `monitor`.
+    # clamp-with-advisory inside Invoke-UsageWatch. Ignored by actions other
+    # than `usage -Watch` / `monitor`.
     [ValidateRange(1, [int]::MaxValue)]
     [int] $Interval = 60,
 
@@ -190,6 +189,23 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 # (matches the `user:sessions:claude_code` scope slot files carry); the
 # other client id in the binary (22422756-...) is for the Console API-key
 # flow and does not accept our refresh tokens.
+#
+# GET /api/oauth/usage response body, verified against a live Team-plan call
+# on 2026-04-24. Every branch is optional; free-tier and API-key accounts
+# receive `{}`:
+#
+#   five_hour        { utilization: 0..100, resets_at: <ISO-8601>|null }
+#   seven_day        { utilization: 0..100, resets_at: <ISO-8601>|null }
+#   seven_day_opus   null | { utilization, resets_at }
+#   seven_day_sonnet null | { utilization, resets_at }
+#   extra_usage      { is_enabled, monthly_limit, used_credits,
+#                      utilization, currency }  (all nullable)
+#
+# Plus internal/unreleased buckets that are null for external subscriptions
+# and are NOT rendered in any view (they round-trip only via -Json):
+# seven_day_oauth_apps, seven_day_cowork, seven_day_omelette,
+# iguana_necktie, omelette_promotional. Only five_hour (Session) and
+# seven_day (Week) are rendered, matching Claude Code's own /usage bars.
 $Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
 $Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
 $Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
@@ -542,6 +558,15 @@ function Update-ScaState {
 # ~/.claude.json in-memory cache, our oauthAccount mutation could race
 # its flush. Wrapped as a function so tests can mock it without driving
 # real process state.
+#
+# This is our whole concurrency story for ~/.claude.json, and it is a
+# deliberate non-participation: Claude Code serialises its OWN writes with
+# proper-lockfile via ~/.claude.json.lock, and we do not take that lock.
+# Taking it would only order our write against theirs; it would not evict the
+# in-memory copy a running Claude Code may still flush over the top of us.
+# Refusing to run at all is the stronger guarantee, because there is no live
+# cache to lose the race against. Recovery if a write ever does corrupt the
+# file: Claude Code keeps rolling ~/.claude.json.backup.<unix-ms> copies.
 function Test-ClaudeRunning {
     return [bool](Get-Process -Name 'claude' -ErrorAction SilentlyContinue)
 }
@@ -629,9 +654,17 @@ function Get-SHA256Hex {
 #
 # Strategy: locate the `"oauthAccount": { ... }` block by brace-counting,
 # then substitute each whitelisted "field": "value" pair within the block
-# via a single regex replace. The non-whitelisted fields (billingType,
-# claudeCodeTrialEndsAt, etc.) inside oauthAccount are also preserved
-# byte-equal; we only touch the five identity fields.
+# via a single regex replace (a MatchEvaluator, not a replacement string, so
+# a value containing $1 / $& cannot be reinterpreted as a capture token).
+# The non-whitelisted fields (billingType, claudeCodeTrialEndsAt, etc.)
+# inside oauthAccount are also preserved byte-equal; we only touch the five
+# identity fields.
+#
+# Why not parse and reserialize: ~/.claude.json is large and structurally
+# complex, and a ConvertTo-Json round-trip silently shifts key ordering,
+# integer vs decimal rendering, and escape casing. Targeted substitution is
+# the smaller blast radius, and the tests assert byte-equal preservation of
+# unrelated top-level fields across a save -> switch round trip.
 #
 # Null-valued whitelisted fields are skipped (they preserve the existing
 # ~/.claude.json value). The asymmetry is deliberate: null → real
@@ -965,6 +998,19 @@ function Show-Help {
 # `$PSStyle.Foreground.Yellow` (ANSI 33), and `Yellow` (advisory)
 # maps to `BrightYellow` (ANSI 93). Visually equivalent to the
 # pre-refactor rendering on every modern terminal palette.
+#
+# Palette convention. Not derivable from any single call site, so it is
+# recorded once here; pick from this set rather than inventing a colour:
+#   DarkYellow : section-title headers ('[Usage] Plan usage', '[List] Saved
+#                slots'). Never a sentence.
+#   Yellow     : advisories and warnings. "Attention required", never a header.
+#   Green      : success on a side-effecting action ('[Save] Saved ...').
+#   Red        : destructive completion ('[Remove] Removed ...').
+#   DarkGray   : dimmed metadata (verbose account row, watch footer).
+#
+# FORCE_COLOR is deliberately unsupported: Write-Host writes to the
+# information stream (6), not stdout, so a pipe or redirect never captures
+# colour in the first place and there is nothing for the override to force.
 function Write-Color {
     Param (
         [Parameter(Mandatory)] [String]              $Message,
@@ -2408,6 +2454,11 @@ function Resolve-SlotAccessToken {
 # Resolve-UsageFailureFallback ladder first, so a single transport blip
 # degrades the row to "last known percentages, labelled" instead of wiping
 # it to em-dashes for a whole poll interval.
+#
+# Parse the RAW body shape documented at $Script:UsageEndpoint. Claude Code
+# re-shapes it into { rate_limits: { five_hour: { used_percentage, resets_at } } }
+# for its status-line hook; do NOT model that hook-input schema here, it is a
+# downstream projection with different key names.
 function Get-SlotUsage {
     Param (
         [String] $SlotPath
@@ -4045,6 +4096,12 @@ function Invoke-UsageAction {
 # -KeepWarm. A positional <name> is ignored: rotation and keep-warm span
 # the whole slot fleet, so scoping to one slot is meaningless. The
 # Claude-Code-running refusal lives in Invoke-UsageWatch's pre-loop guard.
+#
+# Scope is OpenCode-only by design (issue #8). Rotation depends on the client
+# re-reading .credentials.json when its cached token misses, which
+# opencode-claude-auth >= 1.5.4 does, so a swap propagates without a restart.
+# Claude Code caches ~/.claude.json in memory instead and would race the
+# swap, which is why the guard refuses rather than warns.
 function Invoke-MonitorAction {
     Param (
         [string] $Name,
