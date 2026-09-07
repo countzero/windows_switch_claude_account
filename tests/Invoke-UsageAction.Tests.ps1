@@ -194,8 +194,9 @@ Describe 'switch_claude_account' {
 
             { Invoke-UsageAction 6>$null } | Should -Not -Throw
             $out = Invoke-UsageAction 6>&1 | Out-String
-            $out | Should -Match 'error:'
-            $out | Should -Match 'timed out'
+            # Bare label in the cell; the reason on the advisory line below.
+            $out | Should -Match '(?m)^\s+offline\b.*\berror\s*$'
+            $out | Should -Match '\[Usage\] offline: The operation has timed out\.'
         }
 
         It 'slot with no claudeAiOauth section: status is no-oauth; no HTTP call made' {
@@ -348,23 +349,25 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match 'showing cached data'
         }
 
-        It 'refresh failure with non-429 long message: expired tail is truncated' {
+        It 'refresh failure with non-429 long message: reason line is truncated, row label is not widened' {
             New-Slot -Name 'slot-long' -ExpiresAt $script:PastMs | Out-Null
 
-            $longMessage = 'X' * 200
+            $longMessage = 'X' * ($Script:AdvisoryReasonMaxWidth * 2)
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
                 throw [System.Exception]::new($longMessage)
             }
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            # Still classified as 'expired' (no Response.StatusCode = 429).
-            $out | Should -Match '(?m)^\s+slot-long\b.*\bexpired:'
-            # Truncation marker present (the helper appends '...').
-            $out | Should -Match 'expired: X+\.\.\.'
-            # The full 200-char tail must NOT appear verbatim; defense-in-depth
-            # against the original wrapping bug for non-429 long messages.
-            $out | Should -Not -Match ('X' * 100)
+            # Still classified as 'expired' (no Response.StatusCode = 429), and
+            # the message never reaches the Status cell: the cell is the last
+            # column and its width also sizes the aggregate bars.
+            $out | Should -Match '(?m)^\s+slot-long\b.*\bexpired\s*$'
+            # The message lands on the advisory reason line, truncated there
+            # (the helper appends '...').
+            $out | Should -Match "\[Usage\] slot-long: X+\.\.\."
+            # Bounded: the full 400-char message must NOT appear verbatim.
+            $out | Should -Not -Match ('X' * ($Script:AdvisoryReasonMaxWidth + 1))
         }
 
         It '-Json emits is_cached_fallback when cache served the row' {
@@ -1483,6 +1486,18 @@ Describe 'switch_claude_account' {
                     Email    = $null
                 }
             }
+
+            # 60 chars, enough to push the table past 80 columns on its own.
+            $script:WideName = 'slot-' + ('x' * 55)
+
+            # The column-header line is the width yardstick for the bar-clamp
+            # tests below: its Status field is exactly the 6-char header
+            # literal, so its length equals the $totalLineWidth the bars are
+            # derived from.
+            function Get-HeaderLineLength {
+                Param ([string[]] $Lines)
+                return @($Lines | Where-Object { $_ -match '^\s+Slot\s+Account\s+Session\s+Week\s+Status\s*$' })[0].Length
+            }
         }
 
         It 'renders bar lines between [Usage] header and column header when -IncludeAggregateBars is set' {
@@ -1520,6 +1535,37 @@ Describe 'switch_claude_account' {
             # New literals present; old literals absent in header line.
             $out | Should -Match '(?m)^\s+Slot\s+Account\s+Session\s+Week\s+Status\s*$'
             $out | Should -Not -Match '(?m)^\s+Slot\s+Account\s+5h\s+7d\s+Status\s*$'
+        }
+
+        # The bars fit to the table, and the table is content-sized, so it can
+        # be wider than the terminal. An unclamped bar then wraps, which reads
+        # as a rendering bug rather than as an overflowing table.
+        It 'clamps the bar lines to the terminal width when the table is wider' {
+            Mock Get-ConsoleWidth -MockWith { 80 }
+            $out   = Format-UsageTable -Results @((New-OkRow -Name $script:WideName)) -IncludeAggregateBars 6>&1 | Out-String
+            $lines = @($out -split "`r?`n")
+
+            # Guard: the table really is wider than the terminal here.
+            (Get-HeaderLineLength -Lines $lines) | Should -BeGreaterThan 80
+
+            $barLines = @($lines | Where-Object { $_ -match '^\s+(Session|Week)\s*\[' })
+            $barLines.Count | Should -Be 2
+            foreach ($line in $barLines) { $line.Length | Should -Be 79 }
+
+            # The table itself stays content-sized; only the derived bar width
+            # is clamped.
+            @($lines | Where-Object { $_ -match [regex]::Escape($script:WideName) }).Count | Should -BeGreaterThan 0
+        }
+
+        It 'leaves the fit-to-table bar width alone when the terminal width is unknown' {
+            Mock Get-ConsoleWidth -MockWith { 0 }
+            $out   = Format-UsageTable -Results @((New-OkRow -Name $script:WideName)) -IncludeAggregateBars 6>&1 | Out-String
+            $lines = @($out -split "`r?`n")
+
+            $headerLen = Get-HeaderLineLength -Lines $lines
+            $headerLen | Should -BeGreaterThan 80
+            $barLines  = @($lines | Where-Object { $_ -match '^\s+(Session|Week)\s*\[' })
+            foreach ($line in $barLines) { $line.Length | Should -Be $headerLen }
         }
     }
 
@@ -1831,9 +1877,11 @@ Describe 'switch_claude_account' {
             }
             $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
             $out | Should -Match "Slot 'dead'"
-            # The fallback render uses Format-UsageTable, which renders
-            # the "expired:" status text.
-            $out | Should -Match 'expired:'
+            # The fallback render uses Format-UsageTable, which renders the
+            # bare 'expired' label. The reason comes from Format-UsageAdvisory,
+            # which Format-UsageFrame (not this function) renders.
+            $out | Should -Match '(?m)^\s+dead\b.*\bexpired\s*$'
+            $out | Should -Not -Match 'refresh_token invalid'
             # No Session/Week bucket rows in the fallback path.
             $out | Should -Not -Match '^\s+Session\s'
         }
@@ -2257,10 +2305,10 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Format-UsageTable (error-status label)' {
-        # The 'error' arm prefers a short 'error <code>' label when the row
-        # carries a numeric HttpStatus so a verbose .NET exception cannot
-        # widen the Status column and wrap the row; it falls back to the
-        # truncated message tail for codeless network errors.
+        # The 'error' arm appends the numeric HttpStatus when the row carries
+        # one and renders the bare label otherwise. No arm renders the
+        # exception message: the Status cell is the last column and its width
+        # also sizes the aggregate bars, so one long cell wraps both.
         It 'renders "error <code>" when the row carries an HttpStatus' {
             $row = [pscustomobject]@{
                 Name       = 'slot-1'
@@ -2277,7 +2325,7 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match 'does not indicate success'
         }
 
-        It 'falls back to "error: <tail>" when the row has no HttpStatus' {
+        It 'falls back to the bare "error" label when the row has no HttpStatus' {
             $row = [pscustomobject]@{
                 Name     = 'slot-1'
                 IsActive = $false
@@ -2287,7 +2335,29 @@ Describe 'switch_claude_account' {
                 Email    = $null
             }
             $out = Format-UsageTable -Results @($row) 6>&1 | Out-String
-            $out | Should -Match 'error: The operation has timed out\.'
+            $out | Should -Match '(?m)^\s+slot-1\b.*\berror\s*$'
+            $out | Should -Not -Match 'timed out'
+        }
+
+        # Every hard-failure label is a short fixed string. The parenthetical
+        # remedies these used to carry ('no-oauth (api key or non-claude.ai
+        # slot)' and friends) moved to Format-UsageAdvisory's reason lines.
+        It 'renders hard-failure statuses as bare labels' -ForEach @(
+            @{ Status = 'no-oauth';     Hint = 'api key' }
+            @{ Status = 'expired';      Hint = 'sca switch' }
+            @{ Status = 'unauthorized'; Hint = 'revoked'    }
+        ) {
+            $row = [pscustomobject]@{
+                Name     = 'slot-1'
+                IsActive = $false
+                Status   = $Status
+                Data     = $null
+                Error    = $null
+                Email    = $null
+            }
+            $out = Format-UsageTable -Results @($row) 6>&1 | Out-String
+            $out | Should -Match "(?m)^\s+slot-1\b.*\b$([regex]::Escape($Status))\s*`$"
+            $out | Should -Not -Match ([regex]::Escape($Hint))
         }
     }
 
@@ -3472,6 +3542,27 @@ Describe 'switch_claude_account' {
             }
 
             (Invoke-SlotActivator -SlotPath $path).Status | Should -Be 'rate-limited'
+        }
+
+        # Claude Code's own plan-limit sentences say neither 'rate limit' nor
+        # '429', so they used to fall into the default arm and surface as a
+        # hard 'error' on a plainly throttled slot.
+        It 'plan-limit text returns Status=rate-limited with the reset time kept: <Case>' -ForEach @(
+            @{ Case = 'session limit'; Message = "You've hit your session limit `u{00B7} resets 6:10pm (Europe/Berlin)" }
+            @{ Case = 'weekly limit';  Message = "You've hit your weekly limit `u{00B7} resets Nov 4 at 9am"            }
+            @{ Case = 'limit reached'; Message = 'Claude usage limit reached. Your limit will reset at 6pm.'             }
+        ) {
+            $path = New-ActivatorSlot -Name 'capped'
+            Mock Invoke-ClaudeActivatorProcess -MockWith {
+                New-ClaudeFailProc -ExitCode 1 -Result $Message
+            }
+
+            $r = Invoke-SlotActivator -SlotPath $path
+            $r.Status | Should -Be 'rate-limited'
+            # Error carries the whole sentence, uncut: Format-UsageAdvisory
+            # renders it as the slot's reason line, and the reset time is the
+            # only part the user can act on.
+            $r.Error  | Should -Be $Message
         }
 
         It 'auth/permission text returns Status=unauthorized' {

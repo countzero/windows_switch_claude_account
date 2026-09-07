@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-09-07
+
+### Changed
+- The `Status` column of `sca usage` renders short fixed labels only (`error`, `error <code>`, `expired`, `unauthorized`, `no-oauth`), matching what the README always documented. The reason a slot failed now prints below the table as `[Usage] <slot>: <reason>`, up to three slots. Status is the last column and its width also sizes the Session / Week bars, so one long cell wrapped both its own row and the two bars; the reason itself was cut mid-word at 60 characters, which was the case that made this visible ("`error: You've hit your session limit · resets 6:10pm (Europe/Berlin...`").
+
+### Fixed
+- `sca monitor -KeepWarm` no longer reports a slot that has hit its Claude.ai session or weekly limit as a hard `error`. Claude Code phrases those as "You've hit your session limit", which says neither "rate limit" nor "429", so the classifier missed it: such a slot now shows `rate-limited` in yellow, keeps its reset time visible on the advisory line, and is re-probed once its window may have rolled instead of being written off. The advisory also no longer claims the usage API could not be read for a slot whose usage was never read.
+- The aggregate Session / Week bars no longer overflow the terminal. They fit to the table, but the table is content-sized, so a long slot name or a wide status pushed the bar past the right edge and it wrapped onto a second line.
+
 ## [3.1.0] - 2026-08-04
 
 ### Changed

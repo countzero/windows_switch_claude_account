@@ -137,7 +137,8 @@ Decoding the output:
 - **Active marker (`*`)**: sourced from `~/.claude/.sca-state.json`; appears at the start of the row and inherits the row's color.
 - **`Account` column**: the OAuth email captured at save time. Shows `—` when the email equals the slot name (deduped filename), the actual email otherwise.
 - **`Session` / `Week` cells**: `<pct>% <delta>`. The delta is `(2h 11m)` under 24h with minute precision, `(102h)` at 24h+ with integer hours, `now` if the reset is past, or `—` when no data is available.
-- **`Status` column**: one of `ok`, `near limit` (≥90%), `limited 5h` / `limited 7d` (≥100%), `error`, `expired`, `unauthorized`, `rate-limited`, or `no-oauth`. Status drives the entire row's color.
+- **`Status` column**: one of `ok`, `near limit` (≥90%), `limited 5h` / `limited 7d` (≥100%), `error` (`error <code>` on an HTTP failure that carried one), `expired`, `unauthorized`, `rate-limited`, or `no-oauth`. Status drives the entire row's color.
+- **Failure reasons**: labels stay short so they cannot widen the table. Why a slot failed prints below it as `[Usage] <slot>: <reason>` (the API's own message, or the remedy for `expired` / `unauthorized` / `no-oauth`), for up to three slots.
 
 Drill into a single slot for absolute reset times in your local timezone:
 

@@ -1444,6 +1444,12 @@ Describe 'switch_claude_account' {
             @{ Case = 'limited (both)';    Label = 'limited';           Expected = 'no prompts until both 5h and 7d windows reset' }
             @{ Case = 'ok (no plan data)'; Label = 'ok (no plan data)'; Expected = 'HTTP ok but response carried no bucket data' }
             @{ Case = 'rate-limited';      Label = 'rate-limited';      Expected = 'temporary API throttle (429), not a plan limit' }
+            # Hard-failure statuses. Keyed on the raw Status value, because
+            # Format-UsageAdvisory's reason lines are where these remedies
+            # render now that the Status column carries only a bare label.
+            @{ Case = 'expired';           Label = 'expired';           Expected = 'token refresh failed; run sca switch to refresh' }
+            @{ Case = 'unauthorized';      Label = 'unauthorized';      Expected = 'token revoked; run sca switch then /login' }
+            @{ Case = 'no-oauth';          Label = 'no-oauth';          Expected = 'api key or non-claude.ai slot' }
         ) {
             (Get-StatusRationale -Label $Label) | Should -Be $Expected
         }
@@ -1454,8 +1460,10 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'at least one bucket$'
         }
 
-        It 'returns $null for labels with no rationale (ok, error, expired, ...)' {
+        It 'returns $null for labels with no rationale' {
             (Get-StatusRationale -Label 'ok')    | Should -BeNullOrEmpty
+            # 'error' stays absent on purpose: such a row carries a real
+            # message, which the advisory prints instead of a canned remedy.
             (Get-StatusRationale -Label 'error') | Should -BeNullOrEmpty
             (Get-StatusRationale -Label '')      | Should -BeNullOrEmpty
         }
@@ -1605,6 +1613,84 @@ Describe 'switch_claude_account' {
                 Data = $null; Error = $null; Email = $null; IsActive = $false }
             $snap = New-RlSnapshot -Results @($row) -Cache $true -Rl $true
             Format-UsageAdvisory -Snapshot $snap | Should -Match 'rate-limited by Anthropic; showing last known usage'
+        }
+
+        # --- per-slot reason lines ---
+        #
+        # The Status column carries only a short label, so the detail it used
+        # to inline (a 60-char exception tail, cut mid-word) lands here.
+
+        It "prints the row's own message as its reason line" {
+            $row  = New-RlRow -Name 'slot-1' -Status 'error'
+            $row.Error = 'The operation has timed out.'
+            $snap  = New-RlSnapshot -Results @($row) -Cache $false -Rl $false -Err $true
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            $lines.Count | Should -Be 2
+            $lines[0]    | Should -Match 'could not be read from the usage API'
+            $lines[1]    | Should -Be '[Usage] slot-1: The operation has timed out.'
+        }
+
+        It 'collapses a multi-line message onto one reason line and bounds its length' {
+            $row  = New-RlRow -Name 'slot-1' -Status 'error'
+            $row.Error = "first line`r`nsecond line " + ('X' * ($Script:AdvisoryReasonMaxWidth * 2))
+            $snap  = New-RlSnapshot -Results @($row) -Cache $false -Rl $false -Err $true
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            $lines.Count | Should -Be 2
+            $lines[1] | Should -Match '^\[Usage\] slot-1: first line second line X+\.\.\.$'
+            $lines[1].Length | Should -BeLessThan ($Script:AdvisoryReasonMaxWidth + 30)
+        }
+
+        It 'falls back to the canned remedy for a hard failure with no message: <Case>' -ForEach @(
+            @{ Case = 'expired';      Status = 'expired';      Expected = 'token refresh failed; run sca switch to refresh' }
+            @{ Case = 'unauthorized'; Status = 'unauthorized'; Expected = 'token revoked; run sca switch then /login' }
+            @{ Case = 'no-oauth';     Status = 'no-oauth';     Expected = 'api key or non-claude.ai slot' }
+        ) {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status $Status)) -Cache $false -Rl $false
+            # These statuses match no condition bucket, so the reason line is
+            # the whole advisory.
+            Format-UsageAdvisory -Snapshot $snap | Should -Be "[Usage] slot-1: $Expected"
+        }
+
+        It 'stays silent for a rate-limited row with no message (the condition line already says it)' {
+            $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1')) -Cache $false -Rl $true
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+            $lines.Count | Should -Be 1
+            $lines[0]    | Should -Match 'currently rate-limited by Anthropic'
+        }
+
+        It 'caps the reason block at 3 lines so a wide failing pool cannot push the table off screen' {
+            $rows = @('a','b','c','d','e') | ForEach-Object {
+                $r = New-RlRow -Name $_ -Status 'error'
+                $r.Error = "boom $_"
+                $r
+            }
+            $snap  = New-RlSnapshot -Results $rows -Cache $false -Rl $false -Err $true
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            # 1 condition line + 3 reason lines.
+            $lines.Count | Should -Be 4
+            @($lines | Where-Object { $_ -match '^\[Usage\] \w: boom' }).Count | Should -Be 3
+            # The condition line still accounts for every affected slot.
+            $lines[0] | Should -Match "and 2 more"
+        }
+
+        It 'ok rows never produce a reason line' {
+            $row = New-RlRow -Name 'slot-1' -Status 'ok'
+            $snap = New-RlSnapshot -Results @($row) -Cache $false -Rl $false
+            Format-UsageAdvisory -Snapshot $snap | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Get-ConsoleWidth' {
+        It 'returns a non-negative integer without throwing in a console-less host' {
+            # Pester runs with no attached console, so [Console]::WindowWidth
+            # throws here; the helper exists to swallow that and hand callers
+            # a 0 they can branch on.
+            $w = Get-ConsoleWidth
+            $w | Should -BeOfType [int]
+            $w | Should -BeGreaterOrEqual 0
         }
     }
 

@@ -140,7 +140,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '3.1.0'
+$Script:ScriptVersion = '3.2.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -205,9 +205,9 @@ $Script:AnthropicBeta       = "oauth-2025-04-20"
 $Script:AnthropicApiVersion = "2023-06-01"
 $Script:UsageUserAgent      = "claude-code/2.1.119"
 # Per-endpoint HTTP budgets. Measured /api/oauth/usage round-trips against
-# a live subscription span 46-2108 ms, so the previous shared 5 s left under
-# 2.4x headroom and a single latency spike collapsed a slot's row to
-# 'error: The request was canceled due to the configured HttpClient.Timeout'.
+# a live subscription span 46-2108 ms, so a shared 5 s budget left under
+# 2.4x headroom and a single latency spike collapsed a slot's row to an
+# 'error' carrying no numbers.
 # The refresh POST gets its own (larger) budget rather than borrowing the
 # usage constant: it does server-side crypto plus refresh-token rotation, so
 # it is the slowest of the three calls and was the one running tightest.
@@ -294,6 +294,15 @@ $Script:AggregateYellowPct     = 50
 # local-part) stays visible. The verbose `sca usage <name>` view and
 # `-Json` output always carry the full email.
 $Script:AccountColumnMaxWidth  = 32
+
+# Bound on a failure reason as rendered by Format-UsageAdvisory's per-slot
+# lines, and as stored on a row by Invoke-SlotActivator. Generous because the
+# advisory owns a full terminal line and wraps harmlessly, unlike the Status
+# column it replaced: Claude Code's own limit sentence ("You've hit your
+# session limit · resets 6:10pm (Europe/Berlin)") is 61 chars and used to get
+# cut mid-timezone at 60. Still bounded so a runaway stderr cannot flood the
+# frame or a -Json row.
+$Script:AdvisoryReasonMaxWidth = 200
 
 # --- State file + atomic credential-file write primitives -----------------
 #
@@ -1019,6 +1028,18 @@ function Write-Color {
     } else {
         Write-Host $Message
     }
+}
+
+# Terminal width in columns, or 0 when it cannot be determined.
+#
+# [Console]::WindowWidth throws in hosts with no attached console (Pester,
+# CI, a redirected stdout), so every width-aware renderer needs the same
+# try/catch. 0 rather than a guessed default: callers decide what "unknown"
+# means for them (drop the auto-mode indicator, skip the bar clamp) instead
+# of laying out against a width the terminal may not have. A function rather
+# than an inline expression so tests can mock a width.
+function Get-ConsoleWidth {
+    try { return [int][Console]::WindowWidth } catch { return 0 }
 }
 
 # Single chokepoint for ALL non-color VT control sequences in the watch
@@ -1998,12 +2019,12 @@ function Test-Is429 {
     return ((Get-ExceptionHttpStatus $Exception) -eq 429)
 }
 
-# Collapse and tail-truncate an exception message for rendering inside the
-# Status column of the usage table. 60 characters keeps long messages from
-# wrapping the row in typical 100-col terminals while still conveying enough
-# context to debug; the whitespace collapse drops embedded newlines (some
-# socket exceptions span multiple lines). Single helper so the 'expired'
-# and 'error' arms of Format-UsageTable's status switch stay in lockstep.
+# Collapse and tail-truncate an exception message so it renders on a single
+# line. The whitespace collapse is the part every caller needs: some socket
+# exceptions span multiple lines, which breaks any one-line layout.
+#
+# The 60-char default suits a reason embedded mid-sentence (Invoke-SaveAction's
+# throw); callers that own a whole terminal line pass a larger -Max.
 function Format-StatusErrorTail {
     Param (
         [AllowNull()] [String] $Message,
@@ -2721,7 +2742,7 @@ function Invoke-ClaudeActivatorProcess {
 # orchestrator can copy the result onto the row without translation:
 #   @{ Status = 'ok' }                     # claude returned a successful result
 #   @{ Status = 'no-oauth' }               # slot has no claudeAiOauth (skip claude)
-#   @{ Status = 'rate-limited' }           # claude reported a rate limit (429)
+#   @{ Status = 'rate-limited'; Error = <msg> } # claude reported a rate limit or a plan limit
 #   @{ Status = 'unauthorized' }           # claude reported an auth/permission failure
 #   @{ Status = 'expired'; Error = <msg> } # claude reported the login expired / needs re-auth
 #   @{ Status = 'error'; Error = <msg> }   # binary missing, timeout, or other failure
@@ -2783,12 +2804,17 @@ function Invoke-SlotActivator {
     if (-not $msg) { $msg = [string]$proc.Stderr }
     if (-not $msg) { $msg = "claude -p exited with code $($proc.ExitCode)" }
 
+    # 'hit your <bucket> limit' / '<bucket> limit reached' are Claude Code's
+    # own plan-limit sentences, e.g. "You've hit your session limit · resets
+    # 6:10pm (Europe/Berlin)" from claude.exe 2.1.119. They never contain the
+    # words 'rate limit' or '429', so without them a plainly limited slot fell
+    # into the default arm and rendered as a hard 'error'.
     $probe = "$msg $($proc.Stderr)"
     switch -Regex ($probe) {
-        '(?i)rate.?limit|\b429\b'                              { return [pscustomobject]@{ Status = 'rate-limited' } }
+        '(?i)rate.?limit|\b429\b|hit your .{0,24}limit|limit reached' { return [pscustomobject]@{ Status = 'rate-limited'; Error = (Format-StatusErrorTail -Message $msg -Max $Script:AdvisoryReasonMaxWidth) } }
         '(?i)\b401\b|\b403\b|unauthor|forbidden|permission'    { return [pscustomobject]@{ Status = 'unauthorized' } }
-        '(?i)expired|invalid.?grant|re-?auth|\blog ?in\b|\blogin\b' { return [pscustomobject]@{ Status = 'expired'; Error = (Format-StatusErrorTail $msg) } }
-        default                                                { return [pscustomobject]@{ Status = 'error'; Error = (Format-StatusErrorTail $msg) } }
+        '(?i)expired|invalid.?grant|re-?auth|\blog ?in\b|\blogin\b' { return [pscustomobject]@{ Status = 'expired'; Error = (Format-StatusErrorTail -Message $msg -Max $Script:AdvisoryReasonMaxWidth) } }
+        default                                                { return [pscustomobject]@{ Status = 'error'; Error = (Format-StatusErrorTail -Message $msg -Max $Script:AdvisoryReasonMaxWidth) } }
     }
 }
 
@@ -3040,9 +3066,12 @@ function Get-StatusColor {
     }
 }
 
-# One-sentence English rationale for a plan-usability status, used in
-# the verbose `sca usage <slot>` view. Returns $null when no rationale
-# applies (the status label is self-explanatory, e.g. 'ok').
+# One-sentence English rationale for a status. Keyed on both the
+# plan-usability labels (from the verbose `sca usage <slot>` view) and the
+# raw hard-failure Status values (from Format-UsageAdvisory's per-slot
+# lines); the two vocabularies do not collide. Returns $null when no
+# rationale applies, either because the label is self-explanatory ('ok') or
+# because the row carries a real error message to print instead ('error').
 function Get-StatusRationale {
     Param ([String] $Label)
 
@@ -3053,6 +3082,9 @@ function Get-StatusRationale {
         'near limit'        { return "at or above $($Script:UtilWarnPct)% on at least one bucket" }
         'ok (no plan data)' { return 'HTTP ok but response carried no bucket data' }
         'rate-limited'      { return 'temporary API throttle (429), not a plan limit' }
+        'expired'           { return 'token refresh failed; run sca switch to refresh' }
+        'unauthorized'      { return 'token revoked; run sca switch then /login' }
+        'no-oauth'          { return 'api key or non-claude.ai slot' }
         default             { return $null }
     }
 }
@@ -3272,26 +3304,24 @@ function Format-UsageTable {
         $accountCell = Format-AccountCell -SlotName $r.Name -Email $email
 
         # Status: plan-usability when HTTP was ok, HTTP-state otherwise.
-        # Long underlying exceptions must never wrap the row, so every arm
-        # that can carry one caps it: 'error' prefers a short 'error <code>'
-        # label when the row has a numeric HttpStatus (e.g. 529 Overloaded)
-        # and otherwise falls back to a Format-StatusErrorTail tail, which
-        # 'expired' also routes through. An uncapped message produces
-        # multi-line rows when the token endpoint 429s with a long body.
+        # Every label is a short fixed string, because this is the last
+        # column and its width also sizes the aggregate bars above the
+        # header: one long cell wrapped both its own row AND the two bars.
+        # Reasons (an exception tail, or the remedy for a hard failure)
+        # therefore live on Format-UsageAdvisory's per-slot lines below the
+        # table, which own a full terminal line. The one bounded exception
+        # is 'error <code>', short enough to read at a glance and the single
+        # most useful discriminator between transient 5xx and everything else.
         $statusText = switch ($r.Status) {
             'ok'           { Get-PlanStatus $r.Data }
-            'no-oauth'     { 'no-oauth (api key or non-claude.ai slot)' }
-            'expired'      { if ($r.Error) { "expired: $(Format-StatusErrorTail $r.Error)" } else { 'expired (run sca switch to refresh)' } }
-            'unauthorized' { 'unauthorized (token revoked; run sca switch then /login)' }
+            'no-oauth'     { 'no-oauth' }
+            'expired'      { 'expired' }
+            'unauthorized' { 'unauthorized' }
             'error'        {
-                # Prefer a short 'error <code>' label when the row carries a
-                # numeric HTTP status (e.g. 529 Overloaded, 5xx). Falls back
-                # to the truncated message tail for codeless network/timeout
-                # errors. Both forms match Get-StatusColor's '^error' -> Red.
                 if ($r.PSObject.Properties['HttpStatus'] -and $r.HttpStatus) {
                     "error $($r.HttpStatus)"
                 } else {
-                    "error: $(Format-StatusErrorTail $r.Error)"
+                    'error'
                 }
             }
             'rate-limited' { 'rate-limited' }
@@ -3345,13 +3375,12 @@ function Format-UsageTable {
 
     # Header: '[Usage] Plan usage' left-anchored, optional right-aligned
     # auto-mode indicator. The indicator is computed against the terminal
-    # width ([Console]::WindowWidth) so it floats to the right edge with
+    # width (Get-ConsoleWidth) so it floats to the right edge with
     # a 1-column right margin. Width-aware fallback: when the terminal
     # is too narrow to fit both segments with a 2-space minimum gap, the
     # indicator is silently dropped (the footer's [Monitor] line still
-    # carries the state, so no information is lost). [Console]::WindowWidth
-    # can throw in non-interactive hosts (tests, ssh-tty absent); we
-    # treat that as "narrow" and drop the indicator.
+    # carries the state, so no information is lost). An unknown width (0)
+    # counts as "narrow" and drops the indicator.
     #
     # Indicator visual: '<glyph><space><text>' where:
     #   glyph = '▶' (U+25B6, "black right-pointing triangle"), white
@@ -3371,7 +3400,7 @@ function Format-UsageTable {
         $autoGlyph    = "$([char]0x25B6)"
         $autoText     = " switching slot at $AutoThreshold%"
         $indicatorLen = $autoGlyph.Length + $autoText.Length
-        $termWidth    = try { [Console]::WindowWidth } catch { 0 }
+        $termWidth    = Get-ConsoleWidth
         # Reserve 1 col right margin so the indicator isn't flush with
         # the terminal edge. Need: leftLen + 2 (min gap) + indicatorLen
         # + 1 (right margin) <= width.
@@ -3408,8 +3437,20 @@ function Format-UsageTable {
     # so the caller's blank above acts as the leading padding. When
     # there are no eligible rows the helper returns silently; the
     # leading blank still separates header from column header.
+    #
+    # The bars fit to the table, but the table is content-sized and can be
+    # wider than the terminal (a long email plus a wide Status label clears
+    # 80 columns), and a wrapped bar reads as a rendering bug rather than as
+    # an overflowing table. Ceiling at width - 1 (1-col right margin, same
+    # as the auto-mode indicator above); the helper's own floor of 8 caps
+    # the other end. Unknown width (0) leaves the fit-to-table width alone.
     if ($IncludeAggregateBars) {
-        Format-AggregateBars -Results $Results -TotalLineWidth $totalLineWidth
+        $barLineWidth = $totalLineWidth
+        $termWidth    = Get-ConsoleWidth
+        if ($termWidth -gt 0 -and $barLineWidth -gt ($termWidth - 1)) {
+            $barLineWidth = $termWidth - 1
+        }
+        Format-AggregateBars -Results $Results -TotalLineWidth $barLineWidth
     }
     Write-Host ($fmt -f ' ',  'Slot',         'Account',       'Session',     'Week',          'Status')
     Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW),  ('-' * $fiveW), ('-' * $sevenW), '------')
@@ -3678,12 +3719,13 @@ function Format-SlotNameList {
 # Returns a newline-joined string; Format-UsageFooter splits and colours each
 # line the same way it already splits $Footer.
 #
-# Always names the affected slot(s), because the affected row is usually a
-# non-active peer rather than the '*' active slot.
+# Two groups: condition lines naming the affected slots, then per-slot reason
+# lines. Always names the affected slot(s), because the affected row is
+# usually a non-active peer rather than the '*' active slot.
 #
-# One line per distinct condition, worst first, because a slot can only be in
-# one of the four buckets. Collapsing to a single line hides a hard failure
-# behind whichever condition wins:
+# One condition line per distinct condition, worst first, because a slot can
+# only be in one of the four buckets. Collapsing to a single line hides a hard
+# failure behind whichever condition wins:
 #   * no-data failures  : the row shows em-dashes. States the condition
 #     without promising recovery, because the renderer is shared by one-shot
 #     `sca usage` (no "next poll") and the watch loop.
@@ -3728,6 +3770,27 @@ function Format-UsageAdvisory {
         } else {
             $lines.Add("[Usage] $list $($bucket.Tail)")
         }
+    }
+
+    # Per-slot reason lines below the bucket lines. The Status column carries
+    # only a short label, so this is where the detail lands: the row's own
+    # error message when it has one, otherwise the remedy for a hard failure.
+    # A 'rate-limited' row without a message is deliberately silent, because
+    # the bucket line above already says exactly that.
+    #
+    # Capped at 3 for the same reason Format-SlotNameList caps names: under
+    # -Watch a wide pool of failing slots would otherwise push the table off
+    # screen. The bucket lines above already account for every affected slot.
+    $reasons = foreach ($row in $rows) {
+        $reason = if ($row.Error) {
+            Format-StatusErrorTail -Message $row.Error -Max $Script:AdvisoryReasonMaxWidth
+        } elseif ($row.Status -in @('expired', 'unauthorized', 'no-oauth')) {
+            Get-StatusRationale -Label $row.Status
+        }
+        if ($reason) { "[Usage] $($row.Name): $reason" }
+    }
+    foreach ($reasonLine in @(@($reasons) | Select-Object -First 3)) {
+        $lines.Add($reasonLine)
     }
 
     if ($lines.Count -eq 0) { return $null }
