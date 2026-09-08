@@ -2065,6 +2065,16 @@ Describe 'switch_claude_account' {
             # carrying NO .Response, which is what made $status $null and sent the
             # row down the generic arm.
             $script:TimeoutMessage = 'The request was canceled due to the configured HttpClient.Timeout of 12 seconds elapsing.'
+
+            # A coded failure carrying a .Response, for the arms that branch on
+            # the status rather than on the exception type.
+            function New-CodedWebException {
+                Param ([int] $StatusCode)
+                $resp = [pscustomobject]@{ StatusCode = $StatusCode }
+                $ex   = [System.Exception]::new("Response status code does not indicate success: $StatusCode.")
+                $ex | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                return $ex
+            }
         }
 
         It 'serves a FRESH cache as ok, tagged as a network fallback' {
@@ -2107,9 +2117,7 @@ Describe 'switch_claude_account' {
             $script:usageCall = 0
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 $script:usageCall++
-                if ($script:usageCall -eq 1) {
-                    throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
-                }
+                if ($script:usageCall -eq 1) { throw (New-CodedWebException -StatusCode 529) }
                 return [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 7.0; resets_at = $null } }
             }
 
@@ -2117,8 +2125,8 @@ Describe 'switch_claude_account' {
             $r.Status                     | Should -Be 'ok'
             $r.Data.five_hour.utilization | Should -Be 7.0
             $script:usageCall             | Should -Be 2
-            # A timeout already burned the full HTTP budget; an extra sleep
-            # would only freeze the frame.
+            # The first attempt already waited; an extra sleep would only
+            # freeze the frame.
             Should -Invoke Start-Sleep -Times 0 -Exactly
         }
 
@@ -2127,9 +2135,7 @@ Describe 'switch_claude_account' {
             $script:usageCall = 0
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 $script:usageCall++
-                if ($script:usageCall -eq 1) {
-                    throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
-                }
+                if ($script:usageCall -eq 1) { throw (New-CodedWebException -StatusCode 529) }
                 return [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 8.0; resets_at = $null } }
             }
 
@@ -2138,8 +2144,27 @@ Describe 'switch_claude_account' {
             $Script:SlotUsageCache[$slot].Data.five_hour.utilization | Should -Be 8.0
         }
 
-        It 'returns error with the message when both attempts fail and nothing is cached' {
+        It 'returns error with the message when the retry also fails and nothing is cached' {
             $slot = New-TimeoutSlot 'netdead'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.Error      | Should -Match 'No such host'
+            $r.HttpStatus | Should -BeNullOrEmpty
+            $r.Data       | Should -BeNullOrEmpty
+            Should -Invoke Invoke-RestMethod -Times 2 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
+        }
+
+        # Get-UsageSnapshot walks slots serially and nothing is cached on the
+        # first poll of a watch, so this arm sets that poll's wall clock. A
+        # timeout has already burned the full UsageTimeoutSec, making it both
+        # the most expensive class to repeat and the least likely to differ:
+        # retrying it doubled every slot's contribution to the first frame.
+        It 'does NOT retry a timeout, and still reports it' {
+            $slot = New-TimeoutSlot 'noretrytimeout'
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
             }
@@ -2149,6 +2174,22 @@ Describe 'switch_claude_account' {
             $r.Error      | Should -Match 'HttpClient.Timeout'
             $r.HttpStatus | Should -BeNullOrEmpty
             $r.Data       | Should -BeNullOrEmpty
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
+        }
+
+        # 401 / 403 / 429 have their own arms; any other 4xx describes the
+        # request, so the server rejects it identically the second time.
+        It 'does NOT retry a non-retriable 4xx, and still reports its code' {
+            $slot = New-TimeoutSlot 'noretry404'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw (New-CodedWebException -StatusCode 404)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.HttpStatus | Should -Be 404
+            $r.Error      | Should -Match '404'
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
         }
 
         # A timeout is not a throttle. Stamping RateLimitedUntil would make the
@@ -2502,6 +2543,46 @@ Describe 'switch_claude_account' {
             $r.Error                      | Should -Be 'boom'
             $r.HttpStatus                 | Should -Be 500
             $r.Data.five_hour.utilization | Should -Be 12.0
+        }
+    }
+
+    Context 'Test-IsRetriableUsageFailure' {
+        # The retry doubles a slot's contribution to a poll's wall clock and
+        # Get-UsageSnapshot walks slots serially, so each failure class has to
+        # earn the second attempt.
+
+        It 'refuses a timeout by exception type, not by message text' {
+            # -TimeoutSec surfaces as TaskCanceledException : OperationCanceledException.
+            # Type-based so the check survives a localized message.
+            $ex = [System.Threading.Tasks.TaskCanceledException]::new('any wording at all')
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $null | Should -BeFalse
+            # A timeout still has no status even when one is somehow present.
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus 503   | Should -BeFalse
+        }
+
+        It 'accepts a codeless transport failure' {
+            # DNS / socket errors fail fast, so a second attempt is cheap and
+            # does clear transient blips.
+            $ex = [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $null | Should -BeTrue
+        }
+
+        It 'accepts a 5xx: <Case>' -ForEach @(
+            @{ Case = '500'; Status = 500 }
+            @{ Case = '529 Overloaded'; Status = 529 }
+            @{ Case = '503'; Status = 503 }
+        ) {
+            $ex = [System.Exception]::new('server side')
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $Status | Should -BeTrue
+        }
+
+        It 'refuses a 4xx the server will reject identically: <Case>' -ForEach @(
+            @{ Case = '400'; Status = 400 }
+            @{ Case = '404'; Status = 404 }
+            @{ Case = '422'; Status = 422 }
+        ) {
+            $ex = [System.Exception]::new('request side')
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $Status | Should -BeFalse
         }
     }
 

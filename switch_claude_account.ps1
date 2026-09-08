@@ -2717,20 +2717,60 @@ function Get-SlotUsage {
                                                 -ErrorMessage $message -HttpStatus $status
         if ($fallback) { return $fallback }
 
-        # Nothing cached: retry once, without a sleep. A timeout has already
-        # burned $Script:UsageTimeoutSec of wall clock, far longer than any
-        # limiter pause would need, so an extra delay only freezes the frame.
-        try {
-            return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers
-        }
-        catch {
-            return [pscustomobject]@{
-                Status     = 'error'
-                HttpStatus = Get-ExceptionHttpStatus $_.Exception
-                Error      = $_.Exception.Message
+        # Nothing cached, which is the state of every slot on the first poll of
+        # a watch, so this arm sets that poll's wall clock. Retry only when a
+        # second immediate attempt can plausibly answer differently; no sleep,
+        # because the first attempt already waited.
+        if (Test-IsRetriableUsageFailure -Exception $_.Exception -HttpStatus $status) {
+            try {
+                return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers
+            }
+            catch {
+                return [pscustomobject]@{
+                    Status     = 'error'
+                    HttpStatus = Get-ExceptionHttpStatus $_.Exception
+                    Error      = $_.Exception.Message
+                }
             }
         }
+
+        return [pscustomobject]@{
+            Status     = 'error'
+            HttpStatus = $status
+            Error      = $message
+        }
     }
+}
+
+# True when a failed /api/oauth/usage read is worth one more immediate attempt.
+#
+# The retry is not free: it doubles the slot's contribution to the poll's wall
+# clock, and Get-UsageSnapshot walks slots serially, so an indiscriminate retry
+# turns one unreachable endpoint into minutes of frozen watch frame before the
+# first paint. Retry therefore has to earn its cost per failure class.
+#
+#   timeout    -> no. It has already burned the full $Script:UsageTimeoutSec,
+#                 so it is both the most expensive class to repeat and the
+#                 least likely to differ. Detected by exception type
+#                 (-TimeoutSec surfaces as TaskCanceledException, verified on
+#                 PowerShell 7.4) rather than by matching the message, which
+#                 is localized.
+#   no status  -> yes. A DNS or socket failure fails fast, so a second attempt
+#                 costs almost nothing and does clear transient blips.
+#   5xx        -> yes. Anthropic answers 529 Overloaded under load and it
+#                 clears in seconds; this is the case the retry exists for.
+#   other 4xx  -> no. 401 / 403 / 429 are handled by their own arms above; the
+#                 rest describe the request, and the server will reject it
+#                 identically the second time.
+function Test-IsRetriableUsageFailure {
+    Param (
+        $Exception,
+        [AllowNull()] $HttpStatus
+    )
+
+    if ($Exception -is [System.OperationCanceledException]) { return $false }
+    if ($null -eq $HttpStatus)                             { return $true }
+    return ([int]$HttpStatus -ge 500)
 }
 
 # One live GET against /api/oauth/usage: caches the body on success and returns
