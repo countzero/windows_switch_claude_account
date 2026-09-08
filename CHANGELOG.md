@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Credential files are no longer written world-readable on Linux. Every file `sca` writes goes through an atomic rename, which on Unix is a bare `rename(2)`, so the destination inherits the temp file's mode: under the usual `0022` umask that silently downgraded Claude Code's `0600` to `0644` and left live refresh tokens readable by every user on the machine. The mode is now set on the temp file before the rename, covering `.credentials.json`, slot files, identity sidecars, the state file, and `~/.claude.json`.
+- Credential files are no longer written world-readable on Linux. Every file `sca` writes goes through an atomic rename, which on Unix is a bare `rename(2)`, so the destination inherits the temp file's mode: under the usual `0022` umask that silently downgraded Claude Code's `0600` to `0644` and left live refresh tokens readable by every user on the machine. The temp file is now created `0600` by `open(2)` itself, so the bytes are never readable by anyone but the owner, not even for the duration of the write. Covers `.credentials.json`, slot files, identity sidecars, the state file, and `~/.claude.json`.
 - Three `sca save` tests asserted that a file count was zero using an enumeration that cannot see dotfiles on Linux, so they would have passed whether or not the files existed.
 
 ## [3.2.1] - 2026-09-08
@@ -29,9 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sca usage -Json` reports a slot's failure reason in full. A reason classified from a `claude -p` activation was truncated to 200 characters while the seven other failure paths emitted the raw message; the bound belongs to each renderer, which applies it at its own width, so the row itself now keeps the text intact.
 
 ### Fixed
-- The per-slot reason lines under `sca usage` no longer discard real failures in favour of configuration notices. Slots were listed in name order and cut off after three, so a pool whose alphabetically-first slots use an API key showed three `api key or non-claude.ai slot` lines and dropped the transport errors from the slots after them. Slots carrying an actual message are now listed first.
+- The per-slot reason lines under `sca usage` no longer discard real failures in favour of configuration notices, nor the reverse. Slots were listed in name order and cut off after three, so a pool whose alphabetically-first slots use an API key showed three identical `api key or non-claude.ai slot` lines and dropped the transport errors from the slots after them. The two kinds are now separated: a per-slot message is still capped at three lines, while `expired` / `unauthorized` / `no-oauth` are grouped onto one line per status naming every slot that shares it. Those three statuses have no condition line above the reason block, so a shared cap could drop the only on-screen explanation of the one failure class that does not clear on its own.
 - A context-window or tool-output failure from `claude -p` is no longer misreported as `rate-limited`. The plan-limit classifier matched a bare "limit reached", which appears in those messages too, and a slot marked throttled is quietly re-probed on the next poll instead of being reported.
-- `[Watch] Last poll failed:` no longer breaks the footer layout when the underlying exception spans several lines. The footer is split on newlines so each entry can be coloured, which forked one multi-line message into several unprefixed lines.
+- `[Watch] Last poll failed:`, `[Monitor] Rotation failed!` and `[Warmup] Re-warm failed!` no longer break the footer layout when the underlying exception spans several lines. The footer is split on newlines so each entry can be coloured, which forked one multi-line message into several unprefixed lines.
 
 ## [3.2.0] - 2026-09-07
 
@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.1.0] - 2026-08-04
 
 ### Changed
-- A single slow `/api/oauth/usage` response no longer erases a slot's numbers. A failed read now falls back to the last known percentages instead of collapsing the row to `error: The request was canceled due to the configured HttpClient.Timeout...`, and retries once when nothing is cached. The endpoint answers in 46-2108 ms in practice, so the previous shared 5-second budget left almost no headroom; usage now gets 12 seconds and the token refresh gets its own 15.
+- A single slow `/api/oauth/usage` response no longer erases a slot's numbers. A failed read now falls back to the last known percentages instead of collapsing the row to `error: The request was canceled due to the configured HttpClient.Timeout...`. The endpoint answers in 46-2108 ms in practice, so the previous shared 5-second budget left almost no headroom; usage now gets 12 seconds and the token refresh gets its own 15.
+- When nothing is cached, a failed usage read retries once only if a second immediate attempt can plausibly answer differently: a `5xx` (Anthropic's `529 Overloaded` clears in seconds) or a codeless transport failure. A timeout is not retried, because it has already spent the full budget and slots are polled serially, so retrying it doubled every slot's contribution to the first frame of a watch; nor is a `4xx`, which the server rejects identically the second time.
 - Auto-rotation reads a slot's cached percentages when a live read fails, instead of treating every non-`ok` row as 0% utilized. A throttled or briefly unreachable active slot at 100% now rotates rather than freezing. Rotation still refuses to move *into* a slot it could not verify.
 - A bucket whose reset time has already passed counts as 0% for rotation and keep-warm decisions, so cached data cannot report a slot as exhausted after its window has rolled.
 - `sca monitor -KeepWarm` no longer spends a billable `claude -p` on a slot that is already at the rotation threshold: warming re-opens the 5h window, which achieves nothing when that window is open and full.

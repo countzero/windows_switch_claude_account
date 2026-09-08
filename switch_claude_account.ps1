@@ -4389,12 +4389,13 @@ function Invoke-WarmupAction {
 #
 # Decision shape:
 #   @{
-#     Action            : 'rotate' | 'no-eligible' | 'noop'
+#     Action            : 'rotate' | 'no-eligible' | 'active-unknown' | 'noop'
 #     FromName          : <string>  # active slot name (when known); null otherwise
 #     ToName            : <string>  # destination slot name (Action='rotate')
 #     SuggestionName    : <string>  # slot whose bucket resets soonest (Action='no-eligible')
 #     SuggestionBucket  : 'Session' | 'Week'   # which bucket (Action='no-eligible')
 #     SuggestionResetsAt: <ISO-8601 string|DateTime|DateTimeOffset>  # the reset timestamp
+#     ActiveStatus      : <string>  # the active row's Status (Action='active-unknown' only)
 #   }
 #
 # Trigger semantics:
