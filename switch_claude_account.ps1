@@ -4720,7 +4720,11 @@ function Invoke-AutoRotationStep {
                 return ('[Monitor] Rotated from "{0}" to "{1}" at {2}' -f $decision.FromName, $decision.ToName, $ts)
             }
             catch {
-                return "[Monitor] Rotation failed! $($_.Exception.Message)"
+                # Collapsed before interpolating: Format-UsageFooter splits the
+                # footer on newlines to colour each entry, so a multi-line
+                # exception would fork this one line into several unprefixed
+                # ones. Same reason as the [Watch] poll-failure line.
+                return "[Monitor] Rotation failed! $(Format-StatusErrorTail -Message $_.Exception.Message)"
             }
         }
 
@@ -5102,7 +5106,10 @@ function Invoke-KeepWarmStep {
         # Stamp the attempt anyway so a hard failure does not re-fire every
         # poll; the cooldown then holds the slot off until it likely recovers.
         foreach ($n in $cold) { $WarmupTimes[$n] = $now }
-        return "[Warmup] Re-warm failed! $($_.Exception.Message)"
+        # Collapsed for the same reason as the [Monitor] rotation-failure line:
+        # this string becomes one footer entry, and Format-UsageFooter splits
+        # the footer on newlines.
+        return "[Warmup] Re-warm failed! $(Format-StatusErrorTail -Message $_.Exception.Message)"
     }
 }
 

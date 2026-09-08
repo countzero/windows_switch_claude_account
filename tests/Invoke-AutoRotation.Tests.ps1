@@ -568,6 +568,24 @@ Describe 'switch_claude_account' {
             $out | Should -Match '^\[Monitor\] Rotation failed! .*locked file'
         }
 
+        # The latch becomes one footer entry and Format-UsageFooter splits the
+        # footer on newlines to colour each line, so a multi-line exception
+        # (socket errors span several) would fork this into unprefixed lines.
+        It 'collapses a multi-line swap exception onto one latch line' {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+            Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
+            Mock Invoke-SlotSwap { throw [System.IO.IOException]::new("first line`r`nsecond line") }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
+
+            @($out -split "`r?`n").Count | Should -Be 1
+            $out | Should -Be '[Monitor] Rotation failed! first line second line'
+        }
+
         It 'on rotate when slot lookup returns null, returns Rotation failed!' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{
                 Action   = 'rotate'

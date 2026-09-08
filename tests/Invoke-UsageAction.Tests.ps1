@@ -3533,6 +3533,19 @@ Describe 'switch_claude_account' {
             $times.ContainsKey('a') | Should -BeTrue
         }
 
+        # One footer entry, and Format-UsageFooter splits the footer on
+        # newlines to colour each line, so a multi-line exception would fork
+        # this into several unprefixed ones.
+        It 'collapses a multi-line warm-path exception onto one latch line' {
+            Mock Invoke-WarmAllSlots { throw [System.IO.IOException]::new("first line`r`nsecond line") }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
+
+            @($out -split "`r?`n").Count | Should -Be 1
+            $out | Should -Be '[Warmup] Re-warm failed! first line second line'
+        }
+
         It 'lists multiple cold slots sorted and quoted, warming only the cold subset' {
             $snap = New-KwSnapshot @(
                 (New-KwRow -Name 'b' -FiveResetsAt $null),
