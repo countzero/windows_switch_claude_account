@@ -225,9 +225,7 @@ Describe 'switch_claude_account' {
                 return [pscustomobject]@{
                     Results          = @($Rows)
                     NoSlots          = ($null -eq $Rows -or $Rows.Count -eq 0)
-                    HasCacheFallback = $false
                     HasRateLimited   = $false
-                    HasError         = $false
                 }
             }
 
@@ -480,7 +478,6 @@ Describe 'switch_claude_account' {
                 return [pscustomobject]@{
                     Results          = @()
                     NoSlots          = $true
-                    HasCacheFallback = $false
                 }
             }
         }
@@ -630,7 +627,6 @@ Describe 'switch_claude_account' {
             $snap = [pscustomobject]@{
                 Results          = @()
                 NoSlots          = $false
-                HasCacheFallback = $false
             }
             $d = Get-AutoRotationDecision -Snapshot $snap -Threshold 100
             $d.Action   | Should -Be 'noop'

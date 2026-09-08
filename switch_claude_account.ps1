@@ -3825,10 +3825,14 @@ function Format-UsageVerbose {
 #                      synthetic warmup rows; keep the two in step.
 #   NoSlots          : $true when there are zero saved slots. Caller
 #                      prints the "no slots" hint.
-#   HasCacheFallback : $true when at least one row served from the cache
-#                      fallback. Drives a post-table advisory.
-#   HasRateLimited   : $true when at least one row is 'rate-limited'.
-#   HasError         : $true when at least one row is 'error'.
+#   HasRateLimited   : $true when at least one row is 'rate-limited'. Read
+#                      only by Invoke-UsageWatch, to schedule an early
+#                      repoll after a warmup pass that ended throttled.
+#
+# Per-row conditions are NOT summarised here. Format-UsageAdvisory needs the
+# affected slot NAMES, not a boolean, so it partitions Results itself; a
+# parallel set of flags would be a second copy of the same predicate, kept in
+# sync by hand at every site that builds a snapshot.
 #
 # The caller (Invoke-UsageAction) runs Invoke-Reconcile before invoking
 # this function, so by the time we enumerate slots the active-slot file is
@@ -3846,11 +3850,9 @@ function Get-UsageSnapshot {
 
     if ($slots.Count -eq 0) {
         return [pscustomobject]@{
-            Results          = @()
-            NoSlots          = $true
-            HasCacheFallback = $false
-            HasRateLimited   = $false
-            HasError         = $false
+            Results        = @()
+            NoSlots        = $true
+            HasRateLimited = $false
         }
     }
 
@@ -3891,16 +3893,9 @@ function Get-UsageSnapshot {
     }
 
     return [pscustomobject]@{
-        Results          = @($results)
-        NoSlots          = $false
-        HasCacheFallback = ($results | Where-Object { $_.IsCachedFallback }).Count -gt 0
-        # HasRateLimited drives the "transient throttle" advisory for the
-        # no-cache case, where the row has no Data to show.
-        HasRateLimited   = ($results | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0
-        # HasError drives an advisory naming slots whose live read failed
-        # outright. Without it the only signal is a 60-char truncated tail
-        # inside the Status cell, which cuts the reason mid-word.
-        HasError         = ($results | Where-Object { $_.Status -eq 'error' }).Count -gt 0
+        Results        = @($results)
+        NoSlots        = $false
+        HasRateLimited = ($results | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0
     }
 }
 
@@ -4873,10 +4868,9 @@ function Invoke-WarmAllSlots {
     }
     if ($slots.Count -lt 1) { return $null }
 
-    # Each row carries IsCachedFallback so the verify-after-prime usage
-    # read (below) can propagate a 429 cache fallback into the snapshot-
-    # level HasCacheFallback flag, keeping the warmup frame's advisory in
-    # lockstep with the polling loop's frames.
+    # Each row carries IsCachedFallback / FallbackReason so the verify-after-
+    # prime usage read (below) renders through Format-UsageAdvisory exactly as
+    # a polling-loop row would.
     $rows = @($slots | ForEach-Object {
         [pscustomobject]@{
             Name             = $_.Name
@@ -4895,11 +4889,9 @@ function Invoke-WarmAllSlots {
         }
     })
     $snapshot = [pscustomobject]@{
-        Results          = $rows
-        NoSlots          = $false
-        HasCacheFallback = $false
-        HasRateLimited   = $false
-        HasError         = $false
+        Results        = $rows
+        NoSlots        = $false
+        HasRateLimited = $false
     }
     & $Repaint $snapshot
 
@@ -4980,12 +4972,11 @@ function Invoke-WarmAllSlots {
                 $row.Error  = $_.Exception.Message
             }
 
-            # Keep the snapshot-level advisory flags in lockstep with the
-            # rows mutated so far, so the warmup frame's cache-fallback /
-            # transient-throttle note matches what the polling loop renders.
-            $snapshot.HasCacheFallback = (@($rows | Where-Object { $_.IsCachedFallback }).Count -gt 0)
-            $snapshot.HasRateLimited   = (@($rows | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0)
-            $snapshot.HasError         = (@($rows | Where-Object { $_.Status -eq 'error' }).Count -gt 0)
+            # Recomputed per slot rather than once at the end so the flag is
+            # already accurate at each repaint, and on an early return.
+            # Format-UsageAdvisory partitions the rows itself and needs nothing
+            # from here.
+            $snapshot.HasRateLimited = (@($rows | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0)
             & $Repaint $snapshot
 
             if ($i -lt $last -and $Script:WarmupSpacingMs -gt 0) {

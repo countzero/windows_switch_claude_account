@@ -402,7 +402,6 @@ Describe 'switch_claude_account' {
             return [pscustomobject]@{
                 Results          = @($results)
                 NoSlots          = $false
-                HasCacheFallback = $false
             }
         }
 
@@ -475,7 +474,7 @@ Describe 'switch_claude_account' {
         # --- Bare-suffix fallbacks ------------------------------------
 
         It 'returns bare suffix for empty snapshot (no slots saved)' {
-            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true }
             Format-WatchTitle -Name '' -Snapshot $empty |
                 Should -Be 'Switch Claude Account'
         }
@@ -486,7 +485,7 @@ Describe 'switch_claude_account' {
         # principle if Get-UsageSnapshot is ever changed to seed the
         # shape before populating rows.
         It 'returns bare suffix when Results is empty but NoSlots is false' {
-            $empty = [pscustomobject]@{ Results = @(); NoSlots = $false; HasCacheFallback = $false }
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $false }
             Format-WatchTitle -Name '' -Snapshot $empty |
                 Should -Be 'Switch Claude Account'
         }
@@ -612,7 +611,7 @@ Describe 'switch_claude_account' {
                 }
                 Error = $null; IsCachedFallback = $false
             })
-            $snap = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false }
+            $snap = [pscustomobject]@{ Results = $rows; NoSlots = $false }
             $title = Format-WatchTitle -Name '' -Snapshot $snap
             $title | Should -Not -Match "`e"
             $title | Should -Not -Match "`a"
@@ -687,7 +686,7 @@ Describe 'switch_claude_account' {
         }
 
         It '-Aggregate returns bare suffix for empty snapshot' {
-            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true }
             Format-WatchTitle -Name '' -Snapshot $empty -Aggregate |
                 Should -Be 'Switch Claude Account'
         }
@@ -1492,11 +1491,14 @@ Describe 'switch_claude_account' {
 
     Context 'Format-UsageAdvisory' {
         BeforeAll {
+            # Rows only. The advisory partitions Results itself, so there is
+            # no snapshot-level condition flag for a fixture to set (and a
+            # fixture that set one would let a regression pass by satisfying
+            # the flag instead of the rows).
             function New-RlSnapshot {
-                Param ($Results, [bool] $Cache, [bool] $Rl, [bool] $Err = $false)
+                Param ($Results)
                 [pscustomobject]@{
-                    Results = @($Results); NoSlots = $false
-                    HasCacheFallback = $Cache; HasRateLimited = $Rl; HasError = $Err
+                    Results = @($Results); NoSlots = $false; HasRateLimited = $false
                 }
             }
             function New-RlRow {
@@ -1521,7 +1523,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'returns $null when every row read cleanly' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'a' -Status 'ok')) -Cache $false -Rl $false
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'a' -Status 'ok'))
             Format-UsageAdvisory -Snapshot $snap | Should -BeNullOrEmpty
         }
 
@@ -1530,31 +1532,31 @@ Describe 'switch_claude_account' {
         }
 
         It 'returns $null for an empty Results set' {
-            Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results @() -Cache $false -Rl $false) |
+            Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results @()) |
                 Should -BeNullOrEmpty
         }
 
         It 'no-cache, one slot: names it with "is" and no last-known clause' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1')) -Cache $false -Rl $true
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1' is currently rate-limited by Anthropic."
         }
 
         It 'no-cache, multiple slots: names them with "are"' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3')) -Cache $false -Rl $true
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3'))
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited by Anthropic."
         }
 
         It 'no-cache, >3 slots: collapses to "and N more" with plural verb' {
             $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ }
-            $snap = New-RlSnapshot -Results $rows -Cache $false -Rl $true
+            $snap = New-RlSnapshot -Results $rows
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited by Anthropic."
         }
 
         It 'cache branch: names the cached slot and adds the last-known clause' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'cached' -Cached $true)) -Cache $true -Rl $true
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'cached' -Cached $true))
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'cached' is currently rate-limited by Anthropic; showing last known usage."
         }
@@ -1567,7 +1569,7 @@ Describe 'switch_claude_account' {
                 (New-RlRow -Name 'cached'  -Cached $true),
                 (New-RlRow -Name 'nocache' -Cached $false)
             )
-            $snap  = New-RlSnapshot -Results $rows -Cache $true -Rl $true
+            $snap  = New-RlSnapshot -Results $rows
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
 
             $lines.Count | Should -Be 2
@@ -1577,14 +1579,14 @@ Describe 'switch_claude_account' {
         }
 
         It 'words a network fallback as a failed live read, not a rate limit' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error' -Cached $true -Reason 'network')) -Cache $true -Rl $false
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error' -Cached $true -Reason 'network'))
             $out  = Format-UsageAdvisory -Snapshot $snap
             $out | Should -Be "[Usage] 'slot-1' could not be read live; showing last known usage."
             $out | Should -Not -Match 'rate-limited'
         }
 
         It 'names a hard error row with no cached data' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error')) -Cache $false -Rl $false -Err $true
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error'))
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1' could not be read from the usage API; usage unknown."
         }
@@ -1592,7 +1594,7 @@ Describe 'switch_claude_account' {
         It 'reports a cached row once, under its fallback line only' {
             # A stale network fallback carries Status='error' AND
             # IsCachedFallback, so it matches two buckets by status alone.
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error' -Cached $true -Reason 'network')) -Cache $true -Rl $false -Err $true
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error' -Cached $true -Reason 'network'))
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
             $lines.Count | Should -Be 1
             $lines[0]    | Should -Match 'showing last known usage'
@@ -1603,7 +1605,7 @@ Describe 'switch_claude_account' {
                 (New-RlRow -Name 'cached' -Status 'error' -Cached $true -Reason 'network'),
                 (New-RlRow -Name 'dead'   -Status 'error')
             )
-            $snap  = New-RlSnapshot -Results $rows -Cache $true -Rl $false -Err $true
+            $snap  = New-RlSnapshot -Results $rows
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
             $lines[0] | Should -Match "'dead'"
             $lines[1] | Should -Match "'cached'"
@@ -1614,7 +1616,7 @@ Describe 'switch_claude_account' {
             # inline; older callers/fixtures carry no reason at all.
             $row = [pscustomobject]@{ Name = 'slot-1'; Status = 'rate-limited'; IsCachedFallback = $true
                 Data = $null; Error = $null; Email = $null; IsActive = $false }
-            $snap = New-RlSnapshot -Results @($row) -Cache $true -Rl $true
+            $snap = New-RlSnapshot -Results @($row)
             Format-UsageAdvisory -Snapshot $snap | Should -Match 'rate-limited by Anthropic; showing last known usage'
         }
 
@@ -1626,7 +1628,7 @@ Describe 'switch_claude_account' {
         It "prints the row's own message as its reason line" {
             $row  = New-RlRow -Name 'slot-1' -Status 'error'
             $row.Error = 'The operation has timed out.'
-            $snap  = New-RlSnapshot -Results @($row) -Cache $false -Rl $false -Err $true
+            $snap  = New-RlSnapshot -Results @($row)
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
 
             $lines.Count | Should -Be 2
@@ -1637,7 +1639,7 @@ Describe 'switch_claude_account' {
         It 'collapses a multi-line message onto one reason line and bounds its length' {
             $row  = New-RlRow -Name 'slot-1' -Status 'error'
             $row.Error = "first line`r`nsecond line " + ('X' * ($Script:AdvisoryReasonMaxWidth * 2))
-            $snap  = New-RlSnapshot -Results @($row) -Cache $false -Rl $false -Err $true
+            $snap  = New-RlSnapshot -Results @($row)
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
 
             $lines.Count | Should -Be 2

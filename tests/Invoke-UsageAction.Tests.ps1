@@ -957,21 +957,29 @@ Describe 'switch_claude_account' {
             }
 
             $snap = Get-UsageSnapshot
-            $snap.HasRateLimited   | Should -BeTrue
-            # Stale data was served, so HasCacheFallback is also true.
-            $snap.HasCacheFallback | Should -BeTrue
+            $snap.HasRateLimited | Should -BeTrue
+            # Stale data was served, which the row itself records; the
+            # snapshot carries no parallel flag for it.
+            @($snap.Results)[0].IsCachedFallback | Should -BeTrue
         }
 
-        It 'Get-UsageSnapshot sets HasError when a row could not be read' {
+        # HasRateLimited is the only per-row condition the snapshot summarises,
+        # because Invoke-UsageWatch's early-repoll decision is the only caller
+        # that wants a boolean. Every other consumer needs the affected slot
+        # names and partitions Results itself.
+        It 'Get-UsageSnapshot summarises only HasRateLimited' {
             New-Slot -Name 'beta' | Out-Null
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 throw [System.Threading.Tasks.TaskCanceledException]::new('The request was canceled due to the configured HttpClient.Timeout of 12 seconds elapsing.')
             }
 
             $snap = Get-UsageSnapshot
-            $snap.HasError         | Should -BeTrue
-            $snap.HasRateLimited   | Should -BeFalse
-            $snap.HasCacheFallback | Should -BeFalse
+            @($snap.Results)[0].Status           | Should -Be 'error'
+            @($snap.Results)[0].IsCachedFallback | Should -BeFalse
+            $snap.HasRateLimited                 | Should -BeFalse
+
+            $snap.PSObject.Properties.Name | Should -Not -Contain 'HasError'
+            $snap.PSObject.Properties.Name | Should -Not -Contain 'HasCacheFallback'
         }
 
         # Regression guard for the blind spot that hid this for two releases:
@@ -1020,7 +1028,6 @@ Describe 'switch_claude_account' {
                     Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) } }
                     Error = $null; Email = $null })
                 NoSlots          = $false
-                HasCacheFallback = $false
             }
 
             $out = Format-UsageFrame -Snapshot $snap -Footer 'HELLO-FROM-FOOTER' 6>&1 | Out-String
@@ -1054,7 +1061,6 @@ Describe 'switch_claude_account' {
                 Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
                     Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
                 NoSlots          = $false
-                HasCacheFallback = $false
                 HasRateLimited   = $true
             }
 
@@ -1074,7 +1080,6 @@ Describe 'switch_claude_account' {
                     Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null } }
                     Error = $null; Email = $null; IsCachedFallback = $true })
                 NoSlots          = $false
-                HasCacheFallback = $true
                 HasRateLimited   = $true
             }
 
@@ -1088,7 +1093,6 @@ Describe 'switch_claude_account' {
                 Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
                     Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
                 NoSlots          = $false
-                HasCacheFallback = $false
                 HasRateLimited   = $true
             }
 
@@ -3395,7 +3399,6 @@ Describe 'switch_claude_account' {
                 return [pscustomobject]@{
                     Results          = @($Rows)
                     NoSlots          = (@($Rows).Count -eq 0)
-                    HasCacheFallback = $false
                 }
             }
 
@@ -3424,7 +3427,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'returns the current latch when Results is empty but NoSlots is false' {
-            $snap = [pscustomobject]@{ Results = @(); NoSlots = $false; HasCacheFallback = $false }
+            $snap = [pscustomobject]@{ Results = @(); NoSlots = $false }
             $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
