@@ -1190,6 +1190,16 @@ Describe 'switch_claude_account' {
             Format-StatusErrorTail $null | Should -Be ''
             Format-StatusErrorTail ''    | Should -Be ''
         }
+
+        It 'defaults -Max to the full-line width, not the mid-sentence width' {
+            # Renderers that own a whole line call this without -Max; only
+            # Invoke-SaveAction's parenthesised reason narrows it.
+            $msg = 'B' * ($Script:AdvisoryReasonMaxWidth - 1)
+            Format-StatusErrorTail -Message $msg | Should -Be $msg
+
+            $out = Format-StatusErrorTail -Message ('B' * ($Script:AdvisoryReasonMaxWidth + 50))
+            $out.Length | Should -Be ($Script:AdvisoryReasonMaxWidth + 3)
+        }
     }
 
     Context 'Format-AggregateBars' {
@@ -3563,6 +3573,37 @@ Describe 'switch_claude_account' {
             # renders it as the slot's reason line, and the reset time is the
             # only part the user can act on.
             $r.Error  | Should -Be $Message
+        }
+
+        It 'stores the reason raw, leaving the bound to the renderer' {
+            # 3 of the 10 sites that stamp .Error used to truncate and 7 did
+            # not, so a stored bound was never an invariant. Every display path
+            # runs through Format-StatusErrorTail, so the row (and -Json) keeps
+            # the full text.
+            $path = New-ActivatorSlot -Name 'verbose'
+            $long = 'Z' * ($Script:AdvisoryReasonMaxWidth * 3)
+            Mock Invoke-ClaudeActivatorProcess -MockWith {
+                New-ClaudeFailProc -ExitCode 1 -Result $long
+            }
+
+            $r = Invoke-SlotActivator -SlotPath $path
+            $r.Status | Should -Be 'error'
+            $r.Error  | Should -Be $long
+        }
+
+        # A bare 'limit' is not a plan limit. Classifying these as
+        # 'rate-limited' would hide them: a throttled row gets silently
+        # re-probed on the next poll instead of reported to the user.
+        It 'non-plan limit text stays Status=error: <Case>' -ForEach @(
+            @{ Case = 'context window'; Message = 'Prompt is too long: context limit reached for this conversation.' }
+            @{ Case = 'tool output';    Message = 'Tool result exceeds the maximum output limit reached by the tool.' }
+        ) {
+            $path = New-ActivatorSlot -Name 'oversized'
+            Mock Invoke-ClaudeActivatorProcess -MockWith {
+                New-ClaudeFailProc -ExitCode 1 -Result $Message
+            }
+
+            (Invoke-SlotActivator -SlotPath $path).Status | Should -Be 'error'
         }
 
         It 'auth/permission text returns Status=unauthorized' {

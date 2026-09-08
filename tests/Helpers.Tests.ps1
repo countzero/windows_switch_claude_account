@@ -1443,7 +1443,6 @@ Describe 'switch_claude_account' {
             @{ Case = 'limited 7d';        Label = 'limited 7d';        Expected = 'no prompts until 7d window resets' }
             @{ Case = 'limited (both)';    Label = 'limited';           Expected = 'no prompts until both 5h and 7d windows reset' }
             @{ Case = 'ok (no plan data)'; Label = 'ok (no plan data)'; Expected = 'HTTP ok but response carried no bucket data' }
-            @{ Case = 'rate-limited';      Label = 'rate-limited';      Expected = 'temporary API throttle (429), not a plan limit' }
             # Hard-failure statuses. Keyed on the raw Status value, because
             # Format-UsageAdvisory's reason lines are where these remedies
             # render now that the Status column carries only a bare label.
@@ -1462,9 +1461,11 @@ Describe 'switch_claude_account' {
 
         It 'returns $null for labels with no rationale' {
             (Get-StatusRationale -Label 'ok')    | Should -BeNullOrEmpty
-            # 'error' stays absent on purpose: such a row carries a real
-            # message, which the advisory prints instead of a canned remedy.
-            (Get-StatusRationale -Label 'error') | Should -BeNullOrEmpty
+            # 'error' and 'rate-limited' stay absent on purpose: such a row
+            # carries a real message, which the advisory prints instead of a
+            # canned remedy.
+            (Get-StatusRationale -Label 'error')        | Should -BeNullOrEmpty
+            (Get-StatusRationale -Label 'rate-limited') | Should -BeNullOrEmpty
             (Get-StatusRationale -Label '')      | Should -BeNullOrEmpty
         }
     }
@@ -1674,6 +1675,31 @@ Describe 'switch_claude_account' {
             @($lines | Where-Object { $_ -match '^\[Usage\] \w: boom' }).Count | Should -Be 3
             # The condition line still accounts for every affected slot.
             $lines[0] | Should -Match "and 2 more"
+        }
+
+        It 'spends the cap on real messages before canned remedies' {
+            # The remedy-only rows sort first alphabetically, so a row-ordered
+            # cap would emit three 'no-oauth' notices (a permanent config fact)
+            # and drop both transport errors.
+            $rows = @(
+                (New-RlRow -Name 'a-apikey' -Status 'no-oauth'),
+                (New-RlRow -Name 'b-apikey' -Status 'no-oauth'),
+                (New-RlRow -Name 'c-apikey' -Status 'no-oauth')
+            )
+            foreach ($n in @('y-dead', 'z-dead')) {
+                $r = New-RlRow -Name $n -Status 'error'
+                $r.Error = "boom $n"
+                $rows += $r
+            }
+            $snap  = New-RlSnapshot -Results $rows -Cache $false -Rl $false -Err $true
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            # 1 condition line (errors only; no-oauth matches no bucket) + 3 reasons.
+            $lines.Count | Should -Be 4
+            $lines[1] | Should -Be '[Usage] y-dead: boom y-dead'
+            $lines[2] | Should -Be '[Usage] z-dead: boom z-dead'
+            # The single remaining slot goes to the first remedy row, in row order.
+            $lines[3] | Should -Be '[Usage] a-apikey: api key or non-claude.ai slot'
         }
 
         It 'ok rows never produce a reason line' {

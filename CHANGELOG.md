@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.1] - 2026-09-08
+
+### Changed
+- `sca usage -Json` reports a slot's failure reason in full. A reason classified from a `claude -p` activation was truncated to 200 characters while the seven other failure paths emitted the raw message; the bound belongs to each renderer, which applies it at its own width, so the row itself now keeps the text intact.
+
+### Fixed
+- The per-slot reason lines under `sca usage` no longer discard real failures in favour of configuration notices. Slots were listed in name order and cut off after three, so a pool whose alphabetically-first slots use an API key showed three `api key or non-claude.ai slot` lines and dropped the transport errors from the slots after them. Slots carrying an actual message are now listed first.
+- A context-window or tool-output failure from `claude -p` is no longer misreported as `rate-limited`. The plan-limit classifier matched a bare "limit reached", which appears in those messages too, and a slot marked throttled is quietly re-probed on the next poll instead of being reported.
+- `[Watch] Last poll failed:` no longer breaks the footer layout when the underlying exception spans several lines. The footer is split on newlines so each entry can be coloured, which forked one multi-line message into several unprefixed lines.
+
 ## [3.2.0] - 2026-09-07
 
 ### Changed

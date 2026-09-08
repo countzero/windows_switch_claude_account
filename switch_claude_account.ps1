@@ -140,7 +140,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '3.2.0'
+$Script:ScriptVersion = '3.2.1'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -295,13 +295,13 @@ $Script:AggregateYellowPct     = 50
 # `-Json` output always carry the full email.
 $Script:AccountColumnMaxWidth  = 32
 
-# Bound on a failure reason as rendered by Format-UsageAdvisory's per-slot
-# lines, and as stored on a row by Invoke-SlotActivator. Generous because the
-# advisory owns a full terminal line and wraps harmlessly, unlike the Status
-# column it replaced: Claude Code's own limit sentence ("You've hit your
+# Default bound on a failure reason for renderers that own a whole terminal
+# line (Format-UsageAdvisory's per-slot lines, the [Watch] poll-failure
+# footer). Generous because those lines wrap harmlessly, unlike the Status
+# column they replaced: Claude Code's own limit sentence ("You've hit your
 # session limit · resets 6:10pm (Europe/Berlin)") is 61 chars and used to get
-# cut mid-timezone at 60. Still bounded so a runaway stderr cannot flood the
-# frame or a -Json row.
+# cut mid-timezone at 60. Still bounded so a runaway stderr cannot flood a
+# frame.
 $Script:AdvisoryReasonMaxWidth = 200
 
 # --- State file + atomic credential-file write primitives -----------------
@@ -1667,7 +1667,7 @@ function Invoke-SaveAction {
             $sourceLabel = 'api_profile'
         } else {
             $reason = if ($profileResult.Error) {
-                Format-StatusErrorTail $profileResult.Error
+                Format-StatusErrorTail -Message $profileResult.Error -Max 60
             } else {
                 $profileResult.Status
             }
@@ -2023,12 +2023,14 @@ function Test-Is429 {
 # line. The whitespace collapse is the part every caller needs: some socket
 # exceptions span multiple lines, which breaks any one-line layout.
 #
-# The 60-char default suits a reason embedded mid-sentence (Invoke-SaveAction's
-# throw); callers that own a whole terminal line pass a larger -Max.
+# Bounding is the RENDERER's job: every display path funnels through here, so
+# producers store the raw message and each renderer bounds at its own width.
+# The default is the full-line width; Invoke-SaveAction narrows it because its
+# reason sits parenthesised mid-sentence rather than owning a line.
 function Format-StatusErrorTail {
     Param (
         [AllowNull()] [String] $Message,
-        [int] $Max = 60
+        [int] $Max = $Script:AdvisoryReasonMaxWidth
     )
     if ([string]::IsNullOrEmpty($Message)) { return '' }
     $msg = ($Message -replace "\s+", ' ').Trim()
@@ -2809,12 +2811,17 @@ function Invoke-SlotActivator {
     # 6:10pm (Europe/Berlin)" from claude.exe 2.1.119. They never contain the
     # words 'rate limit' or '429', so without them a plainly limited slot fell
     # into the default arm and rendered as a hard 'error'.
+    #
+    # Anchored to the known bucket words rather than a bare 'limit reached':
+    # claude says 'limit' for context-window and tool-output failures too, and
+    # a row misfiled as throttled is silently re-probed instead of reported.
+    $planLimit = 'hit your (?:session|week(?:ly)?|opus|usage) limit|(?:session|week(?:ly)?|opus|usage) limit reached'
     $probe = "$msg $($proc.Stderr)"
     switch -Regex ($probe) {
-        '(?i)rate.?limit|\b429\b|hit your .{0,24}limit|limit reached' { return [pscustomobject]@{ Status = 'rate-limited'; Error = (Format-StatusErrorTail -Message $msg -Max $Script:AdvisoryReasonMaxWidth) } }
-        '(?i)\b401\b|\b403\b|unauthor|forbidden|permission'    { return [pscustomobject]@{ Status = 'unauthorized' } }
-        '(?i)expired|invalid.?grant|re-?auth|\blog ?in\b|\blogin\b' { return [pscustomobject]@{ Status = 'expired'; Error = (Format-StatusErrorTail -Message $msg -Max $Script:AdvisoryReasonMaxWidth) } }
-        default                                                { return [pscustomobject]@{ Status = 'error'; Error = (Format-StatusErrorTail -Message $msg -Max $Script:AdvisoryReasonMaxWidth) } }
+        "(?i)rate.?limit|\b429\b|$planLimit"                        { return [pscustomobject]@{ Status = 'rate-limited'; Error = $msg } }
+        '(?i)\b401\b|\b403\b|unauthor|forbidden|permission'         { return [pscustomobject]@{ Status = 'unauthorized' } }
+        '(?i)expired|invalid.?grant|re-?auth|\blog ?in\b|\blogin\b' { return [pscustomobject]@{ Status = 'expired'; Error = $msg } }
+        default                                                     { return [pscustomobject]@{ Status = 'error'; Error = $msg } }
     }
 }
 
@@ -3069,9 +3076,9 @@ function Get-StatusColor {
 # One-sentence English rationale for a status. Keyed on both the
 # plan-usability labels (from the verbose `sca usage <slot>` view) and the
 # raw hard-failure Status values (from Format-UsageAdvisory's per-slot
-# lines); the two vocabularies do not collide. Returns $null when no
-# rationale applies, either because the label is self-explanatory ('ok') or
-# because the row carries a real error message to print instead ('error').
+# lines). Returns $null when no rationale applies, either because the label
+# is self-explanatory ('ok') or because the row carries a real error message
+# to print instead ('error', 'rate-limited').
 function Get-StatusRationale {
     Param ([String] $Label)
 
@@ -3081,7 +3088,6 @@ function Get-StatusRationale {
         'limited'           { return 'no prompts until both 5h and 7d windows reset' }
         'near limit'        { return "at or above $($Script:UtilWarnPct)% on at least one bucket" }
         'ok (no plan data)' { return 'HTTP ok but response carried no bucket data' }
-        'rate-limited'      { return 'temporary API throttle (429), not a plan limit' }
         'expired'           { return 'token refresh failed; run sca switch to refresh' }
         'unauthorized'      { return 'token revoked; run sca switch then /login' }
         'no-oauth'          { return 'api key or non-claude.ai slot' }
@@ -3781,15 +3787,24 @@ function Format-UsageAdvisory {
     # Capped at 3 for the same reason Format-SlotNameList caps names: under
     # -Watch a wide pool of failing slots would otherwise push the table off
     # screen. The bucket lines above already account for every affected slot.
-    $reasons = foreach ($row in $rows) {
-        $reason = if ($row.Error) {
-            Format-StatusErrorTail -Message $row.Error -Max $Script:AdvisoryReasonMaxWidth
+    #
+    # Message-bearing rows go first so the cap cannot spend all three lines on
+    # canned remedies (a 'no-oauth' slot is a permanent config fact) while
+    # dropping the transport errors this block exists to surface. Two passes
+    # rather than a sort, so order within each group stays the caller's row
+    # order without depending on sort stability.
+    $withMessage = [System.Collections.Generic.List[string]]::new()
+    $withRemedy  = [System.Collections.Generic.List[string]]::new()
+    foreach ($row in $rows) {
+        if ($row.Error) {
+            $tail = Format-StatusErrorTail -Message $row.Error
+            if ($tail) { $withMessage.Add("[Usage] $($row.Name): $tail") }
         } elseif ($row.Status -in @('expired', 'unauthorized', 'no-oauth')) {
-            Get-StatusRationale -Label $row.Status
+            $remedy = Get-StatusRationale -Label $row.Status
+            if ($remedy) { $withRemedy.Add("[Usage] $($row.Name): $remedy") }
         }
-        if ($reason) { "[Usage] $($row.Name): $reason" }
     }
-    foreach ($reasonLine in @(@($reasons) | Select-Object -First 3)) {
+    foreach ($reasonLine in @(@($withMessage) + @($withRemedy) | Select-Object -First 3)) {
         $lines.Add($reasonLine)
     }
 
@@ -5230,7 +5245,11 @@ function Invoke-UsageWatch {
             }
             $footer += "[Watch] Last poll at $($lastPoll.ToString('HH:mm:ss'))"
             if ($lastPollError) {
-                $footer += "`n[Watch] Last poll failed: $lastPollError (keeping previous data; will retry on next tick)"
+                # Collapse before interpolating: the footer is split on newlines
+                # by Format-UsageFooter, so a multi-line socket exception would
+                # otherwise fork one footer entry into several unprefixed lines.
+                $pollReason = Format-StatusErrorTail -Message $lastPollError
+                $footer += "`n[Watch] Last poll failed: $pollReason (keeping previous data; will retry on next tick)"
             }
 
             # Auto-mode threshold for the header tag. Passed only when
