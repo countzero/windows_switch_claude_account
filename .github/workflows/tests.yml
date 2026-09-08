@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # The runners ship PowerShell 7, which satisfies the 7.4 floor the
-      # script needs for [System.IO.File]::SetUnixFileMode.
+      # script needs for FileStreamOptions.UnixCreateMode.
       - name: Report PowerShell version
         shell: pwsh
         run: "$PSVersionTable | Format-List"

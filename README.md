@@ -147,7 +147,7 @@ Decoding the output:
 - **`Account` column**: the OAuth email captured at save time. Shows `—` when the email equals the slot name (deduped filename), the actual email otherwise.
 - **`Session` / `Week` cells**: `<pct>% <delta>`. The delta is `(2h 11m)` under 24h with minute precision, `(102h)` at 24h+ with integer hours, `now` if the reset is past, or `—` when no data is available.
 - **`Status` column**: one of `ok`, `near limit` (≥90%), `limited 5h` / `limited 7d` (≥100%), `error` (`error <code>` on an HTTP failure that carried one), `expired`, `unauthorized`, `rate-limited`, or `no-oauth`. Status drives the entire row's color.
-- **Failure reasons**: labels stay short so they cannot widen the table. Why a slot failed prints below it as `[Usage] <slot>: <reason>` (the API's own message, or the remedy for `expired` / `unauthorized` / `no-oauth`), for up to three slots.
+- **Failure reasons**: labels stay short so they cannot widen the table. Why a slot failed prints below it as `[Usage] <slot>: <reason>`. Up to three slots get the API's own message; `expired`, `unauthorized` and `no-oauth` slots beyond that get one grouped remedy line per status, so no failed slot is left unexplained.
 
 Drill into a single slot for absolute reset times in your local timezone:
 

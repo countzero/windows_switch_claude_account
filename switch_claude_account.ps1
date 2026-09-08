@@ -137,15 +137,22 @@ $ScaHomeDir     = if ($IsWindows) { $env:USERPROFILE } else { $env:HOME }
 # the exact divergence this tool exists to prevent.
 $ScaConfigDir   = if (-not [string]::IsNullOrWhiteSpace($env:CLAUDE_CONFIG_DIR)) { $env:CLAUDE_CONFIG_DIR } else { $null }
 
-$CredDir        = if ($ScaConfigDir) { $ScaConfigDir } else { Join-Path $ScaHomeDir ".claude" }
-$CredFile       = Join-Path $CredDir ".credentials.json"
-$StateFile      = Join-Path $CredDir ".sca-state.json"
+# Every path below stays $null when neither CLAUDE_CONFIG_DIR nor the
+# platform's home variable is set, rather than calling Join-Path on a blank
+# base. Join-Path's binder rejects null outright, and these run at load time:
+# a container or systemd unit started without HOME would abort on this line
+# with "Cannot bind argument to parameter 'Path'" before `sca help` or
+# `sca -Version` could tell the user which variable to set. Assert-CredentialDir
+# does the refusing instead, from inside Invoke-Main.
+$CredDir        = if ($ScaConfigDir) { $ScaConfigDir } elseif ($ScaHomeDir) { Join-Path $ScaHomeDir ".claude" } else { $null }
+$CredFile       = if ($CredDir) { Join-Path $CredDir ".credentials.json" } else { $null }
+$StateFile      = if ($CredDir) { Join-Path $CredDir ".sca-state.json" }   else { $null }
 # Claude Code's persistent config. A top-level dotfile beside .claude/ by
 # default, but it moves inside CLAUDE_CONFIG_DIR when that is set.
 # We read its `oauthAccount` block as the authoritative identity source
 # (it's what /status displays) and write whitelisted identity fields back
 # at switch time so Claude Code's display follows the active slot.
-$ClaudeJsonPath = if ($ScaConfigDir) { Join-Path $ScaConfigDir ".claude.json" } else { Join-Path $ScaHomeDir ".claude.json" }
+$ClaudeJsonPath = if ($ScaConfigDir) { Join-Path $ScaConfigDir ".claude.json" } elseif ($ScaHomeDir) { Join-Path $ScaHomeDir ".claude.json" } else { $null }
 $ProfilePath    = $PROFILE.CurrentUserAllHosts
 
 # Version of this script. Bumped in the same commit that adds the matching
@@ -551,6 +558,27 @@ function Assert-SupportedPlatform {
     }
 }
 
+# Refuse when no credentials directory could be resolved.
+#
+# $CredDir is blank only when the platform's home variable is unset AND
+# CLAUDE_CONFIG_DIR is not set either, which is reachable in a container or a
+# systemd unit started without HOME. Named here rather than at the assignment
+# site so `sca help` and `sca -Version` still work in that environment and can
+# tell the user which variable to set; see the comment on $CredDir for why the
+# paths are left blank instead of throwing at load time.
+#
+# The directory arrives as a parameter defaulting to the script value for the
+# same reason as Assert-SupportedPlatform: it keeps the production call site
+# argument-free while letting the suite drive both arms.
+function Assert-CredentialDir {
+    Param ([AllowNull()] [AllowEmptyString()] [String] $Directory = $CredDir)
+
+    if ([string]::IsNullOrWhiteSpace($Directory)) {
+        $homeVar = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
+        throw "No credentials directory: `$env:$homeVar is not set, so '<home>/.claude' cannot be resolved. Set `$env:$homeVar, or set `$env:CLAUDE_CONFIG_DIR to the directory Claude Code uses."
+    }
+}
+
 # Persist $State to $StateFile via atomic rename. The schema field is
 # enforced to 1 here so callers cannot accidentally write a stale or
 # missing version. last_sync_hash and active_slot may be $null (initial
@@ -700,15 +728,29 @@ function Update-ScaState {
 # overwrite our oauthAccount mutation. Refuse-while-running is the chosen
 # mitigation.
 
-# Returns $true if any process named 'claude' is running on the host.
+# Returns $true if Claude Code is running on the host.
+#
+# Two probes, because the CLI ships in two shapes. The native installer
+# produces a real executable named 'claude', which the name probe finds on
+# both platforms. The npm package (@anthropic-ai/claude-code) is a Node
+# script behind a shim, so its process is 'node' and the name probe misses
+# it entirely; on Unix the second probe matches the package's own entry
+# point in the command line instead.
+#
+# The command-line probe is Unix-only, and the reason is measured, not
+# stylistic: reading .CommandLine off every process costs ~53 s on Windows,
+# where the property is backed by a per-process CIM query, against a few ms
+# on Linux, where it is a /proc/<pid>/cmdline read. A guard that runs before
+# every save / switch / rotation cannot spend that. The residual gap is an
+# npm-installed Claude Code on Windows.
+#
 # Get-Process enumerates processes from ALL users on the system (limited
 # detail for processes owned by other users, but the Process objects
 # themselves still come back), so this refuses save/switch even when a
-# DIFFERENT user on a shared Windows host has Claude Code open. That is
-# intentional multi-user safety: if any user's Claude Code holds the
-# ~/.claude.json in-memory cache, our oauthAccount mutation could race
-# its flush. Wrapped as a function so tests can mock it without driving
-# real process state.
+# DIFFERENT user on a shared host has Claude Code open. That is intentional
+# multi-user safety: if any user's Claude Code holds the ~/.claude.json
+# in-memory cache, our oauthAccount mutation could race its flush. Wrapped as
+# a function so tests can mock it without driving real process state.
 #
 # This is our whole concurrency story for ~/.claude.json, and it is a
 # deliberate non-participation: Claude Code serialises its OWN writes with
@@ -719,7 +761,42 @@ function Update-ScaState {
 # cache to lose the race against. Recovery if a write ever does corrupt the
 # file: Claude Code keeps rolling ~/.claude.json.backup.<unix-ms> copies.
 function Test-ClaudeRunning {
-    return [bool](Get-Process -Name 'claude' -ErrorAction SilentlyContinue)
+    if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) { return $true }
+    if ($IsWindows) { return $false }
+
+    # Never let an unreadable /proc entry or a process that exits mid-scan
+    # turn a safety guard into a terminating error; an enumeration failure
+    # means "not detected", which the name probe above has already answered.
+    try   { return (Test-ClaudeNodeProcess -Processes (Get-Process -ErrorAction SilentlyContinue)) }
+    catch {
+        Write-Verbose "Claude Code command-line probe failed: $_"
+        return $false
+    }
+}
+
+# True when any process in $Processes is an npm-installed Claude Code.
+#
+# Split out of Test-ClaudeRunning because that function's own body cannot be
+# tested: a Get-Process mock does not reach a dot-sourced function the way an
+# Invoke-RestMethod or Get-ChildItem mock does (verified against Pester 5.7).
+# Taking the process list as a parameter puts the part worth pinning, the
+# pattern itself, under test on every platform.
+#
+# The pattern is the npm package's own entry point,
+# @anthropic-ai/claude-code/cli.js, which argv carries as the resolved script
+# path behind the `claude` shim. Anchored on the surrounding path separators
+# rather than the bare word 'claude', because a checkout directory with
+# 'claude' in its name is not a running Claude Code and must not lock the user
+# out of `sca save`. Over-matching would only refuse a safe action, but
+# under-matching races Claude Code's in-memory ~/.claude.json cache, so the
+# pattern is deliberately the narrower of the two.
+function Test-ClaudeNodeProcess {
+    Param ([AllowNull()] $Processes)
+
+    foreach ($process in @($Processes)) {
+        if ($process.CommandLine -like '*/claude-code/cli.js*') { return $true }
+    }
+    return $false
 }
 
 # Read Claude Code's `oauthAccount` block out of ~/.claude.json. Returns a
@@ -1041,6 +1118,13 @@ function Get-ProfileEncoding {
 # We are rendering a compact, locale-independent help screen so the
 # user always sees the same layout regardless of the OS UI language.
 function Show-Help {
+    # Blank when no home directory resolved (see the comment on $CredDir).
+    # Help has to render there, since it is where the user finds out which
+    # variable to set, so the FILES rows degrade to a marker rather than
+    # letting Join-Path's binder throw mid-render.
+    $unresolved = '(unresolved: set HOME or CLAUDE_CONFIG_DIR)'
+    $slotGlob   = if ($CredDir) { Join-Path $CredDir '.credentials.<name>(<email>).json' } else { $unresolved }
+
     $lines = @(
         "",
         "Switch Claude Account - manage multiple Claude Code logins.",
@@ -1101,9 +1185,9 @@ function Show-Help {
         # platform and shift again under CLAUDE_CONFIG_DIR, so printing what
         # this invocation actually uses cannot drift out of date.
         "FILES",
-        "  Active login : $CredFile",
-        "  Saved slots  : $(Join-Path $CredDir '.credentials.<name>(<email>).json')",
-        "  State        : $StateFile",
+        "  Active login : $(if ($CredFile)  { $CredFile }  else { $unresolved })",
+        "  Saved slots  : $slotGlob",
+        "  State        : $(if ($StateFile) { $StateFile } else { $unresolved })",
         "  PS profile   : $ProfilePath",
         "",
         "NOTES",
@@ -3985,25 +4069,32 @@ function Format-UsageAdvisory {
     # names: under -Watch a wide failing pool would push the table off screen.
     # The cap costs detail, not coverage, because the condition lines above
     # already name every affected slot.
-    $messages = [System.Collections.Generic.List[string]]::new()
+    $messages = [System.Collections.Generic.List[pscustomobject]]::new()
     foreach ($row in $rows) {
         if (-not $row.Error) { continue }
         $tail = Format-StatusErrorTail -Message $row.Error
-        if ($tail) { $messages.Add("[Usage] $($row.Name): $tail") }
+        if ($tail) { $messages.Add([pscustomobject]@{ Name = $row.Name; Line = "[Usage] $($row.Name): $tail" }) }
     }
+    $reported = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($message in @($messages | Select-Object -First 3)) {
-        $lines.Add($message)
+        $lines.Add($message.Line)
+        [void]$reported.Add($message.Name)
     }
 
     # Remedies are grouped per status, worst first, like the condition lines: a
     # remedy is a per-status constant, so one line covers every slot sharing it.
     # Sharing the messages' cap instead spent N lines on identical text for N
     # api-key slots, and no ordering could stop three transport errors from
-    # dropping the remedy outright. These statuses get no condition line, so
-    # that would leave nothing on screen about the one failure class that does
-    # not clear on its own.
+    # dropping the remedy outright.
+    #
+    # Keyed on "did this row already get a line", NOT on "does this row carry
+    # a message". Every producer of 'expired' stamps an Error, so the latter
+    # test made the expired remedy unreachable and left the slot silent
+    # whenever the cap above dropped its message. These three statuses get no
+    # condition line, so that silence was total, on the one failure class that
+    # does not clear on its own.
     foreach ($status in @('expired', 'unauthorized', 'no-oauth')) {
-        $names = @($rows | Where-Object { $_.Status -eq $status -and -not $_.Error } | ForEach-Object { $_.Name })
+        $names = @($rows | Where-Object { $_.Status -eq $status -and -not $reported.Contains($_.Name) } | ForEach-Object { $_.Name })
         $list  = Format-SlotNameList -Names $names
         if (-not $list) { continue }
         $lines.Add("[Usage] ${list}: $(Get-StatusRationale -Label $status)")
@@ -5568,7 +5659,19 @@ function Invoke-Main {
     # After -Version / help so those stay informational on every platform,
     # and before the credentials directory is created so an unsupported
     # platform leaves no trace on disk.
-    Assert-SupportedPlatform
+    #
+    # `uninstall` is exempt from both preconditions, and from the directory
+    # creation below: it touches nothing but the PowerShell profile, so
+    # neither the Keychain risk nor a missing home directory applies to it.
+    # Refusing it would strand the alias block on any machine that cannot
+    # satisfy the guards, with no way to remove it but a hand edit, and
+    # $PROFILE.CurrentUserAllHosts is the same path on Linux and macOS, so a
+    # synced profile puts a block there without anyone installing it.
+    $profileOnly = ($Action -eq 'uninstall')
+    if (-not $profileOnly) {
+        Assert-SupportedPlatform
+        Assert-CredentialDir
+    }
 
     # Cross-action flag-misuse guards. Only the switch flags are guarded:
     # -Watch / -Json belong to read-only `usage`, -KeepWarm to `monitor`.
@@ -5583,7 +5686,7 @@ function Invoke-Main {
 
     # We are ensuring the credentials directory exists before
     # attempting any file operations within it.
-    if (-not (Test-Path -LiteralPath $CredDir)) {
+    if (-not $profileOnly -and -not (Test-Path -LiteralPath $CredDir)) {
         New-Item -ItemType Directory -Path $CredDir -Force | Out-Null
     }
 

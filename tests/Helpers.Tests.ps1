@@ -1730,6 +1730,39 @@ Describe 'switch_claude_account' {
             $lines[3] | Should -Be "[Usage] 'a-apikey', 'b-apikey', 'c-apikey': api key or non-claude.ai slot"
         }
 
+        # Every production path that yields 'expired' stamps an Error
+        # (Resolve-SlotAccessToken, Invoke-SlotActivator), so a remedy pass
+        # keyed on "carries no message" never fired for it, and the message
+        # cap could then drop the slot's only line. 'expired' has no condition
+        # line, so that left nothing on screen at all.
+        It 'falls back to the remedy for an expired slot whose message the cap dropped' {
+            $rows = @('a-dead','b-dead','c-dead') | ForEach-Object {
+                $r = New-RlRow -Name $_ -Status 'error'
+                $r.Error = "boom $_"
+                $r
+            }
+            $late = New-RlRow -Name 'z-expired' -Status 'expired'
+            $late.Error = 'refresh returned 400'
+            $rows += $late
+
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            # 1 condition line + 3 capped messages + 1 grouped remedy.
+            $lines.Count | Should -Be 5
+            @($lines | Where-Object { $_ -match 'z-expired' }).Count | Should -Be 1
+            $lines[4] | Should -Be "[Usage] 'z-expired': token refresh failed; run sca switch to refresh"
+        }
+
+        It 'prefers the message over the remedy when the slot fits inside the cap' {
+            $row = New-RlRow -Name 'slot-1' -Status 'expired'
+            $row.Error = 'refresh returned 400'
+
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results @($row))) -split "`n")
+
+            $lines.Count | Should -Be 1
+            $lines[0]    | Should -Be '[Usage] slot-1: refresh returned 400'
+        }
+
         # The regression the shared cap caused: 'expired' / 'unauthorized' /
         # 'no-oauth' have no condition line, so once three messages filled the
         # cap the slot the user actually has to act on vanished from the frame
@@ -2353,6 +2386,115 @@ Describe 'switch_claude_account' {
 
         It 'defaults to the running platform, which the suite never runs on macOS' {
             { Assert-SupportedPlatform } | Should -Not -Throw
+        }
+    }
+
+    Context 'Assert-CredentialDir' {
+        # $CredDir is blank only when neither the platform's home variable nor
+        # CLAUDE_CONFIG_DIR is set. Both arrive as a parameter for the same
+        # reason as Assert-SupportedPlatform: they bind once at load time, so
+        # the suite drives the branches by argument.
+
+        It 'throws naming both variables when no directory resolved: <Case>' -ForEach @(
+            @{ Case = 'null';       Directory = $null }
+            @{ Case = 'empty';      Directory = '' }
+            @{ Case = 'whitespace'; Directory = '   ' }
+        ) {
+            { Assert-CredentialDir -Directory $Directory } |
+                Should -Throw -ExpectedMessage '*CLAUDE_CONFIG_DIR*'
+        }
+
+        It 'names the home variable the running platform actually reads' {
+            $expected = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
+            { Assert-CredentialDir -Directory '' } |
+                Should -Throw -ExpectedMessage "*`$env:$expected*"
+        }
+
+        It 'does not throw for a resolved directory' {
+            { Assert-CredentialDir -Directory $TestDrive } | Should -Not -Throw
+        }
+
+        It 'defaults to the script-scope directory, which the sandbox always resolves' {
+            { Assert-CredentialDir } | Should -Not -Throw
+        }
+    }
+
+    Context 'Show-Help FILES block' {
+        It 'prints the paths this invocation actually uses' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match ([regex]::Escape($CredFile))
+            $out | Should -Match ([regex]::Escape($StateFile))
+        }
+
+        # Help is where the user finds out which variable to set, so it has to
+        # render in the very environment that cannot resolve one. Run out of
+        # process: $CredDir binds when the script is dot-sourced, so nothing
+        # assignable from this scope reaches Show-Help's lookup, and the load
+        # itself is half of what this pins. `sca help` used to die on
+        # Join-Path's binder before printing a line.
+        It 'loads and renders help with no resolvable home directory' {
+            $homeVar = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
+            $out = pwsh -NoProfile -Command "
+                Remove-Item -Path Env:$homeVar -ErrorAction SilentlyContinue
+                Remove-Item -Path Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+                & '$script:ScriptPath' help
+            " 2>&1 | Out-String
+
+            $LASTEXITCODE | Should -Be 0
+            $out | Should -Not -Match 'Cannot bind argument'
+            $out | Should -Match 'Switch Claude Account - manage multiple Claude Code logins'
+            @([regex]::Matches($out, 'unresolved: set HOME or CLAUDE_CONFIG_DIR')).Count |
+                Should -Be 3
+        }
+
+        # The counterpart: every other action has to refuse, and name both
+        # variables rather than surfacing a parameter-binder error.
+        It 'refuses an action with no resolvable home directory, naming both variables' {
+            $homeVar = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
+            $out = pwsh -NoProfile -Command "
+                Remove-Item -Path Env:$homeVar -ErrorAction SilentlyContinue
+                Remove-Item -Path Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+                & '$script:ScriptPath' list
+            " 2>&1 | Out-String
+
+            $out | Should -Match 'No credentials directory'
+            $out | Should -Match "env:$homeVar"
+            $out | Should -Match 'CLAUDE_CONFIG_DIR'
+        }
+    }
+
+    Context 'Test-ClaudeNodeProcess' {
+        # The npm package runs as 'node', so Test-ClaudeRunning's name probe
+        # misses it entirely and the ~/.claude.json write would go ahead
+        # against a live in-memory cache. Mocking Get-Process does not reach a
+        # dot-sourced function, which is why the pattern lives here instead.
+
+        It 'matches the npm package entry point behind the claude shim' {
+            $procs = @(
+                [pscustomobject]@{ ProcessName = 'bash'; CommandLine = '-bash' },
+                [pscustomobject]@{ ProcessName = 'node'; CommandLine = 'node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js' }
+            )
+            Test-ClaudeNodeProcess -Processes $procs | Should -BeTrue
+        }
+
+        # Over-matching only refuses a safe action; under-matching races
+        # Claude Code. But a directory name is not a running Claude Code, and
+        # this repo's own checkout would otherwise lock out `sca save`.
+        It 'ignores a command line that merely mentions claude: <Case>' -ForEach @(
+            @{ Case = 'repo path';   CommandLine = 'code /home/ada/windows_switch_claude_account' }
+            @{ Case = 'bare word';   CommandLine = 'less /home/ada/notes-about-claude.md' }
+            @{ Case = 'no cli.js';   CommandLine = 'node /home/ada/claude-code/index.js' }
+            @{ Case = 'null';        CommandLine = $null }
+        ) {
+            $procs = @([pscustomobject]@{ ProcessName = 'x'; CommandLine = $CommandLine })
+            Test-ClaudeNodeProcess -Processes $procs | Should -BeFalse
+        }
+
+        It 'reports nothing for an empty or null process list: <Case>' -ForEach @(
+            @{ Case = 'null';  Processes = $null }
+            @{ Case = 'empty'; Processes = @() }
+        ) {
+            Test-ClaudeNodeProcess -Processes $Processes | Should -BeFalse
         }
     }
 
