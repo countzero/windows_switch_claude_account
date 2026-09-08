@@ -138,10 +138,10 @@ Describe 'switch_claude_account' {
         }
 
         # 0600, so a credential file is never group- or world-readable. The
-        # mode has to be set on the temp file before the rename, because on
-        # Unix ::Replace is a bare rename(2) and the destination inherits the
-        # source inode's permissions: a 0644 temp silently downgrades Claude
-        # Code's 0600 .credentials.json and exposes live refresh tokens.
+        # temp file has to carry the mode from open(2) onward, because on Unix
+        # ::Replace is a bare rename(2) and the destination inherits the source
+        # inode's permissions: a 0644 temp silently downgrades Claude Code's
+        # 0600 .credentials.json and exposes live refresh tokens.
         It 'writes credential-shaped files as 0600 on Unix' -Skip:$IsWindows {
             $dest = Join-Path $script:SandboxCredDir 'mode.json'
 
@@ -171,6 +171,46 @@ Describe 'switch_claude_account' {
 
             Test-Path -LiteralPath $dest | Should -BeTrue
             (Get-Item -LiteralPath $dest).Length | Should -Be 0
+        }
+    }
+
+    Context 'Write-PrivateFileBytes' {
+        It 'writes the bytes to a new path' {
+            $dest = Join-Path $script:SandboxCredDir 'private.bin'
+            Write-PrivateFileBytes -Path $dest -Bytes ([byte[]](78,69,87))
+
+            [System.IO.File]::ReadAllBytes($dest) | Should -Be ([byte[]](78,69,87))
+        }
+
+        It 'writes an empty payload' {
+            $dest = Join-Path $script:SandboxCredDir 'private-empty.bin'
+            Write-PrivateFileBytes -Path $dest -Bytes ([byte[]]@())
+
+            (Get-Item -LiteralPath $dest).Length | Should -Be 0
+        }
+
+        # CreateNew on both platforms. The caller passes a fresh GUID-suffixed
+        # path, so an existing file means something else planted it; refusing
+        # beats writing a credential into a file we do not own.
+        It 'refuses an existing path rather than truncating it' {
+            $dest = Join-Path $script:SandboxCredDir 'planted.bin'
+            Set-Content -LiteralPath $dest -Value 'PLANTED' -NoNewline
+
+            { Write-PrivateFileBytes -Path $dest -Bytes ([byte[]](78,69,87)) } |
+                Should -Throw
+
+            Get-Content -LiteralPath $dest -Raw | Should -Be 'PLANTED'
+        }
+
+        # The property the chmod-after-write shape could not provide: the mode
+        # is carried by open(2), so the bytes are never readable by anyone but
+        # the owner, not even for the duration of the write.
+        It 'creates the file 0600 regardless of the process umask' -Skip:$IsWindows {
+            $dest = Join-Path $script:SandboxCredDir 'private-mode.bin'
+            Write-PrivateFileBytes -Path $dest -Bytes ([byte[]](78,69,87))
+
+            [System.IO.File]::GetUnixFileMode($dest) |
+                Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite')
         }
     }
 

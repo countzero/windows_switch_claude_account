@@ -371,25 +371,7 @@ function Set-CredentialFileAtomic {
     $maxAttempts = 3
 
     try {
-        [System.IO.File]::WriteAllBytes($tmp, $Bytes)
-
-        # Tighten the temp file to 0600 BEFORE the rename, not the destination
-        # after it. On Unix ::Replace / ::Move is a bare rename(2), so the
-        # destination inherits the temp file's mode; a 0644 temp (the default
-        # under the usual 0022 umask) silently downgrades Claude Code's 0600
-        # .credentials.json and would leave live refresh tokens
-        # world-readable. Measured on Debian 13 / .NET 8: 0600 destination +
-        # 0644 temp yields 0644 after Replace.
-        #
-        # Windows is excluded because it has no Unix mode bits; there
-        # .credentials.json inherits the profile directory's ACL, which
-        # already restricts it to the owning user.
-        #
-        # SetUnixFileMode needs .NET 7, hence the 7.4 floor in #Requires
-        # (7.4 being the lowest LTS carrying it; 7.2 and 7.3 are both EOL).
-        if (-not $IsWindows) {
-            [System.IO.File]::SetUnixFileMode($tmp, 'UserRead, UserWrite')
-        }
+        Write-PrivateFileBytes -Path $tmp -Bytes $Bytes
 
         $lastErr = $null
         for ($i = 1; $i -le $maxAttempts; $i++) {
@@ -420,6 +402,52 @@ function Set-CredentialFileAtomic {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+# Write $Bytes to a NEW file that is owner-only from the moment it exists.
+#
+# On Unix the mode must be set by open(2) itself, not by a chmod afterwards.
+# A chmod-after-write leaves the credential bytes group- and world-readable
+# for the duration of the write (0644 under the usual 0022 umask), and
+# creating the file empty first does not help either: POSIX checks
+# permissions at open time, so a reader that opened the empty file keeps a
+# readable descriptor across the chmod and sees whatever is written next.
+# FileStreamOptions.UnixCreateMode (.NET 7, hence the 7.4 floor in #Requires;
+# 7.4 is the lowest LTS carrying it and 7.2 / 7.3 are both EOL) passes the
+# mode down to open(2), so there is no window at all.
+#
+# This matters because Set-CredentialFileAtomic renames the result over the
+# destination, and on Unix ::Replace / ::Move is a bare rename(2): the
+# destination inherits THIS file's mode rather than keeping its own. Measured
+# on Debian 13 / .NET 8: a 0600 destination plus a 0644 temp yields 0644
+# after Replace, which would silently downgrade Claude Code's own 0600
+# .credentials.json.
+#
+# Windows sets no mode because it has no Unix mode bits (assigning
+# UnixCreateMode there throws PlatformNotSupportedException); the file
+# inherits the profile directory's ACL, which already restricts it to the
+# owning user.
+#
+# CreateNew rather than Create on BOTH platforms: the caller always passes a
+# fresh GUID-suffixed path, so an existing file means something else planted
+# it and we refuse to write a credential into it. Truncating on one platform
+# and refusing on the other would be a contract nobody could rely on.
+function Write-PrivateFileBytes {
+    Param (
+        [Parameter(Mandatory)] [String] $Path,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [byte[]] $Bytes
+    )
+
+    $options = [System.IO.FileStreamOptions]::new()
+    $options.Mode   = [System.IO.FileMode]::CreateNew
+    $options.Access = [System.IO.FileAccess]::Write
+    if (-not $IsWindows) {
+        $options.UnixCreateMode = [System.IO.UnixFileMode]'UserRead, UserWrite'
+    }
+
+    $stream = [System.IO.FileStream]::new($Path, $options)
+    try     { $stream.Write($Bytes, 0, $Bytes.Length) }
+    finally { $stream.Dispose() }
 }
 
 # Every slot-credential file in $Directory (default $CredDir), unsorted, as
