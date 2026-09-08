@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for the state-file primitives in switch_claude_account.ps1:
@@ -16,6 +16,8 @@
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
     $script:OriginalProfile     = $global:PROFILE
+    $script:OriginalHome        = $env:HOME
+    $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
 }
 
 Describe 'switch_claude_account' {
@@ -83,7 +85,13 @@ Describe 'switch_claude_account' {
         # cleanly rather than silently corrupting state. This shouldn't
         # happen in practice (Claude Code grants share-delete) but it
         # documents the contract we depend on.
-        It 'fails when destination is open without FileShare::Delete' {
+        #
+        # Windows-only by nature, not by convenience: FileShare is enforced by
+        # the Win32 kernel. POSIX has no mandatory locking, so on Linux the
+        # rename succeeds no matter what handles are open and there is no
+        # failure to assert. The Linux counterpart below covers the same
+        # ground from the other direction.
+        It 'fails when destination is open without FileShare::Delete' -Skip:(-not $IsWindows) {
             $dest = Join-Path $script:SandboxCredDir 'locked.txt'
             Set-Content -LiteralPath $dest -Value 'OLD' -NoNewline
 
@@ -98,6 +106,63 @@ Describe 'switch_claude_account' {
 
             # Original content is preserved; no partial write reached disk.
             Get-Content -LiteralPath $dest -Raw | Should -Be 'OLD'
+        }
+
+        # The Unix half of the atomic-write contract. On Windows the test
+        # above proves share-modes are honoured; here we prove the property
+        # that actually matters on Linux, which the share-mode test cannot
+        # express: rename(2) swaps the directory entry, so a reader holding
+        # the old descriptor keeps seeing the old inode's bytes while the
+        # path resolves to the new content. Without -Skip this would pass
+        # vacuously on Windows (where the exclusive open blocks the write),
+        # asserting nothing.
+        It 'replaces the path while an open reader keeps the old inode' -Skip:$IsWindows {
+            $dest = Join-Path $script:SandboxCredDir 'inode.txt'
+            Set-Content -LiteralPath $dest -Value 'OLD' -NoNewline
+
+            # FileShare::None: POSIX cannot enforce it, which is the point.
+            $stream = [System.IO.File]::Open($dest, 'Open', 'Read', 'None')
+            try {
+                { Set-CredentialFileAtomic -Path $dest -Bytes ([byte[]](78,69,87)) } |
+                    Should -Not -Throw
+
+                $buffer = [byte[]]::new(3)
+                $read   = $stream.Read($buffer, 0, 3)
+                [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read) | Should -Be 'OLD'
+            }
+            finally {
+                $stream.Dispose()
+            }
+
+            Get-Content -LiteralPath $dest -Raw | Should -Be 'NEW'
+        }
+
+        # 0600, so a credential file is never group- or world-readable. The
+        # mode has to be set on the temp file before the rename, because on
+        # Unix ::Replace is a bare rename(2) and the destination inherits the
+        # source inode's permissions: a 0644 temp silently downgrades Claude
+        # Code's 0600 .credentials.json and exposes live refresh tokens.
+        It 'writes credential-shaped files as 0600 on Unix' -Skip:$IsWindows {
+            $dest = Join-Path $script:SandboxCredDir 'mode.json'
+
+            # Pre-create world-readable so we prove the write tightens it
+            # rather than merely inheriting an already-strict destination.
+            Set-Content -LiteralPath $dest -Value 'OLD' -NoNewline
+            [System.IO.File]::SetUnixFileMode($dest, 'UserRead, UserWrite, GroupRead, OtherRead')
+
+            Set-CredentialFileAtomic -Path $dest -Bytes ([byte[]](78,69,87))
+
+            [System.IO.File]::GetUnixFileMode($dest) |
+                Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite')
+        }
+
+        It 'writes a brand-new credential-shaped file as 0600 on Unix' -Skip:$IsWindows {
+            $dest = Join-Path $script:SandboxCredDir 'fresh.json'
+
+            Set-CredentialFileAtomic -Path $dest -Bytes ([byte[]](78,69,87))
+
+            [System.IO.File]::GetUnixFileMode($dest) |
+                Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite')
         }
 
         It 'writes empty bytes' {
@@ -337,7 +402,9 @@ Describe 'switch_claude_account' {
     }
 
     AfterAll {
-        $env:USERPROFILE = $script:OriginalUserProfile
-        $global:PROFILE  = $script:OriginalProfile
+        $env:USERPROFILE       = $script:OriginalUserProfile
+        $global:PROFILE        = $script:OriginalProfile
+        $env:HOME              = $script:OriginalHome
+        $env:CLAUDE_CONFIG_DIR = $script:OriginalConfigDir
     }
 }

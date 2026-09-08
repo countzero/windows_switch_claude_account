@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pester:
+    # Both platforms the script supports. macOS is deliberately absent:
+    # Assert-SupportedPlatform refuses to run there because Claude Code
+    # keeps credentials in the Keychain, so there is no behaviour to test.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runners ship PowerShell 7, which satisfies the 7.4 floor the
+      # script needs for [System.IO.File]::SetUnixFileMode.
+      - name: Report PowerShell version
+        shell: pwsh
+        run: "$PSVersionTable | Format-List"
+
+      # Coverage runs on one OS only. The gate counts lines executed in a
+      # single run, and each platform necessarily leaves the other's branches
+      # untouched, so requiring 90% on both would fail for the wrong reason.
+      - name: Run tests with coverage
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./tests/Invoke-Tests.ps1
+
+      - name: Run tests
+        if: matrix.os != 'windows-latest'
+        shell: pwsh
+        run: ./tests/Invoke-Tests.ps1 -SkipCoverage

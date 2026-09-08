@@ -1,9 +1,9 @@
-#Requires -Version 7.2
+#Requires -Version 7.4
 # SPDX-License-Identifier: MIT
 
 <#
 .SYNOPSIS
-Switch between multiple Claude Code accounts on Windows.
+Switch between multiple Claude Code accounts on Windows and Linux.
 
 .DESCRIPTION
 This script manages named credential slots for Claude Code. It saves, switches,
@@ -121,14 +121,31 @@ Param (
 # We are resolving the script path to reference this file when
 # installing the alias into the user's PowerShell profile.
 $ScriptPath     = (Resolve-Path $PSCommandPath).Path
-$CredDir        = Join-Path $env:USERPROFILE ".claude"
+
+# $env:HOME, not the $HOME automatic variable: $HOME is bound once at session
+# start and never re-reads the environment, so the test sandbox (which swaps
+# $env:HOME per test) could not redirect it and every test would operate on
+# the developer's real ~/.claude.
+$ScaHomeDir     = if ($IsWindows) { $env:USERPROFILE } else { $env:HOME }
+
+# CLAUDE_CONFIG_DIR relocates Claude Code's whole config tree, .credentials.json
+# and .claude.json included (verified against Claude Code 2.1.263). Taken
+# verbatim: no ~ expansion and no resolution of a relative path, because
+# Claude Code does neither (anthropics/claude-code#78988 treats a leading ~ as
+# a literal cwd-relative directory). Normalizing here would point sca at a
+# different directory than the claude process it is meant to mirror, which is
+# the exact divergence this tool exists to prevent.
+$ScaConfigDir   = if (-not [string]::IsNullOrWhiteSpace($env:CLAUDE_CONFIG_DIR)) { $env:CLAUDE_CONFIG_DIR } else { $null }
+
+$CredDir        = if ($ScaConfigDir) { $ScaConfigDir } else { Join-Path $ScaHomeDir ".claude" }
 $CredFile       = Join-Path $CredDir ".credentials.json"
 $StateFile      = Join-Path $CredDir ".sca-state.json"
-# Claude Code's persistent config (top-level dotfile, NOT inside .claude/).
+# Claude Code's persistent config. A top-level dotfile beside .claude/ by
+# default, but it moves inside CLAUDE_CONFIG_DIR when that is set.
 # We read its `oauthAccount` block as the authoritative identity source
 # (it's what /status displays) and write whitelisted identity fields back
 # at switch time so Claude Code's display follows the active slot.
-$ClaudeJsonPath = Join-Path $env:USERPROFILE ".claude.json"
+$ClaudeJsonPath = if ($ScaConfigDir) { Join-Path $ScaConfigDir ".claude.json" } else { Join-Path $ScaHomeDir ".claude.json" }
 $ProfilePath    = $PROFILE.CurrentUserAllHosts
 
 # Version of this script. Bumped in the same commit that adds the matching
@@ -140,7 +157,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '3.2.1'
+$Script:ScriptVersion = '4.0.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -356,6 +373,24 @@ function Set-CredentialFileAtomic {
     try {
         [System.IO.File]::WriteAllBytes($tmp, $Bytes)
 
+        # Tighten the temp file to 0600 BEFORE the rename, not the destination
+        # after it. On Unix ::Replace / ::Move is a bare rename(2), so the
+        # destination inherits the temp file's mode; a 0644 temp (the default
+        # under the usual 0022 umask) silently downgrades Claude Code's 0600
+        # .credentials.json and would leave live refresh tokens
+        # world-readable. Measured on Debian 13 / .NET 8: 0600 destination +
+        # 0644 temp yields 0644 after Replace.
+        #
+        # Windows is excluded because it has no Unix mode bits; there
+        # .credentials.json inherits the profile directory's ACL, which
+        # already restricts it to the owning user.
+        #
+        # SetUnixFileMode needs .NET 7, hence the 7.4 floor in #Requires
+        # (7.4 being the lowest LTS carrying it; 7.2 and 7.3 are both EOL).
+        if (-not $IsWindows) {
+            [System.IO.File]::SetUnixFileMode($tmp, 'UserRead, UserWrite')
+        }
+
         $lastErr = $null
         for ($i = 1; $i -le $maxAttempts; $i++) {
             try {
@@ -384,6 +419,97 @@ function Set-CredentialFileAtomic {
         if (Test-Path -LiteralPath $tmp) {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
+    }
+}
+
+# Every slot-credential file in $Directory (default $CredDir), unsorted, as
+# FileInfo. Get-ConfigDirAdvisory is the only caller that passes a directory,
+# to count the slots left behind in the default location.
+#
+# -Force is load-bearing on Linux: .NET reports any name starting with '.' as
+# FileAttributes.Hidden, and Get-ChildItem omits hidden entries without it.
+# Since every file this tool owns is a dotfile, omitting -Force makes the
+# directory look empty, which silently degrades `list`, `usage`, rotation and
+# the state auto-migration into "no slots saved" rather than failing loudly.
+#
+# Excludes `.credentials.json` (the active file, not a slot) and the
+# `.account.json` identity sidecars (introduced in v2.1.0), both of which
+# the wildcard matches but neither of which is a slot credential.
+function Get-CredentialSlotFiles {
+    Param ([String] $Directory = $CredDir)
+
+    return Get-ChildItem -LiteralPath $Directory -Filter '.credentials.*.json' -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
+}
+
+# One-line advisory when CLAUDE_CONFIG_DIR has moved the working directory
+# away from the default, or $null when it has not.
+#
+# Honouring CLAUDE_CONFIG_DIR relocates every slot sca can see. Someone who
+# set the variable for an unrelated reason would run `sca list`, get "No slots
+# saved yet", and have nothing to tell them their slots are still sitting in
+# the default ~/.claude. Naming the directory in use, plus a count of what is
+# being skipped, turns a silent relocation into a visible one.
+#
+# GetFullPath normalises separators and relative segments without requiring
+# either path to exist, so the "already the default" case stays quiet instead
+# of emitting a permanent noise line for anyone who sets the variable
+# explicitly to ~/.claude. It resolves a relative value against the current
+# directory, which is what Claude Code does too. A malformed value fails open
+# and emits the advisory.
+# The three inputs arrive as parameters defaulting to the script-scope values
+# so the function is pure and the suite can drive every branch by argument,
+# rather than leaning on PowerShell's dynamic scoping to reach in and rebind
+# globals (which reads as dead assignments to both PSScriptAnalyzer and to the
+# next person). Same reasoning as Assert-SupportedPlatform.
+function Get-ConfigDirAdvisory {
+    Param (
+        [AllowNull()] [AllowEmptyString()] [String] $ConfigDir = $ScaConfigDir,
+        [String] $HomeDir   = $ScaHomeDir,
+        [String] $ActiveDir = $CredDir
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ConfigDir)) { return $null }
+
+    $defaultDir = Join-Path $HomeDir '.claude'
+    try {
+        $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        if ([string]::Equals(
+                [System.IO.Path]::GetFullPath($defaultDir),
+                [System.IO.Path]::GetFullPath($ActiveDir),
+                $comparison)) {
+            return $null
+        }
+    }
+    catch { Write-Verbose "Config-dir comparison failed, emitting advisory: $_" }
+
+    $message  = "[Config] CLAUDE_CONFIG_DIR is set; using '$ActiveDir'."
+    $orphaned = @(Get-CredentialSlotFiles -Directory $defaultDir).Count
+    if ($orphaned -gt 0) {
+        $message += " $orphaned slot(s) in '$defaultDir' are not in use."
+    }
+    return $message
+}
+
+# Refuse to run on macOS.
+#
+# Claude Code stores credentials in the encrypted macOS Keychain, falling back
+# to .credentials.json only when the Keychain rejects the write (a locked
+# keychain in an SSH session, for example). This tool swaps accounts by writing
+# .credentials.json, which the Keychain-backed path ignores: `switch` would
+# report success while Claude Code kept authenticating and billing the previous
+# account. Silence is the worst outcome for a tool whose entire job is knowing
+# which account is active, so refuse until a Keychain backend exists.
+#
+# The platform arrives as a parameter defaulting to $IsMacOS because $IsMacOS
+# is a read-only automatic variable that no test can assign, and Pester cannot
+# mock a variable. A default-valued parameter keeps the production call site
+# argument-free while letting the suite exercise both arms from any OS.
+function Assert-SupportedPlatform {
+    Param ([bool] $IsMacOSPlatform = $IsMacOS)
+
+    if ($IsMacOSPlatform) {
+        throw "macOS is not supported: Claude Code keeps credentials in the encrypted Keychain, so replacing .credentials.json has no effect and 'switch' would silently leave the previous account active and billing. Windows and Linux are supported."
     }
 }
 
@@ -460,13 +586,7 @@ function Read-ScaState {
         return $null
     }
 
-    # Exclude `.account.json` sidecars (introduced in v2.1.0); they
-    # match the wildcard but are not credential files. Without this
-    # filter the auto-migration could hash a sidecar and never find
-    # a match (harmless), but still wastes I/O and is a defensive
-    # cleanup against future bugs.
-    $files = Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
+    $files = Get-CredentialSlotFiles
     foreach ($f in $files) {
         $parsed = Get-SlotFileInfo -FileName $f.Name
         if (-not $parsed) { continue }
@@ -881,11 +1001,11 @@ function Get-ProfileEncoding {
 }
 
 # We are rendering a compact, locale-independent help screen so the
-# user always sees the same layout regardless of Windows UI language.
+# user always sees the same layout regardless of the OS UI language.
 function Show-Help {
     $lines = @(
         "",
-        "Switch Claude Account - manage multiple Claude Code logins on Windows.",
+        "Switch Claude Account - manage multiple Claude Code logins.",
         "",
         "USAGE",
         "  sca <action> [options] [name]",
@@ -939,11 +1059,14 @@ function Show-Help {
         "  sca monitor -Threshold 90        # rotate earlier (default is 95%)",
         "  sca monitor -KeepWarm            # auto-rotate AND keep all slots warm (recommended)",
         "",
+        # Resolved rather than written as literals: the paths differ per
+        # platform and shift again under CLAUDE_CONFIG_DIR, so printing what
+        # this invocation actually uses cannot drift out of date.
         "FILES",
-        "  Active login : %USERPROFILE%\.claude\.credentials.json",
-        "  Saved slots  : %USERPROFILE%\.claude\.credentials.<name>(<email>).json",
-        "  State        : %USERPROFILE%\.claude\.sca-state.json",
-        "  PS profile   : %USERPROFILE%\Documents\PowerShell\profile.ps1",
+        "  Active login : $CredFile",
+        "  Saved slots  : $(Join-Path $CredDir '.credentials.<name>(<email>).json')",
+        "  State        : $StateFile",
+        "  PS profile   : $ProfilePath",
         "",
         "NOTES",
         "  • Close Claude Code / VS Code before 'save', 'switch', 'warmup', or 'monitor'.",
@@ -1127,16 +1250,25 @@ function ConvertTo-WatchFrameSequence {
     return "`e[H" + $body + "`e[0J"
 }
 
-# We are sanitizing names to ensure compatibility with the
-# Windows filesystem by replacing invalid characters with underscores,
-# trimming trailing dots (also invalid on Windows), and rejecting
-# reserved device names like CON, PRN, AUX, NUL, COM1-9, LPT1-9.
+# We are sanitizing names by replacing invalid characters with underscores,
+# trimming trailing dots, and rejecting reserved device names like CON, PRN,
+# AUX, NUL, COM1-9, LPT1-9.
+#
+# The rule set is Windows-strict and applied on every platform on purpose,
+# not by omission. Linux permits nearly every byte in a filename, so relaxing
+# per-platform would mean the same slot name produces different filenames on
+# different machines, and a `.claude` directory copied or synced from Linux to
+# Windows could contain slots Windows cannot open. A single conservative rule
+# set keeps slot files portable; the cost is that a Linux user cannot name a
+# slot `CON`, which is not a real loss.
 function Get-SafeName {
     Param ([String] $inputName)
 
     if ([string]::IsNullOrWhiteSpace($inputName)) { throw "Name required." }
 
-    # Replace Windows-invalid filename characters (including space) with _.
+    # A hardcoded class rather than [IO.Path]::GetInvalidFileNameChars(),
+    # which returns only '/' and NUL on Unix and would silently relax the
+    # rules there. Space is included so slot names stay shell-friendly.
     # [ and ] are valid on the Windows filesystem but PowerShell's -Path
     # parameter treats them as character-class wildcards, so we sanitize
     # them to keep every Test-Path / Copy-Item / Remove-Item call below
@@ -1247,14 +1379,7 @@ function Get-SlotFileName {
 # that want a true offline read should call Get-Slots without first
 # reconciling.
 function Get-Slots {
-    # Filter out sidecar files (`.credentials.*.account.json`) themselves
-    # so they don't get parsed as slot credentials. The wildcard
-    # `.credentials.*.json` would otherwise match them.
-    $files = @(
-        Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' } |
-            Sort-Object -Property Name
-    )
+    $files = @(Get-CredentialSlotFiles | Sort-Object -Property Name)
 
     $state      = Read-ScaState
     $activeName = if ($state) { $state.active_slot } else { $null }
@@ -1358,13 +1483,18 @@ function Add-To-Profile {
     $aliasShort  = "Set-Alias -Name sca -Value switch_claude_account_caller -Option AllScope"
     $aliasLong   = "Set-Alias -Name switch-claude-account -Value switch_claude_account_caller -Option AllScope"
 
-    $block = @($MarkerStart, $funcDef, $aliasShort, $aliasLong, $MarkerEnd) -join "`r`n"
+    # Native newline so the block matches the platform convention of the
+    # profile we are appending to (CRLF on Windows, LF elsewhere), rather
+    # than injecting CRLF into an otherwise-LF file. Remove-From-Profile
+    # splices on `\r?\n`, so either terminator round-trips.
+    $newline = [Environment]::NewLine
+    $block   = @($MarkerStart, $funcDef, $aliasShort, $aliasLong, $MarkerEnd) -join $newline
 
     # Separate our block from any preceding profile content with a blank
     # line. Works for every encoding because the separator is just text.
     $profileInfo = Get-Item -LiteralPath $ProfilePath
     if ($profileInfo.Length -gt 0) {
-        $block = "`r`n" + $block
+        $block = $newline + $block
     }
 
     $encoding = Get-ProfileEncoding $ProfilePath
@@ -1703,10 +1833,7 @@ function Invoke-SaveAction {
     # the raw file system here to also catch invisible legacy slots
     # that share this slot name.
     $snapshots = @()
-    $rawFiles = @(
-        Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
-    )
+    $rawFiles = @(Get-CredentialSlotFiles)
     foreach ($rf in $rawFiles) {
         $parsed = Get-SlotFileInfo -FileName $rf.Name
         if (-not $parsed -or $parsed.Name -ne $safeName) { continue }
@@ -1972,10 +2099,7 @@ function Invoke-RemoveAction {
     # can clean up sidecar-less legacy slots that Get-Slots hides.
     # Without this, an invisible legacy slot would be impossible to
     # remove without manual filesystem editing.
-    $rawFiles = @(
-        Get-ChildItem -LiteralPath $CredDir -Filter '.credentials.*.json' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne '.credentials.json' -and $_.Name -notlike '*.account.json' }
-    )
+    $rawFiles = @(Get-CredentialSlotFiles)
     $matching = @()
     foreach ($rf in $rawFiles) {
         $parsed = Get-SlotFileInfo -FileName $rf.Name
@@ -5360,6 +5484,11 @@ function Invoke-Main {
         return
     }
 
+    # After -Version / help so those stay informational on every platform,
+    # and before the credentials directory is created so an unsupported
+    # platform leaves no trace on disk.
+    Assert-SupportedPlatform
+
     # Cross-action flag-misuse guards. Only the switch flags are guarded:
     # -Watch / -Json belong to read-only `usage`, -KeepWarm to `monitor`.
     # The int flags (-Threshold / -Interval) live in __AllParameterSets and
@@ -5381,6 +5510,17 @@ function Invoke-Main {
     try {
         if ($NoColor -or -not [string]::IsNullOrEmpty($env:NO_COLOR)) {
             $PSStyle.OutputRendering = 'PlainText'
+        }
+
+        # Suppressed under -Json so scripted callers get nothing but the
+        # document. Write-Host targets the information stream, which `|` and
+        # `>` do not capture, so this is belt-and-suspenders rather than a
+        # correctness fix. The watch actions paint into the alternate screen
+        # buffer, so emitting here means the advisory scrolls past once
+        # before the frame takes over rather than fighting the repaint.
+        if (-not $Json) {
+            $configAdvisory = Get-ConfigDirAdvisory
+            if ($configAdvisory) { Write-Color $configAdvisory 'Yellow' }
         }
 
         switch ($Action) {

@@ -1,8 +1,8 @@
 # Switch Claude Account
 
-[![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.2+](https://img.shields.io/badge/PowerShell-7.2%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
+[![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.4+](https://img.shields.io/badge/PowerShell-7.4%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
 
-A zero-dependency PowerShell utility for Claude Code on Windows that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
+A zero-dependency PowerShell utility for Claude Code on Windows and Linux that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
 
 <p align="center">
   <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
@@ -13,7 +13,7 @@ A zero-dependency PowerShell utility for Claude Code on Windows that combines se
 **Account & identity**
 
 - **Identity-aware slots**: each slot's OAuth email is captured at save time, baked into the filename, and locked in a sidecar; what you see in `list` is guaranteed to be who the tokens actually belong to
-- **Named slots with rotation**: unlimited accounts under any name (Windows-invalid characters auto-sanitized); `sca switch` with no name cycles through them alphabetically
+- **Named slots with rotation**: unlimited accounts under any name (filename-unsafe characters auto-sanitized); `sca switch` with no name cycles through them alphabetically
 
 **Live usage monitoring**
 
@@ -28,14 +28,23 @@ A zero-dependency PowerShell utility for Claude Code on Windows that combines se
 
 **Reliability & footprint**
 
-- **Atomic-safe writes**: slot-file updates use `MoveFileEx` with retry so they survive a running Claude Code on `.credentials.json`; `save` / `switch` still refuse to run while it's open to protect `~/.claude.json`
-- **Zero dependencies**: pure PowerShell 7.2+, no external packages, no companion assets
+- **Atomic-safe writes**: slot-file updates use an atomic rename (`MoveFileEx` on Windows, `rename(2)` on Linux) with retry so they survive a running Claude Code on `.credentials.json`; `save` / `switch` still refuse to run while it's open to protect `~/.claude.json`
+- **Zero dependencies**: pure PowerShell 7.4+, no external packages, no companion assets
 
 ## Installation
 
 ### Requisite
 
-**Requires PowerShell 7.2+.** Stock Windows ships PowerShell 5.1, which is not supported. Install PS 7 via `winget install Microsoft.PowerShell`, then run from `pwsh`.
+**Requires PowerShell 7.4+** on **Windows or Linux**. Run everything from `pwsh`.
+
+| Platform | Install PowerShell | Supported |
+|----------|--------------------|-----------|
+| Windows  | `winget install Microsoft.PowerShell` (stock Windows ships 5.1, which is not supported) | Yes |
+| Linux    | [Microsoft's package instructions](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux) | Yes |
+| macOS    | — | **No**, see below |
+
+> [!IMPORTANT]
+> **macOS is not supported and the script refuses to run there.** Claude Code stores credentials in the encrypted macOS Keychain rather than in `~/.claude/.credentials.json`, so replacing that file has no effect: `switch` would report success while Claude Code kept authenticating and billing the previous account. Refusing is safer than swapping accounts silently incorrectly. Supporting macOS needs a Keychain backend, which is not implemented yet.
 
 ### Download
 
@@ -109,7 +118,7 @@ sca remove test-project
 Slot names are user-assigned labels; nothing stops you from naming a slot `work` and later overwriting it with credentials for a completely different account. At `sca save` time the tool pulls the OAuth email from `~/.claude.json`'s `oauthAccount` block (Claude Code's own cache) and embeds it in the slot filename:
 
 ```
-%USERPROFILE%\.claude\.credentials.work(ada.lovelace@arpa.net).json
+~/.claude/.credentials.work(ada.lovelace@arpa.net).json
 ```
 
 A paired sidecar `.credentials.work(ada.lovelace@arpa.net).account.json` holds the full whitelisted identity (`accountUuid`, `emailAddress`, `organizationUuid`, `displayName`, `organizationName`) so `sca switch` can restore the matching `oauthAccount` block to `~/.claude.json`. Because the email is captured at save time and carried in both the filename and sidecar, it cannot drift from the OAuth tokens; the only way to update a slot's email label is to re-run `sca save`.
@@ -211,7 +220,7 @@ Peer slots are walked in alphabetical wrap order (same direction as `sca switch`
 </p>
 
 > [!IMPORTANT]
-> **OpenCode-scoped feature.** Requires [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, which re-reads `~/.claude/.credentials.json` on cache miss so a swap propagates to a running OpenCode process without restart. **Claude Code itself is NOT supported**: its in-memory `~/.claude.json` cache would race the swap, so `sca monitor` refuses to start (and to rotate mid-watch) while `claude.exe` is running. Close Claude Code before running `sca monitor`; OpenCode can keep running.
+> **OpenCode-scoped feature.** Requires [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, which re-reads `~/.claude/.credentials.json` on cache miss so a swap propagates to a running OpenCode process without restart. **Claude Code itself is NOT supported**: its in-memory `~/.claude.json` cache would race the swap, so `sca monitor` refuses to start (and to rotate mid-watch) while `claude` is running. Close Claude Code before running `sca monitor`; OpenCode can keep running.
 
 ### Install / uninstall alias
 
@@ -244,10 +253,20 @@ If Claude Code is running when you invoke `save` or `switch`, the action exits i
 
 `sca save` and `sca switch` read and write `~/.claude.json`'s `oauthAccount` block. Claude Code keeps that block in an in-memory cache that may flush back and clobber the update. Closing the app eliminates the race. (Slot-file updates done by `sca usage`'s token refresh use `MoveFileEx` with retry, so they survive an open Claude Code on `.credentials.json` itself; but the `~/.claude.json` cache race means you still need to close it for the two write actions.)
 
-## Windows Notes
+## Platform Notes
+
+### File locations and `CLAUDE_CONFIG_DIR`
+Credentials, slot files, and the state file live in `~/.claude/` (`%USERPROFILE%\.claude\` on Windows), except that Claude Code's own config is `~/.claude.json`, a sibling of that directory rather than a file inside it.
+
+Setting `CLAUDE_CONFIG_DIR` moves the whole tree, including `.claude.json`, and `sca` follows it. The value is used exactly as given: a leading `~` is **not** expanded and a relative path resolves against the current directory, matching what Claude Code itself does. When the variable relocates the directory, `sca` prints one line naming the directory in use and how many slots are being left behind in the default location.
+
+### File permissions (Linux)
+Every file `sca` writes is created `0600` before being moved into place, matching what Claude Code does. This includes `.credentials.json`, slot files, identity sidecars, the state file, and `~/.claude.json`.
 
 ### Name sanitization
-Spaces, Windows-invalid filename characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and parentheses (`(` `)`) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected.
+Spaces, filename-unsafe characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and parentheses (`(` `)`) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected.
+
+These rules are Windows-strict on every platform by design, so a slot name yields the same filename everywhere and a `~/.claude` directory copied from Linux to Windows stays usable.
 
 - `my personal` → `my_personal`
 - `foo/bar` → `foo_bar`
@@ -260,9 +279,9 @@ Spaces, Windows-invalid filename characters (`\ / : * ? " < > |` and control cha
 `sca install` and `sca uninstall` preserve your PowerShell profile's existing encoding (UTF-8 with or without BOM, UTF-16 LE/BE). ANSI-encoded profiles are treated as UTF-8 no-BOM (indistinguishable without a BOM).
 
 ### State file
-The active-slot tracker lives at `%USERPROFILE%\.claude\.sca-state.json`; plain JSON, safe to inspect. Schema: `{ schema, active_slot, last_sync_hash }`.
+The active-slot tracker lives at `~/.claude/.sca-state.json`; plain JSON, safe to inspect. Schema: `{ schema, active_slot, last_sync_hash }`.
 
-### Execution policy
+### Execution policy (Windows)
 If you get a security warning on first run, press `Y` or run once as:
 
 ```powershell
@@ -275,7 +294,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 pwsh -NoProfile -File tests/Invoke-Tests.ps1
 ```
 
-Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer runs in advisory mode if installed. Each test sandboxes `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` to Pester's `$TestDrive` so your real `.claude\` directory and PowerShell profile are never touched. Exit code follows Pester: `0` on pass, non-zero on any failure.
+Pester 5 is auto-installed to `CurrentUser` scope on first use. PSScriptAnalyzer runs in advisory mode if installed. Each test sandboxes `$env:USERPROFILE`, `$env:HOME`, `$env:CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` to Pester's `$TestDrive` so your real `.claude` directory and PowerShell profile are never touched. Exit code follows Pester: `0` on pass, non-zero on any failure.
 
 ## License & Disclaimer
 

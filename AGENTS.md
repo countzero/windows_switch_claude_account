@@ -11,12 +11,15 @@ This file is the canonical agent-instructions source for this repository, read n
 
 ## Key facts
 
-- **Credential directory**: `%USERPROFILE%\.claude\`
+- **Supported platforms**: Windows and Linux. **macOS is refused** by `Assert-SupportedPlatform`, because Claude Code keeps credentials in the encrypted Keychain there, so writing `.credentials.json` would leave `switch` silently billing the previous account.
+- **Credential directory**: `$CredDir`, resolved once at the top of the script. `$env:CLAUDE_CONFIG_DIR` when set, else `<home>/.claude`. Home is `$env:USERPROFILE` on Windows and **`$env:HOME`** elsewhere: the `$HOME` automatic variable is bound at session start and never re-reads the environment, so the test sandbox could not redirect it.
+- **`CLAUDE_CONFIG_DIR`**: taken verbatim, no `~` expansion and no relative-path resolution, because Claude Code does neither (anthropics/claude-code#78988). Normalizing would aim `sca` at a different directory than the `claude` process it mirrors. `Get-ConfigDirAdvisory` prints one line when the value relocates the directory.
 - **Active credentials**: `.credentials.json`, written by Claude Code via atomic rename on every OAuth refresh. `sca` writes it through the same primitive (`Set-CredentialFileAtomic`) so the file is byte-equal to the tracked slot file after every `sca save` / `sca switch` / reconcile pass.
-- **Claude Code config**: `%USERPROFILE%\.claude.json` (top-level, NOT inside `.claude\`). Its top-level `oauthAccount` block is what `/status` displays as "Email:". `sca` reads it at save time and writes the destination slot's captured block back on `sca switch`; see `Get-OAuthAccountFromClaudeJson` / `Set-OAuthAccountInClaudeJson`.
-- **State file**: `%USERPROFILE%\.claude\.sca-state.json`, schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." See `Read-ScaState` / `Update-ScaState`.
-- **Slot files**: `.credentials.<name>(<email>).json` plus a paired `.credentials.<name>(<email>).account.json` identity sidecar. **Slots without a valid sidecar are hidden from `list` / `usage` / rotation and refused by `switch`**; re-run `sca save <name>` while that slot is active to recapture it. Details on `Get-Slots` and `Invoke-SaveAction`.
-- **PS version**: requires PowerShell 7.2+ (`#Requires -Version 7.2`), the version that introduced `$PSStyle.OutputRendering`. Install target is `$PROFILE.CurrentUserAllHosts`.
+- **Claude Code config**: `$ClaudeJsonPath`. `<home>/.claude.json` by default, a **sibling** of `.claude/` rather than a file inside it, but it moves inside `CLAUDE_CONFIG_DIR` when that is set (verified against Claude Code 2.1.263). Its top-level `oauthAccount` block is what `/status` displays as "Email:". `sca` reads it at save time and writes the destination slot's captured block back on `sca switch`; see `Get-OAuthAccountFromClaudeJson` / `Set-OAuthAccountInClaudeJson`.
+- **State file**: `$CredDir/.sca-state.json`, schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." See `Read-ScaState` / `Update-ScaState`.
+- **Slot files**: `.credentials.<name>(<email>).json` plus a paired `.credentials.<name>(<email>).account.json` identity sidecar. **Slots without a valid sidecar are hidden from `list` / `usage` / rotation and refused by `switch`**; re-run `sca save <name>` while that slot is active to recapture it. Details on `Get-Slots` and `Invoke-SaveAction`. Enumerate them **only** via `Get-CredentialSlotFiles`, which centralizes the `-Force` that dotfiles need on Linux and the sidecar exclusion.
+- **File modes**: every credential-shaped file is chmod 0600 on the temp file *before* the rename, inside `Set-CredentialFileAtomic`. On Unix `::Replace` is a bare `rename(2)`, so the destination inherits the source inode's mode; setting it after the rename would leave a window, and not setting it at all silently downgrades Claude Code's 0600 to 0644.
+- **PS version**: requires PowerShell 7.4+ (`#Requires -Version 7.4`), the lowest LTS carrying `[System.IO.File]::SetUnixFileMode` (.NET 7). 7.2 and 7.3 are both EOL. Install target is `$PROFILE.CurrentUserAllHosts` (`~/.config/powershell/profile.ps1` on Linux).
 - **Alias installer**: `sca` and `switch-claude-account` added to the PowerShell profile inside a marker-delimited block (`# === Switch Claude Account ===`). Keep the markers intact when touching `Add-To-Profile` / `Remove-From-Profile`.
 
 ## Script actions
@@ -45,12 +48,13 @@ The `usage` action and the identity-fallback path depend on constants extracted 
 
 **Undocumented and unsupported by Anthropic.** When the calls start returning 4xx after a Claude Code upgrade, re-extract using the recipe in that comment, bump the constants, and re-run the suite. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only; they will not catch the constants drifting out of date. Only a live `sca usage` will.
 
-## Windows-specific gotchas
+## Platform gotchas
 
 - **Atomic-rename writes survive an open Claude Code**, for `.credentials.json` only. `Set-CredentialFileAtomic` uses `MoveFileEx` semantics, which succeed against the `FILE_SHARE_DELETE` handle Claude Code holds. `save` / `switch` still refuse to run while Claude Code is open, for the different reason documented on `Test-ClaudeRunning`.
-- **Execution policy**: may need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
+- **Execution policy** (Windows): may need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
+- **POSIX has no mandatory locking**: `FileShare` is a Win32 concept, so on Linux `::Replace` succeeds regardless of open handles and a reader keeps the old inode. Share-mode tests are therefore `-Skip:(-not $IsWindows)`, paired with a Linux test asserting the inode property instead.
 - **Token expiry**: OAuth tokens refresh after roughly an hour of inactivity. Without a daemon a slot file is at most one Claude-Code refresh behind; the next reconciling action captures it. Harmless, because the slot's previous refresh token stays valid until rotated again.
-- **Name sanitization**: `Get-SafeName` replaces invalid filename characters, parentheses, PowerShell wildcard brackets, and spaces with `_`, strips trailing dots, and rejects reserved device names. The reason for each class is on the function; every credential-file operation also passes `-LiteralPath` as defense in depth.
+- **Name sanitization**: `Get-SafeName` replaces invalid filename characters, parentheses, PowerShell wildcard brackets, and spaces with `_`, strips trailing dots, and rejects reserved device names. Windows-strict on **every** platform on purpose, via a hardcoded character class rather than `GetInvalidFileNameChars()`, so one slot name yields one filename everywhere. The reason for each class is on the function; every credential-file operation also passes `-LiteralPath` as defense in depth.
 
 ## Testing
 
@@ -71,7 +75,7 @@ Per-function complexity diagnostic (advisory, on-demand): `pwsh -NoProfile -File
 ### Test conventions
 
 - **Layout**: one file per action at `tests/Invoke-<Action>Action.Tests.ps1`, plus cross-cutting suites (`Helpers`, `Profile-Install`, `Invoke-Reconcile`, `Invoke-AutoRotation`, `State-File`). Every outer `Describe` is named `'switch_claude_account'` so `-FullNameFilter` recipes work uniformly.
-- **Sandboxing**: `tests/Common.ps1`, dot-sourced from each `BeforeEach`, sandboxes `$env:USERPROFILE` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive`; the real profile and real `.claude` directory are never touched. It also sets `$PSStyle.OutputRendering = 'PlainText'` so string assertions see ANSI-stripped output.
+- **Sandboxing**: `tests/Common.ps1`, dot-sourced from each `BeforeEach`, sandboxes `$env:USERPROFILE`, `$env:HOME`, `$env:CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive` (both home variables, because the script reads whichever its platform uses; each test file restores the originals in its own `AfterAll`); the real profile and real `.claude` directory are never touched. It also sets `$PSStyle.OutputRendering = 'PlainText'` so string assertions see ANSI-stripped output.
 - **Direct-call pattern**: the script is dot-sourced and tests call `Invoke-*Action` directly, bypassing `Invoke-Main`. The `-NoColor` `try/finally` in `Invoke-Main` therefore never fires in tests; `Common.ps1` substitutes for it.
 - **Output capture**: `6>&1 | Out-String` captures `Write-Host` (information stream 6). Stream 4 (`Write-Progress`) is not captured by that pattern; relevant when adding rendering helpers.
 

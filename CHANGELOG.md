@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-09-08
+
+### Changed
+
+- **BREAKING**: `#Requires -Version` bumped from 7.2 to 7.4. `[System.IO.File]::SetUnixFileMode`, which the Linux file-permission fix depends on, needs .NET 7; 7.4 is the lowest LTS release carrying it, and both 7.2 and 7.3 are past end of life.
+- **BREAKING**: `CLAUDE_CONFIG_DIR` is now honoured, on Windows as well as Linux. Claude Code reads this variable to relocate its whole config tree, `.credentials.json` and `.claude.json` included, so a session with it set was already billing an account `sca` could not see. Anyone who has the variable set will find `sca` reading a different directory than before, and their existing slots in the default `~/.claude` no longer listed. The value is used exactly as given: a leading `~` is not expanded and a relative path resolves against the current directory, matching Claude Code rather than correcting it. When the variable relocates the directory, `sca` prints one line naming the directory in use and counting the slots left behind, so the move is never silent.
+- Linux is supported. `~` resolves via `$env:HOME` there and `%USERPROFILE%` on Windows, slot enumeration passes `-Force` so the dotfiles this tool owns are visible, and `sca install` writes the alias block with the platform's own line ending.
+- The `FILES` section of `sca help` prints the paths this invocation actually uses instead of hardcoded `%USERPROFILE%` literals, so it stays correct on both platforms and under `CLAUDE_CONFIG_DIR`.
+
+### Added
+
+- macOS is refused with an explanatory error rather than misbehaving. Claude Code stores credentials in the encrypted Keychain there, so replacing `.credentials.json` has no effect and `switch` would have reported success while Claude Code kept authenticating and billing the previous account.
+- A test workflow running the suite on `windows-latest` and `ubuntu-latest`. No workflow ran the tests before.
+
+### Fixed
+
+- Credential files are no longer written world-readable on Linux. Every file `sca` writes goes through an atomic rename, which on Unix is a bare `rename(2)`, so the destination inherits the temp file's mode: under the usual `0022` umask that silently downgraded Claude Code's `0600` to `0644` and left live refresh tokens readable by every user on the machine. The mode is now set on the temp file before the rename, covering `.credentials.json`, slot files, identity sidecars, the state file, and `~/.claude.json`.
+- Three `sca save` tests asserted that a file count was zero using an enumeration that cannot see dotfiles on Linux, so they would have passed whether or not the files existed.
+
 ## [3.2.1] - 2026-09-08
 
 ### Changed

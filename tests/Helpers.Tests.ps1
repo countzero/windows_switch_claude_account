@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for the small pure-helper functions in
@@ -21,6 +21,8 @@ BeforeAll {
     # was already safe because the mutations died with the subprocess.
     $script:OriginalUserProfile = $env:USERPROFILE
     $script:OriginalProfile     = $global:PROFILE
+    $script:OriginalHome        = $env:HOME
+    $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
 }
 
 Describe 'switch_claude_account' {
@@ -2115,7 +2117,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'disk full'
 
             # Tokens file landed on disk despite the sidecar failure.
-            $tokenFiles = @(Get-ChildItem -LiteralPath $credDir -Filter '.credentials.auto-*.json' |
+            $tokenFiles = @(Get-ChildItem -LiteralPath $credDir -Filter '.credentials.auto-*.json' -Force |
                 Where-Object { $_.Name -notlike '*.account.json' })
             $tokenFiles.Count | Should -Be 1
             [System.IO.File]::ReadAllBytes($tokenFiles[0].FullName) | Should -Be $bytes
@@ -2147,11 +2149,149 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Get-CredentialSlotFiles' {
+        # The -Force flag this helper exists to centralize is invisible on
+        # Windows and load-bearing on Unix, so assert the exclusions (which
+        # hold everywhere) plus the dotfile visibility itself.
+
+        It 'returns slot files and excludes .credentials.json and sidecars' {
+            New-SlotPair -CredDir $CredDir -Name 'alpha' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $CredDir -Name 'beta'  -Content 'B' | Out-Null
+            Set-Content -LiteralPath $CredFile -Value 'ACTIVE' -NoNewline
+
+            $names = @(Get-CredentialSlotFiles | ForEach-Object { $_.Name } | Sort-Object)
+
+            $names.Count | Should -Be 2
+            $names | Should -Not -Contain '.credentials.json'
+            @($names | Where-Object { $_ -like '*.account.json' }).Count | Should -Be 0
+        }
+
+        It 'finds dotfiles that a -Force-less enumeration would hide' {
+            New-SlotPair -CredDir $CredDir -Name 'gamma' -Content 'G' | Out-Null
+
+            # The regression this guards: without -Force, .NET's Hidden
+            # attribute on dot-prefixed names makes this come back empty on
+            # Linux and macOS while still passing on Windows.
+            @(Get-CredentialSlotFiles).Count | Should -Be 1
+        }
+
+        It 'honors -Directory for a location other than $CredDir' {
+            $other = Join-Path $TestDrive 'other-config'
+            New-Item -ItemType Directory -Path $other -Force | Out-Null
+            New-SlotPair -CredDir $other -Name 'elsewhere' -Content 'E' | Out-Null
+
+            @(Get-CredentialSlotFiles -Directory $other).Count | Should -Be 1
+            @(Get-CredentialSlotFiles).Count                   | Should -Be 0
+        }
+
+        It 'returns nothing for a directory that does not exist' {
+            @(Get-CredentialSlotFiles -Directory (Join-Path $TestDrive 'no-such-dir')).Count |
+                Should -Be 0
+        }
+    }
+
+    Context 'Get-ConfigDirAdvisory' {
+        # Driven by argument rather than by $env:CLAUDE_CONFIG_DIR, because
+        # $ScaConfigDir / $CredDir / $ScaHomeDir are bound once when
+        # Common.ps1 dot-sources the script: re-setting the environment
+        # variable afterwards would not be observed.
+
+        It 'returns null when CLAUDE_CONFIG_DIR is unset' {
+            Get-ConfigDirAdvisory -ConfigDir $null | Should -BeNullOrEmpty
+        }
+
+        It 'returns null when CLAUDE_CONFIG_DIR is set but blank' {
+            Get-ConfigDirAdvisory -ConfigDir '   ' | Should -BeNullOrEmpty
+        }
+
+        It 'returns null when CLAUDE_CONFIG_DIR points at the default directory' {
+            $default = Join-Path $script:SandboxHome '.claude'
+
+            Get-ConfigDirAdvisory -ConfigDir $default `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $default | Should -BeNullOrEmpty
+        }
+
+        It 'returns null when the value differs only by a redundant path segment' {
+            $roundabout = Join-Path $script:SandboxHome (Join-Path 'sub' (Join-Path '..' '.claude'))
+
+            Get-ConfigDirAdvisory -ConfigDir $roundabout `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $roundabout | Should -BeNullOrEmpty
+        }
+
+        It 'names the directory in use when relocated' {
+            $relocated = Join-Path $TestDrive 'relocated'
+
+            $advisory = Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                              -HomeDir   $script:SandboxHome `
+                                              -ActiveDir $relocated
+
+            $advisory | Should -Match 'CLAUDE_CONFIG_DIR is set'
+            $advisory | Should -BeLike "*$relocated*"
+        }
+
+        It 'counts the slots left behind in the default directory' {
+            $defaultDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $defaultDir -Name 'left-a' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $defaultDir -Name 'left-b' -Content 'B' | Out-Null
+
+            $relocated = Join-Path $TestDrive 'relocated-count'
+
+            Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $relocated | Should -Match '2 slot\(s\)'
+        }
+
+        It 'omits the count clause when the default directory holds no slots' {
+            $relocated = Join-Path $TestDrive 'relocated-empty'
+
+            Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $relocated | Should -Not -Match 'slot\(s\)'
+        }
+
+        It 'fails open and still advises when the path cannot be normalized' {
+            # An embedded NUL makes GetFullPath throw. The advisory is the
+            # safe outcome: better a redundant line than a silent relocation.
+            Get-ConfigDirAdvisory -ConfigDir "bad`0path" `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir "bad`0path" | Should -Match 'CLAUDE_CONFIG_DIR is set'
+        }
+
+        It 'reads the script-scope values when called without arguments' {
+            # Common.ps1 clears CLAUDE_CONFIG_DIR, so the default-bound call
+            # must be silent. Covers the production call site in Invoke-Main.
+            Get-ConfigDirAdvisory | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Assert-SupportedPlatform' {
+        # $IsMacOS is a read-only automatic variable and Pester cannot mock a
+        # variable, which is why the platform arrives as a parameter. That
+        # lets both arms run on every OS instead of only on a Mac.
+
+        It 'throws on macOS, naming the Keychain as the reason' {
+            { Assert-SupportedPlatform -IsMacOSPlatform $true } |
+                Should -Throw -ExpectedMessage '*Keychain*'
+        }
+
+        It 'does not throw on Windows or Linux' {
+            { Assert-SupportedPlatform -IsMacOSPlatform $false } | Should -Not -Throw
+        }
+
+        It 'defaults to the running platform, which the suite never runs on macOS' {
+            { Assert-SupportedPlatform } | Should -Not -Throw
+        }
+    }
+
     AfterAll {
         # Restore the two globals BeforeEach mutated so this suite leaves
         # the caller's session clean. Pester runs AfterAll even if tests
         # throw, so this covers the mid-suite-failure case too.
-        $env:USERPROFILE = $script:OriginalUserProfile
-        $global:PROFILE  = $script:OriginalProfile
+        $env:USERPROFILE       = $script:OriginalUserProfile
+        $global:PROFILE        = $script:OriginalProfile
+        $env:HOME              = $script:OriginalHome
+        $env:CLAUDE_CONFIG_DIR = $script:OriginalConfigDir
     }
 }

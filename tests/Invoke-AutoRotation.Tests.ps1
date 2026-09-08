@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for the `sca monitor` auto-rotation helpers
@@ -14,6 +14,8 @@
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
     $script:OriginalProfile     = $global:PROFILE
+    $script:OriginalHome        = $env:HOME
+    $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
 }
 
 Describe 'switch_claude_account' {
@@ -635,5 +637,12 @@ Describe 'switch_claude_account' {
             $d.FromName | Should -BeNullOrEmpty
             $d.ToName   | Should -BeNullOrEmpty
         }
+    }
+
+    AfterAll {
+        $env:USERPROFILE       = $script:OriginalUserProfile
+        $global:PROFILE        = $script:OriginalProfile
+        $env:HOME              = $script:OriginalHome
+        $env:CLAUDE_CONFIG_DIR = $script:OriginalConfigDir
     }
 }
