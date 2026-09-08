@@ -3975,34 +3975,38 @@ function Format-UsageAdvisory {
         }
     }
 
-    # Per-slot reason lines below the bucket lines. The Status column carries
-    # only a short label, so this is where the detail lands: the row's own
-    # error message when it has one, otherwise the remedy for a hard failure.
-    # A 'rate-limited' row without a message is deliberately silent, because
-    # the bucket line above already says exactly that.
+    # Per-slot reason lines below the condition lines. The Status column
+    # carries only a short label, so this is where the detail lands: the row's
+    # own error message when it has one, otherwise the remedy for a hard
+    # failure. A 'rate-limited' row without a message is deliberately silent,
+    # because the condition line above already says exactly that.
     #
-    # Capped at 3 for the same reason Format-SlotNameList caps names: under
-    # -Watch a wide pool of failing slots would otherwise push the table off
-    # screen. The bucket lines above already account for every affected slot.
-    #
-    # Message-bearing rows go first so the cap cannot spend all three lines on
-    # canned remedies (a 'no-oauth' slot is a permanent config fact) while
-    # dropping the transport errors this block exists to surface. Two passes
-    # rather than a sort, so order within each group stays the caller's row
-    # order without depending on sort stability.
-    $withMessage = [System.Collections.Generic.List[string]]::new()
-    $withRemedy  = [System.Collections.Generic.List[string]]::new()
+    # Messages are capped at 3, for the same reason Format-SlotNameList caps
+    # names: under -Watch a wide failing pool would push the table off screen.
+    # The cap costs detail, not coverage, because the condition lines above
+    # already name every affected slot.
+    $messages = [System.Collections.Generic.List[string]]::new()
     foreach ($row in $rows) {
-        if ($row.Error) {
-            $tail = Format-StatusErrorTail -Message $row.Error
-            if ($tail) { $withMessage.Add("[Usage] $($row.Name): $tail") }
-        } elseif ($row.Status -in @('expired', 'unauthorized', 'no-oauth')) {
-            $remedy = Get-StatusRationale -Label $row.Status
-            if ($remedy) { $withRemedy.Add("[Usage] $($row.Name): $remedy") }
-        }
+        if (-not $row.Error) { continue }
+        $tail = Format-StatusErrorTail -Message $row.Error
+        if ($tail) { $messages.Add("[Usage] $($row.Name): $tail") }
     }
-    foreach ($reasonLine in @(@($withMessage) + @($withRemedy) | Select-Object -First 3)) {
-        $lines.Add($reasonLine)
+    foreach ($message in @($messages | Select-Object -First 3)) {
+        $lines.Add($message)
+    }
+
+    # Remedies are grouped per status, worst first, like the condition lines: a
+    # remedy is a per-status constant, so one line covers every slot sharing it.
+    # Sharing the messages' cap instead spent N lines on identical text for N
+    # api-key slots, and no ordering could stop three transport errors from
+    # dropping the remedy outright. These statuses get no condition line, so
+    # that would leave nothing on screen about the one failure class that does
+    # not clear on its own.
+    foreach ($status in @('expired', 'unauthorized', 'no-oauth')) {
+        $names = @($rows | Where-Object { $_.Status -eq $status -and -not $_.Error } | ForEach-Object { $_.Name })
+        $list  = Format-SlotNameList -Names $names
+        if (-not $list) { continue }
+        $lines.Add("[Usage] ${list}: $(Get-StatusRationale -Label $status)")
     }
 
     if ($lines.Count -eq 0) { return $null }

@@ -1652,14 +1652,39 @@ Describe 'switch_claude_account' {
             @{ Case = 'unauthorized'; Status = 'unauthorized'; Expected = 'token revoked; run sca switch then /login' }
             @{ Case = 'no-oauth';     Status = 'no-oauth';     Expected = 'api key or non-claude.ai slot' }
         ) {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status $Status)) -Cache $false -Rl $false
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status $Status))
             # These statuses match no condition bucket, so the reason line is
             # the whole advisory.
-            Format-UsageAdvisory -Snapshot $snap | Should -Be "[Usage] slot-1: $Expected"
+            Format-UsageAdvisory -Snapshot $snap | Should -Be "[Usage] 'slot-1': $Expected"
+        }
+
+        # A remedy is a per-status constant, so repeating it once per slot said
+        # nothing new and burned the shared 3-line cap on identical text.
+        It 'names every slot sharing a remedy on one line' {
+            $rows = @('a','b') | ForEach-Object { New-RlRow -Name $_ -Status 'no-oauth' }
+            $snap = New-RlSnapshot -Results $rows
+
+            Format-UsageAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'a', 'b': api key or non-claude.ai slot"
+        }
+
+        It 'groups per status, worst first, not into one combined line' {
+            $rows = @(
+                (New-RlRow -Name 'a' -Status 'no-oauth'),
+                (New-RlRow -Name 'b' -Status 'expired'),
+                (New-RlRow -Name 'c' -Status 'no-oauth')
+            )
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            $lines.Count | Should -Be 2
+            # Fixed worst-first status order, matching the condition lines
+            # above, rather than whichever status the caller listed first.
+            $lines[0] | Should -Be "[Usage] 'b': token refresh failed; run sca switch to refresh"
+            $lines[1] | Should -Be "[Usage] 'a', 'c': api key or non-claude.ai slot"
         }
 
         It 'stays silent for a rate-limited row with no message (the condition line already says it)' {
-            $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1')) -Cache $false -Rl $true
+            $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
             $lines.Count | Should -Be 1
             $lines[0]    | Should -Match 'currently rate-limited by Anthropic'
@@ -1671,7 +1696,7 @@ Describe 'switch_claude_account' {
                 $r.Error = "boom $_"
                 $r
             }
-            $snap  = New-RlSnapshot -Results $rows -Cache $false -Rl $false -Err $true
+            $snap  = New-RlSnapshot -Results $rows
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
 
             # 1 condition line + 3 reason lines.
@@ -1681,10 +1706,9 @@ Describe 'switch_claude_account' {
             $lines[0] | Should -Match "and 2 more"
         }
 
-        It 'spends the cap on real messages before canned remedies' {
-            # The remedy-only rows sort first alphabetically, so a row-ordered
-            # cap would emit three 'no-oauth' notices (a permanent config fact)
-            # and drop both transport errors.
+        It 'reports both the transport errors and the grouped remedy' {
+            # A row-ordered shared cap emitted three 'no-oauth' notices (a
+            # permanent config fact) and dropped both transport errors.
             $rows = @(
                 (New-RlRow -Name 'a-apikey' -Status 'no-oauth'),
                 (New-RlRow -Name 'b-apikey' -Status 'no-oauth'),
@@ -1695,20 +1719,41 @@ Describe 'switch_claude_account' {
                 $r.Error = "boom $n"
                 $rows += $r
             }
-            $snap  = New-RlSnapshot -Results $rows -Cache $false -Rl $false -Err $true
+            $snap  = New-RlSnapshot -Results $rows
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
 
-            # 1 condition line (errors only; no-oauth matches no bucket) + 3 reasons.
+            # 1 condition line (errors only; no-oauth matches no bucket)
+            # + 2 messages + 1 grouped remedy.
             $lines.Count | Should -Be 4
             $lines[1] | Should -Be '[Usage] y-dead: boom y-dead'
             $lines[2] | Should -Be '[Usage] z-dead: boom z-dead'
-            # The single remaining slot goes to the first remedy row, in row order.
-            $lines[3] | Should -Be '[Usage] a-apikey: api key or non-claude.ai slot'
+            $lines[3] | Should -Be "[Usage] 'a-apikey', 'b-apikey', 'c-apikey': api key or non-claude.ai slot"
+        }
+
+        # The regression the shared cap caused: 'expired' / 'unauthorized' /
+        # 'no-oauth' have no condition line, so once three messages filled the
+        # cap the slot the user actually has to act on vanished from the frame
+        # entirely, leaving only a bare label in the Status column.
+        It 'keeps the remedy visible behind a full message cap' {
+            $rows = @()
+            foreach ($n in @('d1','d2','d3','d4')) {
+                $r = New-RlRow -Name $n -Status 'error'
+                $r.Error = "boom $n"
+                $rows += $r
+            }
+            $rows += (New-RlRow -Name 'revoked' -Status 'unauthorized')
+
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            # 1 condition line + 3 capped messages + the remedy.
+            $lines.Count | Should -Be 5
+            @($lines | Where-Object { $_ -match ': boom ' }).Count | Should -Be 3
+            $lines[-1] | Should -Be "[Usage] 'revoked': token revoked; run sca switch then /login"
         }
 
         It 'ok rows never produce a reason line' {
             $row = New-RlRow -Name 'slot-1' -Status 'ok'
-            $snap = New-RlSnapshot -Results @($row) -Cache $false -Rl $false
+            $snap = New-RlSnapshot -Results @($row)
             Format-UsageAdvisory -Snapshot $snap | Should -BeNullOrEmpty
         }
     }
