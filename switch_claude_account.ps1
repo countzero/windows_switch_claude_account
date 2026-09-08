@@ -499,6 +499,17 @@ function Get-ConfigDirAdvisory {
 
     if ([string]::IsNullOrWhiteSpace($ConfigDir)) { return $null }
 
+    $message = "[Config] CLAUDE_CONFIG_DIR is set; using '$ActiveDir'."
+
+    # No resolvable home means there is no default directory to compare against
+    # or to count orphans in, so report the relocation and stop. Reachable
+    # whenever $env:HOME is unset on Linux, which is exactly the kind of
+    # environment (a container, a systemd unit) that sets CLAUDE_CONFIG_DIR in
+    # the first place: $CredDir does not depend on the home directory there, so
+    # letting Join-Path's binder throw on the empty string would abort an
+    # otherwise-working invocation over an advisory line.
+    if ([string]::IsNullOrWhiteSpace($HomeDir)) { return $message }
+
     $defaultDir = Join-Path $HomeDir '.claude'
     try {
         $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
@@ -511,7 +522,6 @@ function Get-ConfigDirAdvisory {
     }
     catch { Write-Verbose "Config-dir comparison failed, emitting advisory: $_" }
 
-    $message  = "[Config] CLAUDE_CONFIG_DIR is set; using '$ActiveDir'."
     $orphaned = @(Get-CredentialSlotFiles -Directory $defaultDir).Count
     if ($orphaned -gt 0) {
         $message += " $orphaned slot(s) in '$defaultDir' are not in use."

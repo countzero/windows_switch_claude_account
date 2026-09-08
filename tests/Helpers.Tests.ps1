@@ -2259,6 +2259,30 @@ Describe 'switch_claude_account' {
                                   -ActiveDir "bad`0path" | Should -Match 'CLAUDE_CONFIG_DIR is set'
         }
 
+        # $env:HOME unset on Linux (a container, a systemd unit) leaves
+        # $ScaHomeDir null, which a [String] parameter binds as ''. Join-Path
+        # rejects that, and the throw would abort the whole invocation over an
+        # advisory line even though $CredDir came from CLAUDE_CONFIG_DIR and
+        # never needed the home directory.
+        It 'still advises without a resolvable home directory: <Case>' -ForEach @(
+            @{ Case = 'empty string'; HomeDir = '' }
+            @{ Case = 'null';         HomeDir = $null }
+            @{ Case = 'whitespace';   HomeDir = '   ' }
+        ) {
+            $relocated = Join-Path $TestDrive 'relocated-no-home'
+
+            # A throw here IS the regression: Join-Path rejects the empty
+            # string, and the call site in Invoke-Main is not wrapped.
+            $advisory = Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                              -HomeDir   $HomeDir `
+                                              -ActiveDir $relocated
+
+            $advisory | Should -Match 'CLAUDE_CONFIG_DIR is set'
+            $advisory | Should -BeLike "*$relocated*"
+            # No default directory exists to count orphans in.
+            $advisory | Should -Not -Match 'slot\(s\)'
+        }
+
         It 'reads the script-scope values when called without arguments' {
             # Common.ps1 clears CLAUDE_CONFIG_DIR, so the default-bound call
             # must be silent. Covers the production call site in Invoke-Main.
